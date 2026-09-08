@@ -354,7 +354,7 @@ if [ "\$HOST_WAS_RUNNING" -eq 0 ]; then
     echo 'MacWSHost was stopped before deployment; leaving it stopped'
     exit 0
 fi
-/var/jb/usr/bin/uiopen macwshost://show-controls >/dev/null 2>&1
+/var/jb/usr/bin/uiopen --url macwshost://show-controls >/dev/null 2>&1
 # UIKit scene restoration is asynchronous and, while Stray is saturating the
 # device, runtime-confirmed at 3-4 seconds. A fixed two-second sleep made a
 # successful signed install look like a deployment failure and encouraged an
@@ -598,7 +598,7 @@ wait_for_host_operation() {
     device_ssh "set -e; \
         LOG=/var/mobile/Library/Logs/MacWSHostd.log; \
         BEFORE=\$(wc -l < \"\$LOG\" | tr -d ' '); \
-        /var/jb/usr/bin/uiopen 'macwshost://$action' >/dev/null 2>&1; \
+        /var/jb/usr/bin/uiopen --url 'macwshost://$action' >/dev/null 2>&1; \
         I=0; while [ \$I -lt $timeout ]; do \
             I=\$((I+1)); \
             tail -n +\$((BEFORE+1)) \"\$LOG\" | grep -Fq '$expected' && break; \

@@ -29,6 +29,10 @@ NS_ASSUME_NONNULL_BEGIN
 - (uint64_t)macOSDragPasteboardChangeCount;
 - (NSArray<NSItemProvider *> *)macOSDragItemProvidersAfterChangeCount:
     (uint64_t)changeCount waitMilliseconds:(uint64_t)waitMilliseconds;
+- (NSArray<NSItemProvider *> *)macOSDragItemProvidersAfterChangeCount:
+    (uint64_t)changeCount waitMilliseconds:(uint64_t)waitMilliseconds
+    stagedURLs:(NSArray<NSURL *> * _Nullable * _Nullable)stagedURLs;
+- (nullable NSItemProvider *)dragItemProviderForStagedURL:(NSURL *)url;
 - (void)stageAndPublishFiles:(NSArray<NSURL *> *)urls
                   completion:(void (^)(NSArray<NSURL *> *stagedURLs,
                                        NSError * _Nullable error))completion;

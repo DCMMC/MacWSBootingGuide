@@ -1,5 +1,6 @@
 #import <AppKit/AppKit.h>
 #import <ApplicationServices/ApplicationServices.h>
+#import <QuickLookThumbnailing/QuickLookThumbnailing.h>
 #import <dlfcn.h>
 #import <errno.h>
 #import <objc/runtime.h>
@@ -1072,6 +1073,108 @@ static int InspectUIKitMac(void) {
     return 0;
 }
 
+static int WriteFileIcon(const char *pathBytes, const char *outputBytes) {
+    NSString *path = [NSString stringWithUTF8String:pathBytes ?: ""];
+    NSString *output = [NSString stringWithUTF8String:outputBytes ?: ""];
+    if (path.length == 0 || output.length == 0 ||
+        ![NSFileManager.defaultManager fileExistsAtPath:path]) {
+        fprintf(stderr,
+                "macwsworkspacectl: file-icon requires an existing path "
+                "and an output PNG path\n");
+        return 66;
+    }
+
+    NSImage *icon = [NSWorkspace.sharedWorkspace iconForFile:path];
+    NSData *tiff = icon.TIFFRepresentation;
+    NSBitmapImageRep *bitmap = tiff.length
+        ? [NSBitmapImageRep imageRepWithData:tiff] : nil;
+    NSData *png = bitmap
+        ? [bitmap representationUsingType:NSBitmapImageFileTypePNG
+                               properties:@{}]
+        : nil;
+    if (!icon || png.length == 0 ||
+        ![png writeToFile:output options:NSDataWritingAtomic error:nil]) {
+        fprintf(stderr,
+                "macwsworkspacectl: IconServices produced no writable icon "
+                "for %s\n", path.fileSystemRepresentation);
+        return 1;
+    }
+
+    fprintf(stdout,
+            "file-icon-ready path=%s output=%s points=%.0fx%.0f "
+            "pixels=%ldx%ld bytes=%lu representations=%lu\n",
+            path.fileSystemRepresentation,
+            output.fileSystemRepresentation,
+            icon.size.width, icon.size.height,
+            (long)bitmap.pixelsWide, (long)bitmap.pixelsHigh,
+            (unsigned long)png.length,
+            (unsigned long)icon.representations.count);
+    return 0;
+}
+
+static int WriteFileThumbnail(const char *pathBytes,
+                              const char *outputBytes) {
+    NSString *path = [NSString stringWithUTF8String:pathBytes ?: ""];
+    NSString *output = [NSString stringWithUTF8String:outputBytes ?: ""];
+    if (path.length == 0 || output.length == 0 ||
+        ![NSFileManager.defaultManager fileExistsAtPath:path]) {
+        fprintf(stderr,
+                "macwsworkspacectl: file-thumbnail requires an existing "
+                "path and an output PNG path\n");
+        return 66;
+    }
+
+    NSURL *url = [NSURL fileURLWithPath:path];
+    QLThumbnailGenerationRequest *request =
+        [[QLThumbnailGenerationRequest alloc]
+            initWithFileAtURL:url
+                         size:CGSizeMake(512.0, 512.0)
+                        scale:1.0
+          representationTypes:
+              QLThumbnailGenerationRequestRepresentationTypeThumbnail];
+    dispatch_semaphore_t completed = dispatch_semaphore_create(0);
+    __block NSData *png = nil;
+    __block NSError *generationError = nil;
+    QLThumbnailGenerator *generator = QLThumbnailGenerator.sharedGenerator;
+    [generator generateBestRepresentationForRequest:request
+          completionHandler:^(QLThumbnailRepresentation *representation,
+                              NSError *error) {
+        if (representation.CGImage) {
+            NSBitmapImageRep *bitmap = [[NSBitmapImageRep alloc]
+                initWithCGImage:representation.CGImage];
+            png = [bitmap representationUsingType:NSBitmapImageFileTypePNG
+                                       properties:@{}];
+        }
+        generationError = error;
+        dispatch_semaphore_signal(completed);
+    }];
+
+    long waitResult = dispatch_semaphore_wait(
+        completed, dispatch_time(DISPATCH_TIME_NOW, 15 * NSEC_PER_SEC));
+    if (waitResult != 0) {
+        [generator cancelRequest:request];
+        fprintf(stderr,
+                "macwsworkspacectl: thumbnail request timed out for %s\n",
+                path.fileSystemRepresentation);
+        return 1;
+    }
+    if (png.length == 0 ||
+        ![png writeToFile:output options:NSDataWritingAtomic error:nil]) {
+        fprintf(stderr,
+                "macwsworkspacectl: thumbnail generation failed for %s: "
+                "%s\n",
+                path.fileSystemRepresentation,
+                generationError.description.UTF8String ?: "no image");
+        return 1;
+    }
+    fprintf(stdout,
+            "file-thumbnail-ready path=%s output=%s bytes=%lu\n",
+            path.fileSystemRepresentation,
+            output.fileSystemRepresentation,
+            (unsigned long)png.length);
+    return 0;
+}
+
 int main(int argc, const char *argv[]) {
     @autoreleasepool {
         if (argc >= 2 && strcmp(argv[1], "set-wallpaper") == 0) {
@@ -1133,6 +1236,12 @@ int main(int argc, const char *argv[]) {
         if (argc == 2 && strcmp(argv[1], "inspect-uikitmac") == 0) {
             return InspectUIKitMac();
         }
+        if (argc == 4 && strcmp(argv[1], "file-icon") == 0) {
+            return WriteFileIcon(argv[2], argv[3]);
+        }
+        if (argc == 4 && strcmp(argv[1], "file-thumbnail") == 0) {
+            return WriteFileThumbnail(argv[2], argv[3]);
+        }
         fprintf(stderr,
                 "usage: macwsworkspacectl set-wallpaper [path] | "
                 "show-launchpad | list-spaces | set-current-space ID | "
@@ -1144,7 +1253,8 @@ int main(int argc, const char *argv[]) {
                 "open-application /absolute/App.app | "
                 "session-status | activate-process PID | list-windows PID | "
                 "reopen-process PID | inspect-appkit-reopen | "
-                "inspect-uikitmac\n");
+                "inspect-uikitmac | file-icon PATH OUTPUT.png | "
+                "file-thumbnail PATH OUTPUT.png\n");
         return 64;
     }
 }

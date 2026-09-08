@@ -84,6 +84,8 @@ static const char *const kRunningBoardSettingsBridgeMarker =
     "/var/jb/var/mobile/macws-runningboard-settings-bridge.ready";
 static const char *const kFrame = "/var/mnt/rootfs/private/tmp/macws_vnc_fb";
 static const char *const kInputSocket = "/var/mnt/rootfs/private/tmp/macws_host_input.sock";
+static const char *const kVNCPointerProxySocket =
+    "/var/mnt/rootfs/private/tmp/macws_vnc_pointer_proxy.sock";
 static const char *const kShareFlag = "/var/mnt/rootfs/private/tmp/macws_vnc_share";
 static const char *const kCaptureFlag = "/var/mnt/rootfs/tmp/macws_capture_final";
 static const char *const kCaptureAck = "/var/mnt/rootfs/tmp/macws_capture_done";
@@ -1191,7 +1193,8 @@ static BOOL WaitForGUIComponents(NSTimeInterval timeout, int *wsPIDOut) {
         if (JobHasPID(kWindowServerLabel, &pid) &&
             JobHasPID(kInputLabel, NULL) &&
             JobHasPID(kDisplayLabel, NULL) &&
-            IsSocket(kInputSocket)) {
+            IsSocket(kInputSocket) &&
+            IsSocket(kVNCPointerProxySocket)) {
             if (wsPIDOut) *wsPIDOut = pid;
             return YES;
         }
@@ -1270,8 +1273,10 @@ static BOOL StartGUI(BOOL experimental, NSString **message) {
     // app is launched.  Runtime-confirmed on 2026-07-31: all three services
     // remained healthy for a minute with a zero-window DisplayStream, then the
     // old 60-second capture deadline tore them down.  Establish workspace
-    // readiness from the actual service endpoints; LaunchAllowedApp separately
-    // requires that process's real NSWindow metrics before reporting success.
+    // readiness from the actual service endpoints, including OSXvnc's
+    // localhost-only pointer proxy used for native Mission Control drags;
+    // LaunchAllowedApp separately requires that process's real NSWindow
+    // metrics before reporting success.
     SetState(YES, @"等待 WindowServer、触控与窗口流…", @"");
     int wsPID = 0;
     if (WaitForGUIComponents(15.0, &wsPID)) {
@@ -1359,7 +1364,8 @@ static BOOL IsThirdPartyAppIdentifier(const char *identifier) {
 
 // A native Host launch is complete when AppInputBridge has published at least
 // one real NSWindow descriptor. This replaces the VNC framebuffer
-// acknowledgement, which is intentionally absent under `start --no-vnc`.
+// acknowledgement, which is intentionally absent from the localhost-only
+// pointer-proxy job selected by `start --no-vnc`.
 static uint64_t ReadWindowMetricsGeneration(pid_t pid) {
     char path[PATH_MAX];
     snprintf(path, sizeof(path),
@@ -1524,6 +1530,7 @@ static BOOL SendAppInputRecord(pid_t pid, MacWSInputRecord *record,
         return NO;
     }
     record->targetPID = pid;
+    record->version = MacWSInputWireVersionForKind(record->kind);
     ssize_t sent = sendto(socketFD, record, sizeof(*record), 0,
         (const struct sockaddr *)&address, sizeof(address));
     int savedError = sent < 0 ? errno :
@@ -3146,6 +3153,7 @@ static BOOL LaunchRootExecutable(const char *identifier,
                                  NSString *rootPath,
                                  const char *logPath,
                                  NSTimeInterval timeout,
+                                 BOOL documentOpenPending,
                                  NSString **message) {
     NSString *hostPath = [@("/var/mnt/rootfs") stringByAppendingString:rootPath];
     // access(X_OK) asks iPadOS whether this foreign-platform Mach-O may be
@@ -3166,6 +3174,26 @@ static BOOL LaunchRootExecutable(const char *identifier,
 
     pid_t existingPID = FindRunningRootExecutable(rootPath);
     if (existingPID > 1) {
+        if (documentOpenPending) {
+            BOOL endpointReady = WaitForAppInputEndpoint(
+                existingPID, MIN(timeout, 5.0));
+            if (!endpointReady) {
+                HostLog(@"launch-document reuse pid=%d executable=%@ "
+                        "result=no-appinput-endpoint", existingPID,
+                        rootPath);
+                *message = @"目标应用仍在运行，但文稿投递端点未就绪";
+                return NO;
+            }
+            os_unfair_lock_lock(&gStateLock);
+            gActiveAppPID = existingPID;
+            gActiveAppID = [@(identifier) copy];
+            os_unfair_lock_unlock(&gStateLock);
+            TrackApplicationSession(@(identifier), rootPath, existingPID);
+            HostLog(@"launch-document reuse id=%s pid=%d executable=%@ "
+                    "endpoint=ready", identifier, existingPID, rootPath);
+            *message = @"目标应用已在运行，文稿投递端点已就绪";
+            return YES;
+        }
         int exitStatus = -1;
         BOOL finder = strcmp(identifier, "finder") == 0;
         BOOL reopenLifecycle = strcmp(identifier, "system-settings") == 0 ||
@@ -3295,6 +3323,7 @@ static BOOL LaunchRootExecutable(const char *identifier,
         }
         childEnvironment = ownedEnvironment;
     } else if (strcmp(identifier, "activity-monitor") == 0 ||
+               strcmp(identifier, "finder") == 0 ||
                strcmp(identifier, "custom-path") == 0 ||
                IsThirdPartyAppIdentifier(identifier)) {
         // Runtime-confirmed by Amadine-2026-08-11-141854.ips: creating a
@@ -3309,8 +3338,11 @@ static BOOL LaunchRootExecutable(const char *identifier,
         // NSWorkspace iconForFile: -> _LSFindOrRegisterBundleNode -> NSURL
         // bookmarkData -> CoreServicesInternal FileCache recursion until the
         // stack guard fires. Scope the filesystem contract to these proven
-        // consumers; ordinary Terminal/Finder keep their separately proven
-        // fork/catalog policies.
+        // consumers. Finder's file-open A/B on 2026-09-07 reached the same
+        // FileCache/CFURL recursion without this environment and reached the
+        // real RunningBoard launch boundary with it. Finder keeps its own
+        // clean-state and browser-window policy; this only supplies the
+        // logical-root filesystem contract.
         static const char *const thirdPartyEnvironment[] = {
             "MACWS_APP_MOUNT_COMPAT=1",
         };
@@ -3343,6 +3375,27 @@ static BOOL LaunchRootExecutable(const char *identifier,
     os_unfair_lock_unlock(&gStateLock);
     TrackApplicationSession(@(identifier), rootPath, pid);
     if (JobHasPID(kDisplayLabel, NULL)) {
+        if (documentOpenPending) {
+            BOOL endpointReady = WaitForAppInputEndpoint(pid,
+                                                          MIN(timeout, 10.0));
+            if (!endpointReady) {
+                os_unfair_lock_lock(&gStateLock);
+                if (gActiveAppPID == pid) {
+                    gActiveAppPID = 0;
+                    gActiveAppID = @"";
+                }
+                os_unfair_lock_unlock(&gStateLock);
+                *message = @"目标应用已启动，但文稿投递端点未就绪";
+                BeginApplicationChildReaper(pid, @(identifier));
+                return NO;
+            }
+            HostLog(@"launch-document process-ready id=%s pid=%d "
+                    "executable=%@ endpoint=ready", identifier, pid,
+                    rootPath);
+            *message = @"目标应用与文稿投递端点已就绪";
+            BeginApplicationChildReaper(pid, @(identifier));
+            return YES;
+        }
         int exitStatus = -1;
         BOOL finder = strcmp(identifier, "finder") == 0;
         BOOL reopenLifecycle = strcmp(identifier, "system-settings") == 0 ||
@@ -3478,7 +3531,9 @@ static NSString *ResolveExecutableRootPath(const char *requestedPath,
 
 static BOOL LaunchAllowedApp(const char *identifier, NSString **message);
 
-static BOOL LaunchRequestedPath(const char *requestedPath, NSString **message) {
+static BOOL LaunchRequestedPath(const char *requestedPath,
+                                BOOL documentOpenPending,
+                                NSString **message) {
     NSString *error = nil;
     NSString *rootPath = ResolveExecutableRootPath(requestedPath, &error);
     if (!rootPath) {
@@ -3505,7 +3560,8 @@ static BOOL LaunchRequestedPath(const char *requestedPath, NSString **message) {
             return LaunchAllowedApp(kAllowedApps[index].identifier, message);
     }
     return LaunchRootExecutable("custom-path", rootPath,
-        "/var/mobile/Library/Logs/CustomApp.host.log", 30.0, message);
+        "/var/mobile/Library/Logs/CustomApp.host.log", 30.0,
+        documentOpenPending, message);
 }
 
 static BOOL LaunchAllowedApp(const char *identifier, NSString **message) {
@@ -3543,13 +3599,249 @@ static BOOL LaunchAllowedApp(const char *identifier, NSString **message) {
         }
     }
     if (!LaunchRootExecutable(identifier, @(app->rootPath), app->logPath,
-                              30.0, message)) return NO;
+                              30.0, NO, message)) return NO;
     if (strcmp(identifier, "glassdemo") == 0) {
         *message = @"GlassDemo 窗口已就绪；从窗口列表打开后即可直接触控";
     } else {
         *message = [NSString stringWithFormat:
             @"已启动 %s，AppKit 窗口已进入 DisplayStream 列表", identifier];
     }
+    return YES;
+}
+
+static NSArray<NSString *> *ValidatedDocumentPaths(
+        xpc_object_t request, NSString **message) {
+    xpc_object_t values = xpc_dictionary_get_value(
+        request, MACWS_CONTROL_KEY_DOCUMENT_PATHS);
+    if (!values || xpc_get_type(values) != XPC_TYPE_ARRAY) {
+        if (message) *message = @"缺少文稿路径列表";
+        return nil;
+    }
+    size_t count = xpc_array_get_count(values);
+    if (count == 0 || count > 128) {
+        if (message) *message = @"文稿数量必须在 1 到 128 之间";
+        return nil;
+    }
+    char resolvedRoot[PATH_MAX] = {0};
+    if (!realpath(kRootFS, resolvedRoot)) {
+        if (message) *message = @"无法解析 macOS 根目录";
+        return nil;
+    }
+    size_t rootLength = strlen(resolvedRoot);
+    NSMutableArray<NSString *> *paths = [NSMutableArray arrayWithCapacity:count];
+    for (size_t index = 0; index < count; index++) {
+        xpc_object_t value = xpc_array_get_value(values, index);
+        const char *requested = value && xpc_get_type(value) == XPC_TYPE_STRING
+            ? xpc_string_get_string_ptr(value) : NULL;
+        if (!requested || requested[0] != '/' ||
+            strlen(requested) >= PATH_MAX) {
+            if (message) *message = @"文稿路径不是有效的 macOS 绝对路径";
+            return nil;
+        }
+        NSString *rootPath = [@(requested) stringByStandardizingPath];
+        NSString *hostPath = [@(kRootFS) stringByAppendingString:rootPath];
+        char resolved[PATH_MAX] = {0};
+        struct stat status = {0};
+        if (!realpath(hostPath.fileSystemRepresentation, resolved) ||
+            strncmp(resolved, resolvedRoot, rootLength) != 0 ||
+            resolved[rootLength] != '/' || stat(resolved, &status) != 0 ||
+            !S_ISREG(status.st_mode)) {
+            HostLog(@"open-documents reject index=%zu requested=%s "
+                    "resolved=%s errno=%d (%s)", index, requested,
+                    resolved[0] ? resolved : "(none)", errno,
+                    strerror(errno));
+            if (message) *message = @"文稿不在受控 macOS 根目录内，或不是普通文件";
+            return nil;
+        }
+        [paths addObject:rootPath];
+    }
+    return paths;
+}
+
+static BOOL WriteAllBytes(int descriptor, const void *bytes, size_t length) {
+    const uint8_t *cursor = bytes;
+    while (length != 0) {
+        ssize_t count = write(descriptor, cursor, length);
+        if (count < 0 && errno == EINTR) continue;
+        if (count <= 0) return NO;
+        cursor += (size_t)count;
+        length -= (size_t)count;
+    }
+    return YES;
+}
+
+static void OpenDocumentHostPaths(pid_t targetPID, uint64_t nonce,
+                                  char *sidecar, size_t sidecarSize,
+                                  char *ack, size_t ackSize) {
+    snprintf(sidecar, sidecarSize, "%s%s.%d.%016llx.plist", kRootFS,
+             MACWS_OPEN_DOCUMENT_SIDECAR_PREFIX, targetPID,
+             (unsigned long long)nonce);
+    snprintf(ack, ackSize, "%s%s_ack.%d.%016llx.bin", kRootFS,
+             MACWS_OPEN_DOCUMENT_SIDECAR_PREFIX, targetPID,
+             (unsigned long long)nonce);
+}
+
+static BOOL PublishOpenDocumentSidecar(pid_t targetPID, uint64_t nonce,
+                                       NSArray<NSString *> *paths,
+                                       char *sidecarOut,
+                                       size_t sidecarOutSize,
+                                       NSString **message) {
+    char ack[PATH_MAX] = {0};
+    OpenDocumentHostPaths(targetPID, nonce, sidecarOut, sidecarOutSize,
+                          ack, sizeof(ack));
+    NSDictionary *payload = @{
+        @"version": @1,
+        @"nonce": @(nonce),
+        @"target_pid": @(targetPID),
+        @"paths": paths,
+    };
+    NSError *serializationError = nil;
+    NSData *data = [NSPropertyListSerialization
+        dataWithPropertyList:payload
+                      format:NSPropertyListBinaryFormat_v1_0
+                     options:0
+                       error:&serializationError];
+    if (!data) {
+        if (message) *message = [NSString stringWithFormat:
+            @"无法构造文稿投递数据：%@",
+            serializationError.localizedDescription ?: @"未知错误"];
+        return NO;
+    }
+    char temporary[PATH_MAX] = {0};
+    int pathLength = snprintf(temporary, sizeof(temporary), "%s.new.%d",
+                              sidecarOut, getpid());
+    if (pathLength <= 0 || (size_t)pathLength >= sizeof(temporary)) {
+        if (message) *message = @"文稿投递路径过长";
+        return NO;
+    }
+    (void)unlink(temporary);
+    (void)unlink(sidecarOut);
+    (void)unlink(ack);
+    int descriptor = open(temporary,
+        O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
+    if (descriptor < 0) {
+        if (message) *message = [NSString stringWithFormat:
+            @"无法创建文稿投递数据（errno=%d）", errno];
+        return NO;
+    }
+    BOOL written = WriteAllBytes(descriptor, data.bytes, data.length) &&
+        fsync(descriptor) == 0;
+    int savedError = written ? 0 : (errno ?: EIO);
+    if (close(descriptor) != 0 && written) {
+        written = NO;
+        savedError = errno;
+    }
+    if (written && rename(temporary, sidecarOut) != 0) {
+        written = NO;
+        savedError = errno;
+    }
+    if (!written) {
+        (void)unlink(temporary);
+        if (message) *message = [NSString stringWithFormat:
+            @"无法发布文稿投递数据（errno=%d）", savedError];
+    }
+    return written;
+}
+
+static BOOL WaitForOpenDocumentAck(pid_t targetPID, uint64_t nonce,
+                                   uint32_t expectedCount,
+                                   NSTimeInterval timeout) {
+    char sidecar[PATH_MAX] = {0};
+    char ackPath[PATH_MAX] = {0};
+    OpenDocumentHostPaths(targetPID, nonce, sidecar, sizeof(sidecar),
+                          ackPath, sizeof(ackPath));
+    NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:timeout];
+    BOOL accepted = NO;
+    while (deadline.timeIntervalSinceNow > 0) {
+        int descriptor = open(ackPath, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+        if (descriptor >= 0) {
+            MacWSOpenDocumentAck ack = {0};
+            struct stat status = {0};
+            ssize_t count = read(descriptor, &ack, sizeof(ack));
+            BOOL complete = fstat(descriptor, &status) == 0 &&
+                count == (ssize_t)sizeof(ack) &&
+                status.st_size == (off_t)sizeof(ack) &&
+                S_ISREG(status.st_mode) && status.st_nlink == 1 &&
+                (status.st_mode & 022) == 0;
+            close(descriptor);
+            if (complete && ack.magic == MACWS_OPEN_DOCUMENT_ACK_MAGIC &&
+                ack.version == MACWS_OPEN_DOCUMENT_ACK_VERSION &&
+                ack.size == sizeof(ack) && ack.nonce == nonce &&
+                ack.targetPID == targetPID &&
+                ack.acceptedCount == expectedCount) {
+                accepted = YES;
+                break;
+            }
+        }
+        if (kill(targetPID, 0) != 0 && errno == ESRCH) break;
+        usleep(20000);
+    }
+    (void)unlink(ackPath);
+    if (!accepted) (void)unlink(sidecar);
+    return accepted;
+}
+
+static BOOL OpenDocumentsRequest(xpc_object_t request, pid_t *targetPIDOut,
+                                 NSString **message) {
+    NSArray<NSString *> *paths = ValidatedDocumentPaths(request, message);
+    if (!paths) return NO;
+    const char *applicationPath = xpc_dictionary_get_string(
+        request, MACWS_CONTROL_KEY_APP_PATH);
+    if (!LaunchRequestedPath(applicationPath, YES, message)) return NO;
+    os_unfair_lock_lock(&gStateLock);
+    pid_t targetPID = gActiveAppPID;
+    os_unfair_lock_unlock(&gStateLock);
+    if (targetPID <= 1 || !WaitForAppInputEndpoint(targetPID, 2.0)) {
+        if (message) *message = @"目标应用没有可用的 AppKit 文稿端点";
+        return NO;
+    }
+    uint64_t nonce = 0;
+    do {
+        nonce = ((uint64_t)arc4random() << 32) | arc4random();
+    } while (nonce == 0);
+    char sidecar[PATH_MAX] = {0};
+    if (!PublishOpenDocumentSidecar(targetPID, nonce, paths, sidecar,
+                                    sizeof(sidecar), message)) return NO;
+    static _Atomic uint32_t sequence = 0;
+    MacWSInputRecord record = {
+        .magic = MACWS_INPUT_MAGIC,
+        .version = MACWS_INPUT_VERSION,
+        .kind = MacWSInputKindOpenDocuments,
+        .sceneID = nonce,
+        .x = 0.0f,
+        .y = 0.0f,
+        .frameWidth = 1,
+        .frameHeight = 1,
+        .targetPID = targetPID,
+        .source = MacWSInputSourceUnknown,
+        .sampleSequence = atomic_fetch_add(&sequence, 1) + 1,
+    };
+    int sendError = 0;
+    if (!SendAppInputRecord(targetPID, &record, &sendError)) {
+        (void)unlink(sidecar);
+        if (message) *message = [NSString stringWithFormat:
+            @"无法投递 AppKit 文稿事件（errno=%d）", sendError];
+        return NO;
+    }
+    // The acknowledgement is written only after the target's real AppKit
+    // delegate returns. Runtime witness 1788787445.832..1788787453.912 showed
+    // Preview opening the document while the former eight-second deadline
+    // expired first; the subsequent window was published at 1788787468.522.
+    // Keep the success criterion unchanged and wait for that real handler
+    // completion through a cold-launch-sized bounded interval.
+    BOOL accepted = WaitForOpenDocumentAck(
+        targetPID, nonce, (uint32_t)paths.count, 30.0);
+    HostLog(@"open-documents app=%s pid=%d nonce=%016llx count=%lu "
+            "result=%@", applicationPath ?: "(nil)", targetPID,
+            (unsigned long long)nonce, (unsigned long)paths.count,
+            accepted ? @"appkit-accepted" : @"ack-timeout");
+    if (!accepted) {
+        if (message) *message = @"目标应用没有确认 AppKit 文稿事件";
+        return NO;
+    }
+    if (targetPIDOut) *targetPIDOut = targetPID;
+    if (message) *message = [NSString stringWithFormat:
+        @"已由目标应用接收 %lu 个文稿", (unsigned long)paths.count];
     return YES;
 }
 
@@ -5555,11 +5847,21 @@ static void ServeRequest(xpc_object_t request) {
                 launchedAppPID = gActiveAppPID;
                 os_unfair_lock_unlock(&gStateLock);
             }
+        } else if (strcmp(op, MACWS_CONTROL_OP_OPEN_DOCUMENTS) == 0) {
+            SetState(YES, @"正在打开 macOS 文稿…", @"");
+            ok = OpenDocumentsRequest(request, &launchedAppPID, &message);
         } else if (strcmp(op, MACWS_CONTROL_OP_LAUNCH_PATH) == 0) {
             SetState(YES, @"启动 macOS 路径…", @"");
             ok = LaunchRequestedPath(
                 xpc_dictionary_get_string(request, MACWS_CONTROL_KEY_APP_PATH),
+                xpc_dictionary_get_bool(
+                    request, MACWS_CONTROL_KEY_DOCUMENT_OPEN_PENDING),
                 &message);
+            if (ok) {
+                os_unfair_lock_lock(&gStateLock);
+                launchedAppPID = gActiveAppPID;
+                os_unfair_lock_unlock(&gStateLock);
+            }
         } else if (strcmp(op, MACWS_CONTROL_OP_CAPTURE) == 0) {
             SetState(YES, @"请求刷新共享帧…", @"");
             int wsPID = 0;

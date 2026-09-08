@@ -56,6 +56,7 @@ variables. `MallocScribble` is explicitly forbidden.
   move. Native menus and Chromium popups therefore retain WindowServer/AppKit
   hover semantics without duplicating Host's circular pointer affordance.
 - Validated custom-path apps, generic Catalyst children, and the stock
+  Finder, custom-path applications, generic Catalyst children, and the
   UIKitSystem service receive the scoped `MACWS_APP_MOUNT_COMPAT=1` namespace
   contract. UIKitSystem owns the CoreServices repository used while Catalyst
   bundles initialize; without the same logical chroot root its CFURL cache can
@@ -211,11 +212,26 @@ all 48 Settings extension checks, and left the package `install ok installed`.
 The deb installs the optional VS Code launch job under
 `/var/jb/usr/macOS/gui-launchd`, which is intentionally not auto-scanned by
 launchd. `macos_gui.sh production` synchronizes the packaged 60,000-fish
-settings and Aquarium extension into the project-owned `targetfix13` profile
-before starting WindowServer. It preserves Chromium caches/session state and
-never reads or writes the user's normal VS Code profile. VS Code itself is
-still loaded explicitly after the GUI is ready; package installation or
-re-jailbreak cannot launch Electron prematurely.
+settings and Aquarium extension into the project-owned
+`agx-native-production1` profile selected by the launch plist before starting
+WindowServer. Production preflight requires the selected profile path and its
+materialized `settings.json` to match the packaged assets. It also requires
+`--use-angle=metal`, `--disable-gpu-sandbox`, `--ignore-gpu-blocklist` and the
+native-AGX environment, while rejecting the exact `--disable-gpu` argument.
+An obsolete or accidentally software-only profile therefore cannot silently
+disable WebGL or re-enable AgentHost. Chromium caches/session state are
+preserved and the user's normal VS Code profile is never read or written. VS
+Code itself is still loaded explicitly after the GUI is ready; package
+installation or re-jailbreak cannot launch Electron prematurely.
+
+The JIT W^X adapter never calls its interposed POSIX `mprotect` while holding
+the CodeRange table mutex. Runtime sampling of a stalled extension host showed
+that route recursively entered the overlap lookup and waited on the same
+mutex. The permission transition now uses the underlying `vm_protect`, and
+the thread-local writable state is resolved before acquiring the mutex so its
+first TLV lookup cannot recurse through runtime allocation while locked. The
+adapter continues to apply the real RW/RX transitions; it does not bypass a
+JIT permission check.
 
 The VS Code Helper Metal source-library cache has a separate persistent schema
 marker, `macws-macabi-source-v1`. Runtime capture on 2026-08-01 proved that an

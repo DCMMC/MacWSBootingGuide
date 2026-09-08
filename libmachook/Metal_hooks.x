@@ -19912,6 +19912,19 @@ static id macws_new_library_url_metal2metal(
         id self, SEL selector, NSURL *url, NSError **error) {
     id library = g_macws_new_library_url_orig
         ? g_macws_new_library_url_orig(self, selector, url, error) : nil;
+    if (access("/private/tmp/macws_mtl_data_diag", F_OK) == 0) {
+        NSError *returned_error = error ? *error : nil;
+        dprintf(STDERR_FILENO,
+            "#### MTL-LIB-URL pid=%d device=%s url=%s result=%p "
+            "class=%s errorDomain=%s errorCode=%ld description=%s\n",
+            getpid(), class_getName([self class]),
+            url.path.UTF8String ?: "(nil)", (void *)library,
+            library ? class_getName([library class]) : "(nil)",
+            returned_error ? returned_error.domain.UTF8String : "(nil)",
+            returned_error ? (long)returned_error.code : 0L,
+            returned_error ? returned_error.localizedDescription.UTF8String
+                           : "(nil)");
+    }
     if (!library || !getenv("MACWS_AGX_NATIVE")) return library;
 
     const MacWSMetal2MetalRuntimeObjects *keys =
@@ -21616,6 +21629,18 @@ static const char *macws_private_chroot_service_name(const char *name) {
         return "com.apple.macosbooter.iconservices";
     if (!strcmp(name, "com.apple.iconservices.store"))
         return "com.apple.macosbooter.iconservices.store";
+    if (!strcmp(name, "com.apple.pluginkit.pkd"))
+        return "com.apple.macosbooter.pluginkit.pkd";
+    if (!strcmp(name, "com.apple.quicklook.ThumbnailsAgent"))
+        return "com.apple.macosbooter.quicklook.ThumbnailsAgent";
+    if (!strcmp(name, "com.apple.quicklook.ThumbnailsAgent.CacheDelete"))
+        return "com.apple.macosbooter.quicklook.ThumbnailsAgent.CacheDelete";
+    if (!strcmp(name, "com.apple.quicklook"))
+        return "com.apple.macosbooter.quicklook";
+    if (!strcmp(name, "com.apple.quicklookd.xpc"))
+        return "com.apple.macosbooter.quicklookd.xpc";
+    if (!strcmp(name, "com.apple.quicklook.satellite"))
+        return "com.apple.macosbooter.quicklook.satellite";
     if (!strcmp(name, "com.apple.carboncore.csnameddata"))
         return "com.apple.macosbooter.carboncore.csnameddata";
     if (!strcmp(name, "com.apple.dock.helper"))
@@ -21833,6 +21858,15 @@ xpc_connection_t hooked_xpc_connection_create(const char *name, dispatch_queue_t
                 name != originalName ? "'" : "");
     }
 
+    // RE-confirmed in Ventura QuickLook's -[QLServerSatellite _connect]: the
+    // legacy generator asks libxpc to activate the bundled service by its
+    // identifier. There is no XPC bundle domain inside the chroot, so connect
+    // to the private launchd Mach service that hosts that same executable and
+    // wire protocol. Preserve the requested queue and all message handling.
+    if (originalName &&
+        !strcmp(originalName, "com.apple.quicklook.satellite")) {
+        return orig_xpc_connection_create_mach_service(name, queue, 0);
+    }
     return orig_xpc_connection_create(name, queue);
 }
 
@@ -22236,6 +22270,7 @@ __attribute__((constructor)) static void InitMetalHooks() {
         "/ViewBridge.framework/Versions/A/XPCServices/ViewBridgeAuxiliary.xpc",
         "/HIServices.framework/Versions/A/XPCServices/HIServicesProxy.xpc",
         "/AppKit.framework/Versions/C/XPCServices/OpenAndSavePanelProxy.xpc",
+        "/QuickLookUI.framework/Versions/A/XPCServices/QuickLookUIServiceProxy.xpc",
         "/Dock.framework/Versions/A/XPCServices/DockHelperProxy.xpc",
         "/ExtensionFoundation.framework/Versions/A/XPCServices/ExtensionKitProxy.xpc",
         "/FileCoordination.framework/Versions/A/XPCServices/FileCoordinationProxy.xpc",

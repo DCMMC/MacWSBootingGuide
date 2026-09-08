@@ -18,7 +18,7 @@
 #   --no-experimental     explicit control run without the native-AGX VNC adapters
 #   --diagnostics         also enable high-overhead AGX flight recorders/traces
 #   --no-terminal         start WindowServer + VNC only, no Terminal
-#   --no-vnc              start WindowServer (+ Terminal) but no VNC server
+#   --no-vnc              disable remote VNC; keep the localhost pointer proxy
 #   --pace-us=N           diagnostic synthetic-completion pace (8333..500000)
 #   --runtime-cap=N        optional automation wall-clock cap (minimum 60s)
 #
@@ -76,6 +76,7 @@ GUI_LAUNCHD_DIR=/var/jb/usr/macOS/gui-launchd   # script-owned; NOT auto-scanned
 WATCHDOG_PLIST="$GUI_LAUNCHD_DIR/com.macwsguide.watchdog.plist"
 VSCODE_ASSET_DIR=/var/jb/usr/macOS/share/vscode
 VNC_PLIST="$GUI_LAUNCHD_DIR/com.macwsguide.osxvnc.plist"
+VNC_POINTER_PROXY_SOCKET="$ROOTFS/private/tmp/macws_vnc_pointer_proxy.sock"
 TERM_PLIST="$GUI_LAUNCHD_DIR/com.macwsguide.terminal.plist"
 PBOARD_PLIST="$GUI_LAUNCHD_DIR/com.macwsguide.pboard.plist"
 PBS_PLIST="$GUI_LAUNCHD_DIR/com.macwsguide.pbs.plist"
@@ -88,7 +89,13 @@ CORELOCATIONAGENT_PLIST="$GUI_LAUNCHD_DIR/com.macwsguide.corelocationagent.plist
 LOCATIONBRIDGE_PLIST="$GUI_LAUNCHD_DIR/com.macwsguide.locationbridge.plist"
 ICONSERVICESD_PLIST="$GUI_LAUNCHD_DIR/com.macwsguide.iconservicesd.plist"
 ICONSERVICESAGENT_PLIST="$GUI_LAUNCHD_DIR/com.macwsguide.iconservicesagent.plist"
+PLUGINKIT_PKD_PLIST="$GUI_LAUNCHD_DIR/com.macwsguide.pluginkit-pkd.plist"
+QUICKLOOK_THUMBNAILS_PLIST="$GUI_LAUNCHD_DIR/com.macwsguide.quicklook-thumbnails.plist"
+QUICKLOOKD_PLIST="$GUI_LAUNCHD_DIR/com.macwsguide.quicklookd.plist"
+QUICKLOOK_SATELLITE_PLIST="$GUI_LAUNCHD_DIR/com.macwsguide.quicklook-satellite.plist"
 CSNAMEDDATAD_PLIST="$GUI_LAUNCHD_DIR/com.macwsguide.csnameddatad.plist"
+AUTHD_PLIST="$GUI_LAUNCHD_DIR/com.macwsguide.authd.plist"
+DESKTOP_SERVICES_HELPER_PLIST="$GUI_LAUNCHD_DIR/com.macwsguide.desktopserviceshelper.plist"
 FINDER_DESKTOP_PLIST="$GUI_LAUNCHD_DIR/com.macwsguide.finder-desktop.plist"
 DOCK_PLIST="$GUI_LAUNCHD_DIR/com.macwsguide.dock.plist"
 SYSTEMUI_PLIST="$GUI_LAUNCHD_DIR/com.macwsguide.systemuiserver.plist"
@@ -114,7 +121,13 @@ CORELOCATIONAGENT_LABEL=com.macwsguide.corelocationagent
 LOCATIONBRIDGE_LABEL=com.macwsguide.locationbridge
 ICONSERVICESD_LABEL=com.macwsguide.iconservicesd
 ICONSERVICESAGENT_LABEL=com.macwsguide.iconservicesagent
+PLUGINKIT_PKD_LABEL=com.macwsguide.pluginkit-pkd
+QUICKLOOK_THUMBNAILS_LABEL=com.macwsguide.quicklook-thumbnails
+QUICKLOOKD_LABEL=com.macwsguide.quicklookd
+QUICKLOOK_SATELLITE_LABEL=com.macwsguide.quicklook-satellite
 CSNAMEDDATAD_LABEL=com.macwsguide.csnameddatad
+AUTHD_LABEL=com.macwsguide.authd
+DESKTOP_SERVICES_HELPER_LABEL=com.macwsguide.desktopserviceshelper
 FINDER_DESKTOP_LABEL=com.macwsguide.finder-desktop
 DOCK_LABEL=com.macwsguide.dock
 SYSTEMUI_LABEL=com.macwsguide.systemuiserver
@@ -140,7 +153,8 @@ STEAM_LABEL=UIKitApplication:com.macwsguide.steam
 # race the new production job for Steam's singleton namespace.
 STEAM_LEGACY_LABEL=com.macwsguide.steam
 VSCODE_TRUST_SENTINEL="$ROOTFS/Applications/Visual Studio Code.app/Contents/Frameworks/Electron Framework.framework/Versions/A/Electron Framework"
-VSCODE_PROFILE_DIR="$ROOTFS/private/tmp/macws-vscode-profile-agx-native-targetfix13"
+VSCODE_PROFILE_NAME=macws-vscode-profile-agx-native-production1
+VSCODE_PROFILE_DIR="$ROOTFS/private/tmp/$VSCODE_PROFILE_NAME"
 VSCODE_EXTENSIONS_DIR="$ROOTFS/private/tmp/macws-vscode-extensions"
 # Metal's source-library FS cache is keyed by compiler build, not by the
 # effective target triple. Before the macabi source adapter existed, VS Code
@@ -209,9 +223,17 @@ CONTROL_CENTER_BIN=/System/Library/CoreServices/ControlCenter.app/Contents/MacOS
 OFFICE_LICENSING_BIN=/Library/PrivilegedHelperTools/com.microsoft.office.licensingV2.helper
 ICONSERVICESD_BIN=/System/Library/CoreServices/iconservicesd
 ICONSERVICESAGENT_BIN=/System/Library/CoreServices/iconservicesagent
+PLUGINKIT_PKD_BIN=/usr/libexec/pkd
+QUICKLOOK_THUMBNAILS_BIN=/System/Library/Frameworks/QuickLookThumbnailing.framework/Support/com.apple.quicklook.ThumbnailsAgent
+QUICKLOOKD_BIN=/System/Library/Frameworks/QuickLook.framework/Resources/quicklookd.app/Contents/MacOS/quicklookd
+QUICKLOOK_SATELLITE_BIN=/System/Library/Frameworks/QuickLook.framework/Versions/A/XPCServices/QuickLookSatellite.xpc/Contents/MacOS/QuickLookSatellite
+QUICKLOOK_UI_SERVICE_BIN=/System/Library/Frameworks/QuickLookUI.framework/Versions/A/XPCServices/QuickLookUIService.xpc/Contents/MacOS/QuickLookUIService
 CSNAMEDDATAD_BIN=/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/CarbonCore.framework/Versions/A/XPCServices/csnameddatad.xpc/Contents/MacOS/csnameddatad
+AUTHD_BIN=/System/Library/Frameworks/Security.framework/Versions/A/XPCServices/authd.xpc/Contents/MacOS/authd
+DESKTOP_SERVICES_HELPER_BIN=/System/Library/PrivateFrameworks/DesktopServicesPriv.framework/Versions/A/Resources/DesktopServicesHelper
 CSNAMEDDATA_PROXY=/var/jb/usr/macOS/Frameworks/HIServices.framework/Versions/A/XPCServices/HIServicesProxy.xpc/HIServicesProxy
 DOCK_HELPER_PROXY=/var/jb/usr/macOS/Frameworks/Dock.framework/Versions/A/XPCServices/DockHelperProxy.xpc/DockHelperProxy
+QUICKLOOK_UI_PROXY=/var/jb/usr/macOS/Frameworks/QuickLookUI.framework/Versions/A/XPCServices/QuickLookUIServiceProxy.xpc/QuickLookUIServiceProxy
 # Never launch Ventura's stock cfprefsd image directly.  iPadOS AMFI rejects
 # its Apple CT policy, while the project's broad chroot entitlement profile
 # gives it com.apple.security.system-container and makes sandbox_init kill it.
@@ -221,7 +243,7 @@ CFPREFSD_BIN=/usr/local/libexec/macws-cfprefsd
 DEFAULTS_BIN=/usr/bin/defaults
 LSREGISTER_BIN=/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister
 WORKSPACECTL_BIN=/usr/local/bin/macwsworkspacectl
-LAUNCHSERVICES_CATALOG_SCHEMA=macws-launchservices-catalog-v3
+LAUNCHSERVICES_CATALOG_SCHEMA=macws-launchservices-catalog-v4
 LAUNCHSERVICES_CATALOG_MARKER="$ROOTFS/var/db/macws/launchservices-catalog.ready"
 LSD_SESSION_USER_DIR=/var/folders/zz/zyxvpxvq6csfxvn_n0000000000000/0/macws-lsd-session/
 LAUNCHSERVICES_VERIFY_LOG="$LOGDIR/launchservices-catalog-verify.log"
@@ -262,6 +284,9 @@ P_CONTROL_CENTER='CoreServices/ControlCenter.app/Contents/MacOS/ControlCenter'
 P_OFFICE_LICENSING='PrivilegedHelperTools/com.microsoft.office.licensingV2.helper'
 P_ICONSERVICESD='CoreServices/iconservicesd'
 P_ICONSERVICESAGENT='CoreServices/iconservicesagent'
+P_QUICKLOOK_THUMBNAILS='QuickLookThumbnailing.framework/Support/com.apple.quicklook.ThumbnailsAgent'
+P_QUICKLOOKD='QuickLook.framework/Resources/quicklookd.app/Contents/MacOS/quicklookd'
+P_QUICKLOOK_SATELLITE='QuickLook.framework/Versions/A/XPCServices/QuickLookSatellite.xpc/Contents/MacOS/QuickLookSatellite'
 P_CSNAMEDDATAD='XPCServices/csnameddatad.xpc/Contents/MacOS/csnameddatad'
 P_DOCK_HELPER='XPCServices/DockHelper.xpc/Contents/MacOS/DockHelper'
 P_INPUTD='/usr/local/bin/macwsinputd'
@@ -543,6 +568,23 @@ proc_running() {
     ps aux 2>/dev/null | grep -v grep | grep -qF "$1"
 }
 
+wait_for_vnc_pointer_proxy() {
+    local waited=0
+    while [ "$waited" -lt 100 ]; do
+        if proc_running "$P_OSXVNC" && [ -S "$VNC_POINTER_PROXY_SOCKET" ]; then
+            log "OSXvnc pointer proxy ready at $VNC_POINTER_PROXY_SOCKET."
+            return 0
+        fi
+        sleep 0.1
+        waited=$((waited + 1))
+    done
+    proc_running "$P_OSXVNC" ||
+        log "ERROR: OSXvnc pointer-proxy process did not start."
+    [ -S "$VNC_POINTER_PROXY_SOCKET" ] ||
+        log "ERROR: OSXvnc pointer-proxy socket was not published."
+    return 1
+}
+
 # launchd's current PID for one exact job (empty / "-" when not running).
 launchd_job_pid() {
     local snapshot="" line="" value=""
@@ -718,6 +760,10 @@ stop_ws_dependents() {
     launchctl remove "$DISPLAY_LABEL" 2>/dev/null
     launchctl unload "$INTEROP_PLIST" 2>/dev/null
     launchctl remove "$INTEROP_LABEL" 2>/dev/null
+    launchctl unload "$DESKTOP_SERVICES_HELPER_PLIST" 2>/dev/null
+    launchctl remove "$DESKTOP_SERVICES_HELPER_LABEL" 2>/dev/null
+    launchctl unload "$AUTHD_PLIST" 2>/dev/null
+    launchctl remove "$AUTHD_LABEL" 2>/dev/null
     # This file is an output witness from the current interopd generation, not
     # persistent configuration. Never let a replacement process inherit an
     # apparently-ready provider from a dead generation.
@@ -760,8 +806,16 @@ stop_ws_dependents() {
         launchctl remove "$LSD_SYSTEM_LABEL" 2>/dev/null
         launchctl unload "$ICONSERVICESAGENT_PLIST" 2>/dev/null
         launchctl unload "$ICONSERVICESD_PLIST" 2>/dev/null
+        launchctl unload "$PLUGINKIT_PKD_PLIST" 2>/dev/null
+        launchctl unload "$QUICKLOOK_THUMBNAILS_PLIST" 2>/dev/null
+        launchctl unload "$QUICKLOOKD_PLIST" 2>/dev/null
+        launchctl unload "$QUICKLOOK_SATELLITE_PLIST" 2>/dev/null
         launchctl remove "$ICONSERVICESAGENT_LABEL" 2>/dev/null
         launchctl remove "$ICONSERVICESD_LABEL" 2>/dev/null
+        launchctl remove "$PLUGINKIT_PKD_LABEL" 2>/dev/null
+        launchctl remove "$QUICKLOOK_THUMBNAILS_LABEL" 2>/dev/null
+        launchctl remove "$QUICKLOOKD_LABEL" 2>/dev/null
+        launchctl remove "$QUICKLOOK_SATELLITE_LABEL" 2>/dev/null
         launchctl unload "$CSNAMEDDATAD_PLIST" 2>/dev/null
         launchctl remove "$CSNAMEDDATAD_LABEL" 2>/dev/null
     fi
@@ -808,6 +862,9 @@ stop_ws_dependents() {
     if [ "$preserve_catalog_services" -ne 1 ]; then
         kill_by_pattern "$P_ICONSERVICESAGENT"
         kill_by_pattern "$P_ICONSERVICESD"
+        kill_by_pattern "$P_QUICKLOOK_THUMBNAILS"
+        kill_by_pattern "$P_QUICKLOOKD"
+        kill_by_pattern "$P_QUICKLOOK_SATELLITE"
         kill_by_pattern "$P_CSNAMEDDATAD"
         kill_by_pattern "$P_SHAREDFILELISTD"
     fi
@@ -1093,6 +1150,10 @@ start_ws_dependents_after_replacement() {
         log "watchdog: private macOS settings service contracts did not recover"
         return 1
     }
+    publish_desktop_operation_services || {
+        log "watchdog: private macOS desktop-operation contracts did not recover"
+        return 1
+    }
     ensure_locationd_dirhelper_tree || {
         log "watchdog: Ventura locationd cache tree did not recover"
         return 1
@@ -1122,6 +1183,14 @@ start_ws_dependents_after_replacement() {
         launchctl load "$ICONSERVICESD_PLIST" 2>/dev/null
     [ ! -f "$ICONSERVICESAGENT_PLIST" ] || \
         launchctl load "$ICONSERVICESAGENT_PLIST" 2>/dev/null
+    [ ! -f "$PLUGINKIT_PKD_PLIST" ] || \
+        launchctl load "$PLUGINKIT_PKD_PLIST" 2>/dev/null
+    [ ! -f "$QUICKLOOK_THUMBNAILS_PLIST" ] || \
+        launchctl load "$QUICKLOOK_THUMBNAILS_PLIST" 2>/dev/null
+    [ ! -f "$QUICKLOOKD_PLIST" ] || \
+        launchctl load "$QUICKLOOKD_PLIST" 2>/dev/null
+    [ ! -f "$QUICKLOOK_SATELLITE_PLIST" ] || \
+        launchctl load "$QUICKLOOK_SATELLITE_PLIST" 2>/dev/null
     [ ! -f "$CSNAMEDDATAD_PLIST" ] || \
         launchctl load "$CSNAMEDDATAD_PLIST" 2>/dev/null
     for workspace_plist in "$FINDER_DESKTOP_PLIST" "$DOCK_PLIST" \
@@ -1139,9 +1208,15 @@ start_ws_dependents_after_replacement() {
     ensure_navigation_spaces || return 1
     refresh_dock_after_navigation_spaces || return 1
     apply_workspace_wallpaper || return 1
-    if [ "$WANT_VNC" = 1 ]; then
-        launchctl load "$VNC_PLIST" 2>/dev/null
-    fi
+    # Full-screen Mission Control drags must be posted from OSXvnc's real
+    # WindowServer/CGS client. Keep that process alive even when remote RFB is
+    # disabled; write_plists then binds its RFB listener to localhost only.
+    rm -f "$VNC_POINTER_PROXY_SOCKET"
+    launchctl load "$VNC_PLIST" 2>/dev/null
+    wait_for_vnc_pointer_proxy || {
+        log "watchdog: local Mission Control pointer proxy did not recover"
+        return 1
+    }
     if [ "$WANT_TERMINAL" = 1 ]; then
         sleep 2
         launchctl load "$TERM_PLIST" 2>/dev/null
@@ -1768,11 +1843,14 @@ restore_cold_boot_trust() {
         "$ROOTFS/System/Library/PrivateFrameworks/SystemStatusServer.framework/Support/systemstatusd" \
         "$ROOTFS/usr/local/libexec/macws-cfprefsd" \
         "$ROOTFS/usr/libexec/lsd" \
+        "$ROOTFS$PLUGINKIT_PKD_BIN" \
         "$ROOTFS/System/Library/CoreServices/Finder.app/Contents/MacOS/Finder" \
         "$ROOTFS/System/Library/PrivateFrameworks/TimelineUI.framework/Versions/A/TimelineUI" \
         "$ROOTFS/System/Library/CoreServices/Dock.app/Contents/MacOS/Dock" \
         "$ROOTFS/System/Library/CoreServices/Dock.app/Contents/XPCServices/DockHelper.xpc/Contents/MacOS/DockHelper" \
         "$ROOTFS$CSNAMEDDATAD_BIN" \
+        "$ROOTFS$AUTHD_BIN" \
+        "$ROOTFS$DESKTOP_SERVICES_HELPER_BIN" \
         "$ROOTFS/System/Library/PrivateFrameworks/ViewBridge.framework/Versions/A/XPCServices/ViewBridgeAuxiliary.xpc/Contents/MacOS/ViewBridgeAuxiliary" \
         "$ROOTFS/System/Library/Frameworks/ApplicationServices.framework/Versions/A/Frameworks/HIServices.framework/Versions/A/XPCServices/com.apple.hiservices-xpcservice.xpc/Contents/MacOS/com.apple.hiservices-xpcservice" \
         "$ROOTFS/System/Library/Frameworks/AppKit.framework/Versions/C/XPCServices/com.apple.appkit.xpc.openAndSavePanelService.xpc/Contents/MacOS/com.apple.appkit.xpc.openAndSavePanelService" \
@@ -1782,6 +1860,10 @@ restore_cold_boot_trust() {
         "$ROOTFS/System/Library/CoreServices/ControlCenter.app/Contents/MacOS/ControlCenter" \
         "$ROOTFS/System/Library/CoreServices/iconservicesd" \
         "$ROOTFS/System/Library/CoreServices/iconservicesagent" \
+        "$ROOTFS$QUICKLOOK_THUMBNAILS_BIN" \
+        "$ROOTFS$QUICKLOOKD_BIN" \
+        "$ROOTFS$QUICKLOOK_SATELLITE_BIN" \
+        "$ROOTFS$QUICKLOOK_UI_SERVICE_BIN" \
         "$ROOTFS/usr/libexec/pboard" \
         "$ROOTFS/System/Library/CoreServices/pbs" \
         "$ROOTFS$OFFICE_LICENSING_BIN" \
@@ -1797,6 +1879,16 @@ restore_cold_boot_trust() {
         "$ROOTFS/usr/local/bin/macwsinteropd" \
         "$ROOTFS/usr/local/bin/macwsworkspacectl"; do
         boot_trust_macho "$path" || return 1
+    done
+
+    quicklook_display_root="$ROOTFS/System/Library/Frameworks/QuickLookUI.framework/Versions/A/PlugIns"
+    for quicklook_display_bundle in "$quicklook_display_root"/*.qldisplay; do
+        [ -d "$quicklook_display_bundle" ] || continue
+        quicklook_display_name=${quicklook_display_bundle##*/}
+        quicklook_display_name=${quicklook_display_name%.qldisplay}
+        boot_trust_macho \
+            "$quicklook_display_bundle/Contents/MacOS/$quicklook_display_name" || \
+            return 1
     done
 
     restore_installed_application_trust || return 1
@@ -2036,10 +2128,14 @@ prepare_vscode_production_assets() {
         fi
         log "VS Code Metal source cache migrated to $VSCODE_METAL_CACHE_SCHEMA."
     fi
-    log "VS Code production assets ready (isolated profile=targetfix13)."
+    log "VS Code production assets ready (isolated profile=$VSCODE_PROFILE_NAME)."
 }
 
 write_plists() {
+    local vnc_listen_scope=""
+    if [ "$WANT_VNC" != 1 ]; then
+        vnc_listen_scope="        <string>-localhost</string>"
+    fi
     mkdir -p "$GUI_LAUNCHD_DIR"
 
     # Remove the pre-xpcproxy scaffold on upgrade.  A normal launchd Mach job
@@ -2049,6 +2145,15 @@ write_plists() {
     launchctl unload "$GUI_LAUNCHD_DIR/com.macwsguide.dockhelper.plist" 2>/dev/null
     launchctl remove com.macwsguide.dockhelper 2>/dev/null
     rm -f "$GUI_LAUNCHD_DIR/com.macwsguide.dockhelper.plist"
+    # Upgrade cleanup for the temporary service contracts used while the
+    # DesktopServices authorization failure was being traced.  They use the
+    # same private protocol names as the production jobs below and therefore
+    # must not remain registered in parallel.
+    launchctl unload "$GUI_LAUNCHD_DIR/com.macwsguide.authd-test.plist" 2>/dev/null
+    launchctl unload "$GUI_LAUNCHD_DIR/com.macwsguide.desktopserviceshelper-test.plist" 2>/dev/null
+    launchctl remove com.macwsguide.desktopserviceshelper-test 2>/dev/null
+    rm -f "$GUI_LAUNCHD_DIR/com.macwsguide.authd-test.plist" \
+          "$GUI_LAUNCHD_DIR/com.macwsguide.desktopserviceshelper-test.plist"
 
     # Ventura normally installs this as both a system daemon and login agent.
     # MacWS has one outer launchd domain, so publish one stock protocol owner
@@ -2099,6 +2204,7 @@ PLIST
         <string>${ROOTFS}</string>
         <string>${VNC_BIN}</string>
         <string>-rfbnoauth</string>
+${vnc_listen_scope}
         <!--
           OSXvnc maps RFB button 4 to the third CGPostMouseEvent slot unless
           this option is enabled. Runtime tracing in Dock then receives
@@ -2446,6 +2552,143 @@ PLIST
 </plist>
 PLIST
 
+    # PluginKit discovery must use the same Ventura LaunchServices catalog as
+    # Finder and Quick Look. Runtime oslog on 2026-09-07 showed the unisolated
+    # client reaching iPadOS pkd (pid 1836), which rejected the macOS
+    # com.apple.quicklook.preview and .thumbnail extension points with -10814.
+    # Host Ventura's stock pkd under a collision-free endpoint; libmachook
+    # rewrites both its check-in and every chroot client's lookup.
+    cat > "$PLUGINKIT_PKD_PLIST" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>${PLUGINKIT_PKD_LABEL}</string>
+    <key>POSIXSpawnType</key><string>Adaptive</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>${CHROOTEXEC}</string><string>0</string><string>0</string>
+        <string>${ROOTFS}</string><string>${PLUGINKIT_PKD_BIN}</string>
+    </array>
+    <key>MachServices</key>
+    <dict><key>com.apple.macosbooter.pluginkit.pkd</key><true/></dict>
+    <key>RunAtLoad</key><true/>
+    <key>KeepAlive</key><false/>
+    <key>EnableTransactions</key><true/>
+    <key>EnablePressuredExit</key><true/>
+    <key>StandardOutPath</key><string>${LOGDIR}/pluginkit-pkd.log</string>
+    <key>StandardErrorPath</key><string>${LOGDIR}/pluginkit-pkd.log</string>
+</dict>
+</plist>
+PLIST
+
+    # Finder's QLThumbnailGenerator client and iPadOS both use the public
+    # com.apple.quicklook.ThumbnailsAgent name. Runtime-confirmed on the target
+    # on 2026-09-06: the process holding that public job was uid 501 and had
+    # UUID BA2DE509-8911-30D7-9933-702807526BE2 (the iPadOS executable), while
+    # the installed Ventura executable has UUID
+    # 6FF47A91-A359-38A8-8E56-CCEA34DC129F. Publish the unmodified Ventura
+    # service under private names; libmachook rewrites both client lookup and
+    # the agent's NSXPCListener check-in at the transport boundary.
+    cat > "$QUICKLOOK_THUMBNAILS_PLIST" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>${QUICKLOOK_THUMBNAILS_LABEL}</string>
+    <key>POSIXSpawnType</key><string>Adaptive</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>${CHROOTEXEC}</string><string>0</string><string>0</string>
+        <string>${ROOTFS}</string><string>${QUICKLOOK_THUMBNAILS_BIN}</string>
+    </array>
+    <key>MachServices</key>
+    <dict>
+        <key>com.apple.macosbooter.quicklook.ThumbnailsAgent</key><true/>
+        <key>com.apple.macosbooter.quicklook.ThumbnailsAgent.CacheDelete</key><true/>
+    </dict>
+    <key>RunAtLoad</key><true/>
+    <key>KeepAlive</key><false/>
+    <key>EnableTransactions</key><true/>
+    <key>EnablePressuredExit</key><true/>
+    <key>StandardOutPath</key><string>${LOGDIR}/quicklook-thumbnails.log</string>
+    <key>StandardErrorPath</key><string>${LOGDIR}/quicklook-thumbnails.log</string>
+</dict>
+</plist>
+PLIST
+
+    # Finder's preview panel and qlmanage use the separate Ventura quicklookd
+    # endpoint. The stock LaunchAgent publishes both names; host the same
+    # executable and NSXPC listeners under collision-free names so thumbnail
+    # generation and preview requests stay on one Ventura protocol family.
+    cat > "$QUICKLOOKD_PLIST" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>${QUICKLOOKD_LABEL}</string>
+    <key>POSIXSpawnType</key><string>Adaptive</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>${CHROOTEXEC}</string><string>0</string><string>0</string>
+        <string>${ROOTFS}</string><string>${QUICKLOOKD_BIN}</string>
+    </array>
+    <key>MachServices</key>
+    <dict>
+        <key>com.apple.macosbooter.quicklook</key><true/>
+        <key>com.apple.macosbooter.quicklookd.xpc</key><true/>
+    </dict>
+    <key>RunAtLoad</key><true/>
+    <key>KeepAlive</key><false/>
+    <key>EnableTransactions</key><true/>
+    <key>EnablePressuredExit</key><true/>
+    <key>StandardOutPath</key><string>${LOGDIR}/quicklookd.log</string>
+    <key>StandardErrorPath</key><string>${LOGDIR}/quicklookd.log</string>
+</dict>
+</plist>
+PLIST
+
+    # Ventura's legacy thumbnail path runs generators in the bundled
+    # QuickLookSatellite XPC service. RE-confirmed in QuickLook 13.4 at
+    # -[QLServerSatellite _connect]+0x68: the thumbnail agent connects to
+    # com.apple.quicklook.satellite, then sends its unmodified setup/request
+    # dictionaries. Runtime LLDB on the target observed that send but no
+    # satellite process or completion/failure callback because the chroot has
+    # no XPC bundle activation domain. Publish the stock executable and wire
+    # protocol under a collision-free Mach name; libmachook adapts only the
+    # listener/lookup transport boundary.
+    cat > "$QUICKLOOK_SATELLITE_PLIST" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>${QUICKLOOK_SATELLITE_LABEL}</string>
+    <key>POSIXSpawnType</key><string>Adaptive</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>${CHROOTEXEC}</string>
+        <string>0</string>
+        <string>0</string>
+        <string>${ROOTFS}</string>
+        <string>${QUICKLOOK_SATELLITE_BIN}</string>
+    </array>
+    <key>MachServices</key>
+    <dict><key>com.apple.macosbooter.quicklook.satellite</key><true/></dict>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key><string>/Users/root</string>
+        <key>TMPDIR</key><string>/tmp</string>
+    </dict>
+    <key>RunAtLoad</key><true/>
+    <key>KeepAlive</key><false/>
+    <key>EnableTransactions</key><true/>
+    <key>ThrottleInterval</key><integer>3</integer>
+    <key>StandardOutPath</key><string>${LOGDIR}/quicklook-satellite.log</string>
+    <key>StandardErrorPath</key><string>${LOGDIR}/quicklook-satellite.log</string>
+</dict>
+</plist>
+PLIST
+
     # CarbonCore normally asks launchd's XPC bundle resolver to instantiate
     # csnameddatad for a login session. The chroot has no XPC bundle domain.
     # Runtime-confirmed on 2026-08-06: a Dock secondary click reached the real
@@ -2482,6 +2725,70 @@ PLIST
 </plist>
 PLIST
 
+    # Finder's DesktopServices client performs real Authorization.framework
+    # and helper handshakes before it accepts a file operation.  The chroot has
+    # no macOS launchd XPC bundle domain, while iPadOS owns the public authd
+    # name with a different protocol.  Publish the unmodified Ventura authd on
+    # the private name selected by libmachook.  HIServicesProxy is only the
+    # already-packaged setuid first image which enters the chroot; authd itself
+    # remains the protocol owner.
+    cat > "$AUTHD_PLIST" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>${AUTHD_LABEL}</string>
+    <key>POSIXSpawnType</key><string>Interactive</string>
+    <key>ProgramArguments</key>
+    <array><string>${CSNAMEDDATA_PROXY}</string></array>
+    <key>MachServices</key>
+    <dict><key>com.apple.macosbooter.authd</key><true/></dict>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>XPC_SERVICE_NAME</key><string>${AUTHD_LABEL}</string>
+        <key>MACWS_XPC_TARGET</key><string>${AUTHD_BIN}</string>
+        <key>HOME</key><string>/Users/root</string>
+        <key>TMPDIR</key><string>/tmp</string>
+    </dict>
+    <key>RunAtLoad</key><true/>
+    <key>KeepAlive</key><false/>
+    <key>EnableTransactions</key><true/>
+    <key>ThrottleInterval</key><integer>3</integer>
+    <key>StandardOutPath</key><string>${LOGDIR}/authd.log</string>
+    <key>StandardErrorPath</key><string>${LOGDIR}/authd.log</string>
+</dict>
+</plist>
+PLIST
+
+    # DesktopServicesHelper is a stock Ventura per-session Mach service.  Its
+    # own handshake validates the requesting process' audit token and TCC
+    # entitlement; no reply or authorization decision is synthesized here.
+    # MultipleInstances preserves the launchd request context used by the
+    # original service contract.
+    cat > "$DESKTOP_SERVICES_HELPER_PLIST" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>${DESKTOP_SERVICES_HELPER_LABEL}</string>
+    <key>POSIXSpawnType</key><string>Adaptive</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>${CHROOTEXEC}</string><string>0</string><string>0</string>
+        <string>${ROOTFS}</string><string>${DESKTOP_SERVICES_HELPER_BIN}</string>
+    </array>
+    <key>MachServices</key>
+    <dict><key>com.apple.macosbooter.DesktopServicesHelper</key><true/></dict>
+    <key>MultipleInstances</key><true/>
+    <key>EnableTransactions</key><true/>
+    <key>KeepAlive</key><false/>
+    <key>ThrottleInterval</key><integer>3</integer>
+    <key>StandardOutPath</key><string>${LOGDIR}/desktopserviceshelper.log</string>
+    <key>StandardErrorPath</key><string>${LOGDIR}/desktopserviceshelper.log</string>
+</dict>
+</plist>
+PLIST
+
     # A macOS Aqua login session normally launches Finder, Dock,
     # SystemUIServer and ControlCenter as per-user LaunchAgents.  The chroot
     # deliberately has no loginwindow domain, so map the stock Ventura agents'
@@ -2506,7 +2813,14 @@ PLIST
     <key>RunAtLoad</key><true/>
     <key>KeepAlive</key><false/>
     <key>EnvironmentVariables</key>
-    <dict><key>CA_VSYNC_OFF</key><string>1</string></dict>
+    <dict>
+        <key>CA_VSYNC_OFF</key><string>1</string>
+        <!-- Runtime A/B on 2026-09-07: Finder's document-open path without
+             this logical-root contract recursively entered
+             CoreServicesInternal FileCache/CFURL and SIGBUSed. With it, the
+             same selection reached the real LS/RBS launch boundary. -->
+        <key>MACWS_APP_MOUNT_COMPAT</key><string>1</string>
+    </dict>
     <key>StandardOutPath</key><string>${LOGDIR}/finder-desktop.log</string>
     <key>StandardErrorPath</key><string>${LOGDIR}/finder-desktop.log</string>
 </dict>
@@ -2855,6 +3169,7 @@ clear_diagnostic_state() {
 
 production_preflight() {
     local path plist key bad=0
+    local expected_vscode_profile_dir="$ROOTFS/private/tmp/macws-vscode-profile-agx-native-production1"
     clear_diagnostic_state
 
     # No production launch job may enable allocator/debug flight recorders via
@@ -2886,7 +3201,11 @@ production_preflight() {
                    MACWS_JIT_FAULT_WRITE_COMPAT \
                    MACWS_AMFI_IMMOVABLE_TASK_PORT_COMPAT \
                    MACWS_MACOS_SYSTEM_POLICY_COMPAT \
-                   MACWS_APP_MOUNT_COMPAT; do
+                   MACWS_APP_MOUNT_COMPAT \
+                   MACWS_AGX_NATIVE \
+                   MACWS_AGX_REGISTER_CLASSES \
+                   MACWS_PIN_FALLBACK \
+                   MACWS_CHROMIUM_COMPOSITE_OVERLAYS; do
             if ! plutil "$VSCODE_PLIST" 2>/dev/null |
                  grep -Eq "\"?$key\"?[[:space:]]*=[[:space:]]*1;"; then
                 log "ERROR: required VS Code production environment $key=1 missing from $VSCODE_PLIST"
@@ -2894,23 +3213,34 @@ production_preflight() {
             fi
         done
         for path in \
-            '--user-data-dir=/tmp/macws-vscode-profile-software-composite1' \
+            '--user-data-dir=/tmp/macws-vscode-profile-agx-native-production1' \
             '--extensions-dir=/tmp/macws-vscode-extensions' \
-            '--disable-gpu' \
+            '--disable-gpu-sandbox' \
+            '--use-angle=metal' \
+            '--ignore-gpu-blocklist' \
             '--disable-features=SkiaGraphite'; do
             if ! plutil "$VSCODE_PLIST" 2>/dev/null | grep -Fq -- "$path"; then
                 log "ERROR: required VS Code production argument missing: $path"
                 bad=1
             fi
         done
-        for key in MACWS_AGX_NATIVE MACWS_AGX_REGISTER_CLASSES \
-                   MACWS_PIN_FALLBACK MACWS_CHROMIUM_COMPOSITE_OVERLAYS; do
-            if plutil "$VSCODE_PLIST" 2>/dev/null |
-                 grep -Eq "\"?$key\"?[[:space:]]*=[[:space:]]*1;"; then
-                log "ERROR: VS Code software-compositor profile unexpectedly enables $key: $VSCODE_PLIST"
-                bad=1
-            fi
-        done
+        if [ "$VSCODE_PROFILE_DIR" != "$expected_vscode_profile_dir" ]; then
+            log "ERROR: VS Code asset target does not match its launch profile: $VSCODE_PROFILE_DIR"
+            bad=1
+        elif ! cmp -s "$VSCODE_ASSET_DIR/settings.json" \
+                       "$VSCODE_PROFILE_DIR/User/settings.json"; then
+            # Runtime-confirmed on 2026-09-04: the stale production generation
+            # spawned AgentHost despite the packaged false setting; that same
+            # generation later had Chrome_IOThread retrying a full MOJO Mach
+            # queue at 100% CPU.
+            log "ERROR: VS Code production settings are missing or stale in $VSCODE_PROFILE_DIR"
+            bad=1
+        fi
+        if plutil "$VSCODE_PLIST" 2>/dev/null |
+             grep -Eq '"--disable-gpu"([[:space:],;]|$)'; then
+            log "ERROR: VS Code native-AGX profile still disables the GPU: $VSCODE_PLIST"
+            bad=1
+        fi
     fi
     if [ -d "$ROOTFS/Applications/Steam.app" ]; then
         for key in MACWS_STEAM_CPU_RENDERING \
@@ -2960,14 +3290,17 @@ production_preflight() {
                 bad=1
             fi
         done
-        for key in MACWS_VNC_NATIVE_ALL MACWS_VNC_LOW_LATENCY_COMPRESSION; do
-            if ! plutil "$VNC_PLIST" 2>/dev/null |
-                 grep -Eq "\"?$key\"?[[:space:]]*=[[:space:]]*1;"; then
-                log "ERROR: required production VNC environment $key=1 missing from $VNC_PLIST"
-                bad=1
-            fi
-        done
+    elif ! plutil "$VNC_PLIST" 2>/dev/null | grep -Fq -- '"-localhost"'; then
+        log "ERROR: local pointer-proxy VNC job is not restricted to localhost: $VNC_PLIST"
+        bad=1
     fi
+    for key in MACWS_VNC_NATIVE_ALL MACWS_VNC_LOW_LATENCY_COMPRESSION; do
+        if ! plutil "$VNC_PLIST" 2>/dev/null |
+             grep -Eq "\"?$key\"?[[:space:]]*=[[:space:]]*1;"; then
+            log "ERROR: required OSXvnc environment $key=1 missing from $VNC_PLIST"
+            bad=1
+        fi
+    done
     diagnostic_flag_paths | while IFS= read -r path; do
         [ ! -e "$ROOTFS$path" ] || echo "$path"
     done > "$ROOTFS/private/tmp/macws_production_preflight.bad"
@@ -3016,6 +3349,8 @@ cleanup_macos() {
         "$P_MAPS" "$P_SYSTEM_SETTINGS" "$P_FINDER" "$P_DOCK" \
         "$P_DOCK_HELPER" "$P_SYSTEMUI" "$P_CONTROL_CENTER" \
         "$P_ICONSERVICESAGENT" "$P_ICONSERVICESD" \
+        "$P_QUICKLOOK_THUMBNAILS" "$P_QUICKLOOKD" \
+        "$P_QUICKLOOK_SATELLITE" \
         "$P_SHAREDFILELISTD" "$P_INPUTD" "$P_DISPLAYD" \
         "$P_INTEROPD" "$P_VSCODE" "$P_STEAM_OUTER" \
         "$P_STEAM_LIVE" "$P_STEAM_HELPER" "$P_WINDOWSERVER" \
@@ -3115,6 +3450,14 @@ for visible_root, suffix in roots:
                             os.path.join(bundle, "Contents", "Info.plist")))
         directories[:] = [name for name in directories
                           if not name.endswith(suffix)]
+
+for visible in (
+    "/System/Library/Frameworks/QuickLook.framework/Resources/Info.plist",
+    "/System/Library/Frameworks/QuickLookThumbnailing.framework/Resources/Info.plist",
+    "/System/Library/Frameworks/QuickLookThumbnailing.framework/PlugIns/ThumbnailExtension_macOS.appex/Contents/Info.plist",
+    "/System/Library/Frameworks/QuickLookUI.framework/PlugIns/QLPreviewGenerationExtension.appex/Contents/Info.plist",
+):
+    records.append((visible, rootfs + visible))
 
 system_version = rootfs + "/System/Library/CoreServices/SystemVersion.plist"
 records.append(("@SystemVersion", system_version))
@@ -3251,6 +3594,7 @@ prepare_settings_service_proxies() {
         /var/jb/usr/macOS/Frameworks/ViewBridge.framework/Versions/A/XPCServices/ViewBridgeAuxiliary.xpc/ViewBridgeAuxiliary \
         /var/jb/usr/macOS/Frameworks/HIServices.framework/Versions/A/XPCServices/HIServicesProxy.xpc/HIServicesProxy \
         /var/jb/usr/macOS/Frameworks/AppKit.framework/Versions/C/XPCServices/OpenAndSavePanelProxy.xpc/OpenAndSavePanelProxy \
+        /var/jb/usr/macOS/Frameworks/QuickLookUI.framework/Versions/A/XPCServices/QuickLookUIServiceProxy.xpc/QuickLookUIServiceProxy \
         /var/jb/usr/macOS/Frameworks/ExtensionFoundation.framework/Versions/A/XPCServices/ExtensionKitProxy.xpc/ExtensionKitProxy \
         /var/jb/usr/macOS/PrivateFrameworks/GeoServices.framework/Versions/A/XPCServices/GeodProxy.xpc/GeodProxy \
         /var/jb/Applications/SettingsExtensionProxy.app/SettingsExtensionProxy; do
@@ -3319,6 +3663,67 @@ publish_settings_service_contracts() {
         }
     done
     log "Private macOS ViewBridge, ExtensionKit, HIServices and GeoServices contracts ready."
+}
+
+publish_desktop_operation_services() {
+    local plist="" label="" authd_pid="" waited=0
+    [ -x "$CSNAMEDDATA_PROXY" ] || {
+        log "ERROR: authd chroot proxy is missing: $CSNAMEDDATA_PROXY"
+        return 1
+    }
+    chown root:wheel "$CSNAMEDDATA_PROXY" || return 1
+    chmod 4755 "$CSNAMEDDATA_PROXY" || return 1
+    for plist in "$AUTHD_PLIST" "$DESKTOP_SERVICES_HELPER_PLIST"; do
+        if [ ! -f "$plist" ]; then
+            log "ERROR: required macOS desktop-operation job is missing: $plist"
+            return 1
+        fi
+    done
+    [ -x "$ROOTFS$AUTHD_BIN" ] || {
+        log "ERROR: Ventura authd launch target is missing: $AUTHD_BIN"
+        return 1
+    }
+    [ -x "$ROOTFS$DESKTOP_SERVICES_HELPER_BIN" ] || {
+        log "ERROR: DesktopServicesHelper launch target is missing: $DESKTOP_SERVICES_HELPER_BIN"
+        return 1
+    }
+    for plist_label in \
+        "$AUTHD_PLIST:$AUTHD_LABEL" \
+        "$DESKTOP_SERVICES_HELPER_PLIST:$DESKTOP_SERVICES_HELPER_LABEL"; do
+        plist=${plist_label%%:*}
+        label=${plist_label#*:}
+        launchctl list "$label" >/dev/null 2>&1 || launchctl load "$plist" || return 1
+        launchctl list "$label" >/dev/null 2>&1 || {
+            log "ERROR: private desktop-operation contract was not registered: $label"
+            return 1
+        }
+    done
+
+    # authd is RunAtLoad and services synchronous Authorization.framework
+    # requests. Require the real stock payload to survive startup; the helper
+    # stays on demand and its registered MachService is its readiness contract.
+    while [ "$waited" -lt 10 ]; do
+        authd_pid=$(launchd_job_pid "$AUTHD_LABEL")
+        case "$authd_pid" in
+            ''|'-'|*[!0-9]*) ;;
+            *) kill -0 "$authd_pid" 2>/dev/null && break ;;
+        esac
+        sleep 1
+        waited=$((waited + 1))
+    done
+    case "$authd_pid" in
+        ''|'-'|*[!0-9]*)
+            log "ERROR: Ventura authd did not publish a live process."
+            tail -n 30 "$LOGDIR/authd.log" 2>/dev/null || true
+            return 1
+            ;;
+    esac
+    kill -0 "$authd_pid" 2>/dev/null || {
+        log "ERROR: Ventura authd exited during startup."
+        tail -n 30 "$LOGDIR/authd.log" 2>/dev/null || true
+        return 1
+    }
+    log "Private Ventura authd and DesktopServicesHelper contracts ready."
 }
 
 run_defaults_utility() {
@@ -3683,26 +4088,47 @@ repair_desktop() {
     verify_launchservices_database_for_desktop_repair || return 1
     ensure_desktop_job "$PBOARD_PLIST" "$PBOARD_LABEL" \
         "macOS pasteboard service" || return 1
+    publish_desktop_operation_services || return 1
     log "TIMING desktop-repair stage=launchservices-pasteboard seconds=$((SECONDS - stage_started)) total=$((SECONDS - repair_started))"
     stage_started=$SECONDS
 
     # Icon question marks are stale/fallback Dock tiles, not a reason to
     # fabricate images.  Recreate the two real Ventura IconServices endpoints
     # and then restart Dock so it resolves every tile from those endpoints.
-    local icon_stage_started=$SECONDS csnamed_retire_task=""
+    local icon_stage_started=$SECONDS csnamed_retire_task="" \
+        pkd_retire_task="" ql_retire_task="" quicklookd_retire_task="" \
+        quicklook_satellite_retire_task=""
     # The named-data launch contract is independent from both IconServices
     # contracts while retiring.  Start its exact-label retirement alongside
     # the IconServices pair, then publish all three fresh endpoints before
     # Dock is allowed to restart.
     retire_desktop_job "$CSNAMEDDATAD_PLIST" "$CSNAMEDDATAD_LABEL" &
     csnamed_retire_task=$!
+    retire_desktop_job "$PLUGINKIT_PKD_PLIST" "$PLUGINKIT_PKD_LABEL" &
+    pkd_retire_task=$!
+    retire_desktop_job "$QUICKLOOK_THUMBNAILS_PLIST" \
+        "$QUICKLOOK_THUMBNAILS_LABEL" &
+    ql_retire_task=$!
+    retire_desktop_job "$QUICKLOOKD_PLIST" "$QUICKLOOKD_LABEL" &
+    quicklookd_retire_task=$!
+    retire_desktop_job "$QUICKLOOK_SATELLITE_PLIST" \
+        "$QUICKLOOK_SATELLITE_LABEL" &
+    quicklook_satellite_retire_task=$!
     retire_desktop_job_pair \
         "$ICONSERVICESAGENT_PLIST" "$ICONSERVICESAGENT_LABEL" \
         "$ICONSERVICESD_PLIST" "$ICONSERVICESD_LABEL" || {
             wait "$csnamed_retire_task" 2>/dev/null || true
+            wait "$pkd_retire_task" 2>/dev/null || true
+            wait "$ql_retire_task" 2>/dev/null || true
+            wait "$quicklookd_retire_task" 2>/dev/null || true
+            wait "$quicklook_satellite_retire_task" 2>/dev/null || true
             return 1
         }
     wait "$csnamed_retire_task" || return 1
+    wait "$pkd_retire_task" || return 1
+    wait "$ql_retire_task" || return 1
+    wait "$quicklookd_retire_task" || return 1
+    wait "$quicklook_satellite_retire_task" || return 1
     log "TIMING desktop-repair detail=iconservices-nameddata-retire seconds=$((SECONDS - icon_stage_started))"
     icon_stage_started=$SECONDS
     rm -f "$LOGDIR/iconservicesd.log" "$LOGDIR/iconservicesagent.log"
@@ -3710,15 +4136,29 @@ repair_desktop() {
         "macOS IconServices store" || return 1
     load_desktop_job "$ICONSERVICESAGENT_PLIST" \
         "$ICONSERVICESAGENT_LABEL" "macOS IconServices agent" || return 1
+    load_desktop_job "$PLUGINKIT_PKD_PLIST" "$PLUGINKIT_PKD_LABEL" \
+        "macOS PluginKit database service" || return 1
+    load_desktop_job "$QUICKLOOK_THUMBNAILS_PLIST" \
+        "$QUICKLOOK_THUMBNAILS_LABEL" \
+        "macOS Quick Look thumbnail agent" || return 1
+    load_desktop_job "$QUICKLOOKD_PLIST" "$QUICKLOOKD_LABEL" \
+        "macOS Quick Look preview service" || return 1
+    load_desktop_job "$QUICKLOOK_SATELLITE_PLIST" \
+        "$QUICKLOOK_SATELLITE_LABEL" \
+        "macOS Quick Look legacy generator satellite" || return 1
     load_desktop_job "$CSNAMEDDATAD_PLIST" "$CSNAMEDDATAD_LABEL" \
         "Dock CarbonCore named-data service" || return 1
     log "TIMING desktop-repair detail=iconservices-nameddata-load seconds=$((SECONDS - icon_stage_started))"
     icon_stage_started=$SECONDS
     sleep 2
-    desktop_job_loaded "$ICONSERVICESD_LABEL" &&
+        desktop_job_loaded "$ICONSERVICESD_LABEL" &&
         desktop_job_loaded "$ICONSERVICESAGENT_LABEL" &&
+        desktop_job_loaded "$PLUGINKIT_PKD_LABEL" &&
+        desktop_job_loaded "$QUICKLOOK_THUMBNAILS_LABEL" &&
+        desktop_job_loaded "$QUICKLOOKD_LABEL" &&
+        desktop_job_loaded "$QUICKLOOK_SATELLITE_LABEL" &&
         desktop_job_loaded "$CSNAMEDDATAD_LABEL" || {
-            log "ERROR: IconServices/named-data did not survive its readiness window."
+            log "ERROR: IconServices/Quick Look/named-data did not survive its readiness window."
             return 1
         }
     log "TIMING desktop-repair detail=iconservices-nameddata-survival seconds=$((SECONDS - icon_stage_started))"
@@ -3754,6 +4194,10 @@ repair_desktop() {
         return 1
     fi
     for label in "$ICONSERVICESD_LABEL" "$ICONSERVICESAGENT_LABEL" \
+                 "$PLUGINKIT_PKD_LABEL" \
+                 "$QUICKLOOK_THUMBNAILS_LABEL" \
+                 "$QUICKLOOKD_LABEL" \
+                 "$QUICKLOOK_SATELLITE_LABEL" \
                  "$CSNAMEDDATAD_LABEL" "$DOCK_LABEL" "$SYSTEMUI_LABEL" \
                  "$CONTROL_CENTER_LABEL"; do
         desktop_job_loaded "$label" || {
@@ -3813,6 +4257,11 @@ rebuild_desktop_session() {
         log "ERROR: settings service contracts were not ready for the replacement WindowServer."
         return 1
     }
+    publish_desktop_operation_services || {
+        rm -f "$composite_marker"
+        log "ERROR: desktop-operation contracts were not ready for the replacement WindowServer."
+        return 1
+    }
     ensure_desktop_job "$LSD_SYSTEM_PLIST" "$LSD_SYSTEM_LABEL" \
         "macOS LaunchServices system store" || {
         rm -f "$composite_marker"; return 1;
@@ -3833,6 +4282,24 @@ rebuild_desktop_session() {
     }
     ensure_desktop_job "$ICONSERVICESAGENT_PLIST" \
         "$ICONSERVICESAGENT_LABEL" "macOS IconServices agent" || {
+        rm -f "$composite_marker"; return 1;
+    }
+    ensure_desktop_job "$PLUGINKIT_PKD_PLIST" "$PLUGINKIT_PKD_LABEL" \
+        "macOS PluginKit database service" || {
+        rm -f "$composite_marker"; return 1;
+    }
+    ensure_desktop_job "$QUICKLOOK_THUMBNAILS_PLIST" \
+        "$QUICKLOOK_THUMBNAILS_LABEL" \
+        "macOS Quick Look thumbnail agent" || {
+        rm -f "$composite_marker"; return 1;
+    }
+    ensure_desktop_job "$QUICKLOOKD_PLIST" "$QUICKLOOKD_LABEL" \
+        "macOS Quick Look preview service" || {
+        rm -f "$composite_marker"; return 1;
+    }
+    ensure_desktop_job "$QUICKLOOK_SATELLITE_PLIST" \
+        "$QUICKLOOK_SATELLITE_LABEL" \
+        "macOS Quick Look legacy generator satellite" || {
         rm -f "$composite_marker"; return 1;
     }
     ensure_desktop_job "$CSNAMEDDATAD_PLIST" "$CSNAMEDDATAD_LABEL" \
@@ -4073,6 +4540,30 @@ start_macos() {
     rm -f "$LOGDIR/iconservicesd.log" "$LOGDIR/iconservicesagent.log"
     launchctl load "$ICONSERVICESD_PLIST" || return 1
     launchctl load "$ICONSERVICESAGENT_PLIST" || return 1
+    rm -f "$LOGDIR/pluginkit-pkd.log"
+    launchctl load "$PLUGINKIT_PKD_PLIST" || return 1
+    launchctl list "$PLUGINKIT_PKD_LABEL" >/dev/null 2>&1 || {
+        log "ERROR: private Ventura PluginKit contract was not registered."
+        return 1
+    }
+    rm -f "$LOGDIR/quicklook-thumbnails.log"
+    launchctl load "$QUICKLOOK_THUMBNAILS_PLIST" || return 1
+    launchctl list "$QUICKLOOK_THUMBNAILS_LABEL" >/dev/null 2>&1 || {
+        log "ERROR: private Ventura Quick Look thumbnail contract was not registered."
+        return 1
+    }
+    rm -f "$LOGDIR/quicklookd.log"
+    launchctl load "$QUICKLOOKD_PLIST" || return 1
+    launchctl list "$QUICKLOOKD_LABEL" >/dev/null 2>&1 || {
+        log "ERROR: private Ventura Quick Look preview contract was not registered."
+        return 1
+    }
+    rm -f "$LOGDIR/quicklook-satellite.log"
+    launchctl load "$QUICKLOOK_SATELLITE_PLIST" || return 1
+    launchctl list "$QUICKLOOK_SATELLITE_LABEL" >/dev/null 2>&1 || {
+        log "ERROR: private Ventura Quick Look satellite contract was not registered."
+        return 1
+    }
 
     # CarbonCore's named-data endpoint is independent of IconServices but is
     # needed by Dock later in the same transaction. Start all three cold-boot
@@ -4140,6 +4631,8 @@ start_macos() {
     # must exist before any GUI application can enter that dependency chain.
     log "Publishing macOS ViewBridge, ExtensionKit and HIServices services..."
     publish_settings_service_contracts || return 1
+    log "Publishing Ventura authorization and DesktopServices helpers..."
+    publish_desktop_operation_services || return 1
 
     log "Loading legacy macOS launchservicesd..."
     launchctl load "$LAUNCHSERVICESD_PLIST" || return 1
@@ -4325,21 +4818,14 @@ start_macos() {
     macos_stage_started=$SECONDS
 
     if [ "$WANT_VNC" = 1 ]; then
-        log "Starting VNC server (launchd job '$VNC_LABEL', persistent)..."
-        rm -f "$LOGDIR/osxvnc.log"
-        launchctl load "$VNC_PLIST"
-        waited=0
-        while ! proc_running "$P_OSXVNC" && [ "$waited" -lt 10 ]; do
-            sleep 1
-            waited=$((waited + 1))
-        done
-        proc_running "$P_OSXVNC" || {
-            log "ERROR: VNC process did not start."
-            return 1
-        }
-        sleep 2
-        started_ws_unchanged "VNC startup" || return 1
+        log "Starting remote VNC and Mission Control pointer proxy (launchd job '$VNC_LABEL')..."
+    else
+        log "Starting localhost-only Mission Control pointer proxy (launchd job '$VNC_LABEL')..."
     fi
+    rm -f "$LOGDIR/osxvnc.log" "$VNC_POINTER_PROXY_SOCKET"
+    launchctl load "$VNC_PLIST" || return 1
+    wait_for_vnc_pointer_proxy || return 1
+    started_ws_unchanged "OSXvnc pointer-proxy startup" || return 1
 
     if [ "$WANT_TERMINAL" = 1 ]; then
         log "Starting Terminal (launchd job '$TERM_LABEL')..."
@@ -4411,7 +4897,11 @@ status() {
         || echo "(none loaded)"
     echo
     if proc_running "$P_OSXVNC"; then
-        echo "VNC: running -> connect with  vnc://<device-ip>:5900   (no password)"
+        if plutil "$VNC_PLIST" 2>/dev/null | grep -Fq -- '"-localhost"'; then
+            echo "VNC: localhost-only pointer proxy (remote framebuffer disabled)"
+        else
+            echo "VNC: running -> connect with  vnc://<device-ip>:5900   (no password)"
+        fi
     else
         echo "VNC: not running"
     fi

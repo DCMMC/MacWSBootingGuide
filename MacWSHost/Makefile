@@ -25,7 +25,7 @@ MacWSHost_FILES = main.m MacWSControlClient.m MacWSStreamClient.m \
 	MacWSMenuClient.m \
 	MacWSInteropClient.m ../misc/iosclear_ref.m
 MacWSHost_FRAMEWORKS = UIKit Metal MetalKit QuartzCore CoreGraphics Foundation \
-	IOKit IOSurface UniformTypeIdentifiers
+	AVFoundation ImageIO IOKit IOSurface UniformTypeIdentifiers
 MacWSHost_LIBRARIES = bsm
 MacWSHost_CFLAGS = -fobjc-arc -Wall -Wextra -I$(CURDIR)/../include \
 	-I$(CURDIR) -I$(CURDIR)/Support -I$(CURDIR)/Testing -I$(CURDIR)/Transport \

@@ -22,6 +22,9 @@ typedef NS_ENUM(NSUInteger, MacWSHostPresentationResolution) {
       emittedInput:(MacWSInputRecord)record;
 - (void)metalView:(MacWSMetalView *)view
   receivedWindows:(NSArray<MacWSStreamWindow *> *)windows;
+- (void)metalView:(MacWSMetalView *)view
+    windowConfigurationWasConstrainedToLogicalSize:(CGSize)appliedSize
+                                      requestedSize:(CGSize)requestedSize;
 @end
 
 /// Owns DisplayStream presentation and translates UIKit touch/keyboard input
@@ -45,6 +48,11 @@ typedef NS_ENUM(NSUInteger, MacWSHostPresentationResolution) {
 @property(nonatomic) CGSize minimumLogicalSize;
 @property(nonatomic) BOOL targetWindowResizable;
 @property(nonatomic) BOOL softwareKeyboardActive;
+// A native iPadOS drag and a macOS long-press/right-click begin with the same
+// physical gesture. The controller arms this explicitly for one cross-App
+// drag so UIKit alone owns that contact; ordinary macOS touch semantics remain
+// unchanged at all other times.
+@property(nonatomic) BOOL crossAppDragModeEnabled;
 @property(nonatomic, readonly) BOOL hasDirectSurfaceFrame;
 @property(nonatomic, readonly) BOOL hasFinalCompositeFrame;
 @property(nonatomic, readonly) BOOL streamServiceConnected;
@@ -59,6 +67,7 @@ typedef NS_ENUM(NSUInteger, MacWSHostPresentationResolution) {
 - (void)refreshPresentationPolicy;
 - (void)resetViewportZoom;
 - (void)geometryDidChange;
+- (void)observeTargetWindowLogicalSize:(CGSize)logicalSize;
 - (void)suspendStream;
 - (void)emitSoftwareText:(NSString *)text modifiers:(uint32_t)modifiers;
 - (void)emitSoftwareKeySym:(uint32_t)keySym modifiers:(uint32_t)modifiers;

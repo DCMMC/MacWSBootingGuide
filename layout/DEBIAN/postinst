@@ -8,6 +8,7 @@ KEYCHAIND_PLIST=/var/jb/Library/LaunchDaemons/com.macwsguide.keychain.plist
 VIEWBRIDGE_PROXY=/var/jb/usr/macOS/Frameworks/ViewBridge.framework/Versions/A/XPCServices/ViewBridgeAuxiliary.xpc/ViewBridgeAuxiliary
 HISERVICES_PROXY=/var/jb/usr/macOS/Frameworks/HIServices.framework/Versions/A/XPCServices/HIServicesProxy.xpc/HIServicesProxy
 OPEN_SAVE_PANEL_PROXY=/var/jb/usr/macOS/Frameworks/AppKit.framework/Versions/C/XPCServices/OpenAndSavePanelProxy.xpc/OpenAndSavePanelProxy
+QUICKLOOK_UI_PROXY=/var/jb/usr/macOS/Frameworks/QuickLookUI.framework/Versions/A/XPCServices/QuickLookUIServiceProxy.xpc/QuickLookUIServiceProxy
 DOCK_HELPER_PROXY=/var/jb/usr/macOS/Frameworks/Dock.framework/Versions/A/XPCServices/DockHelperProxy.xpc/DockHelperProxy
 EXTENSIONKIT_PROXY=/var/jb/usr/macOS/Frameworks/ExtensionFoundation.framework/Versions/A/XPCServices/ExtensionKitProxy.xpc/ExtensionKitProxy
 GEOD_PROXY=/var/jb/usr/macOS/PrivateFrameworks/GeoServices.framework/Versions/A/XPCServices/GeodProxy.xpc/GeodProxy
@@ -37,6 +38,28 @@ WORKSPACE_WALLPAPER_SOURCE=/var/jb/usr/macOS/share/wallpapers/macws-forest-lake.
 WORKSPACE_WALLPAPER_TARGET="$ROOTFS/usr/local/share/macws/wallpapers/macws-forest-lake.png"
 ANGLE_ASSET_SOURCE_DIR=/var/jb/usr/macOS/share/angle
 ANGLE_ASSET_TARGET_DIR="$ROOTFS/usr/local/share/macws/angle"
+SUBLIME_SETTINGS_TEMPLATE=/var/jb/usr/macOS/share/sublime/Preferences.sublime-settings
+
+install_sublime_software_renderer_default() {
+    sublime_binary="$ROOTFS/Applications/Sublime Text.app/Contents/MacOS/sublime_text"
+    settings_directory="$ROOTFS/var/root/Library/Application Support/Sublime Text/Packages/User"
+    settings_path="$settings_directory/Preferences.sublime-settings"
+    [ -x "$sublime_binary" ] || return 0
+    [ -f "$SUBLIME_SETTINGS_TEMPLATE" ] || return 1
+
+    # The shipped macOS platform setting selects OpenGL. On this device that
+    # is runtime-confirmed to render through GLRendererFloat and to hold
+    # Sublime's main thread in CAOpenGLLayer for most of an input refresh.
+    # Seed the application's supported CPU path only for a pristine profile;
+    # never replace an existing User preferences file.
+    if [ ! -e "$settings_path" ]; then
+        mkdir -p "$settings_directory" || return 1
+        cp "$SUBLIME_SETTINGS_TEMPLATE" "$settings_path" || return 1
+        chown root:wheel "$settings_path" 2>/dev/null || true
+        chmod 0644 "$settings_path" || return 1
+        echo 'Installed MacWS Sublime CPU-renderer default.'
+    fi
+}
 
 # A package install may replace libmachook or an ExtensionKit carrier.  Force
 # the next launch through the deep verifier before allowing the boot cache.
@@ -213,6 +236,7 @@ ensure_interop_signature() {
 trust_installed_macho "$VIEWBRIDGE_PROXY"
 trust_installed_macho "$HISERVICES_PROXY"
 trust_installed_macho "$OPEN_SAVE_PANEL_PROXY"
+trust_installed_macho "$QUICKLOOK_UI_PROXY"
 trust_installed_macho "$DOCK_HELPER_PROXY"
 trust_installed_macho "$EXTENSIONKIT_PROXY"
 trust_installed_macho "$GEOD_PROXY"
@@ -567,10 +591,30 @@ if [ -d "$ROOTFS/System/Library" ]; then
     # incompatible with the responsible-process carrier, before merging the
     # common MacWS admission rights.
     ensure_weather_signature || exit 1
+    install_sublime_software_renderer_default || exit 1
     ensure_chroot_application_signature \
         "$ROOTFS/System/Library/CoreServices/UIKitSystem.app/Contents/MacOS/UIKitSystem" || exit 1
     ensure_chroot_application_signature \
         "$ROOTFS/System/Library/PrivateFrameworks/ViewBridge.framework/Versions/A/XPCServices/ViewBridgeAuxiliary.xpc/Contents/MacOS/ViewBridgeAuxiliary" || exit 1
+    ensure_chroot_application_signature \
+        "$ROOTFS/System/Library/Frameworks/QuickLookUI.framework/Versions/A/XPCServices/QuickLookUIService.xpc/Contents/MacOS/QuickLookUIService" || exit 1
+    # QuickLookUIService dlopens the qldisplay implementation selected for the
+    # previewed type. Runtime oslog on 2026-09-08 showed its real Image and
+    # Generic bundle paths rejected as "missing compatible architecture"
+    # while both Mach-O headers contained arm64e; their exact CDHashes were
+    # absent from `jbctl trustcache info`, whereas the executing UI service's
+    # hash was present. Sign and admit the complete fixed system qldisplay set
+    # so Space preview does not regress when the selected UTI changes.
+    quicklook_display_root="$ROOTFS/System/Library/Frameworks/QuickLookUI.framework/Versions/A/PlugIns"
+    for quicklook_display_bundle in "$quicklook_display_root"/*.qldisplay; do
+        [ -d "$quicklook_display_bundle" ] || continue
+        quicklook_display_name=${quicklook_display_bundle##*/}
+        quicklook_display_name=${quicklook_display_name%.qldisplay}
+        quicklook_display_executable="$quicklook_display_bundle/Contents/MacOS/$quicklook_display_name"
+        [ ! -f "$quicklook_display_executable" ] || \
+            ensure_chroot_application_signature \
+                "$quicklook_display_executable" || exit 1
+    done
     ensure_chroot_application_signature \
         "$ROOTFS/System/Library/CoreServices/Dock.app/Contents/XPCServices/DockHelper.xpc/Contents/MacOS/DockHelper" || exit 1
     ensure_chroot_application_signature \
@@ -638,6 +682,33 @@ if [ -d "$ROOTFS/System/Library" ]; then
 else
     echo 'macOS rootfs is not mounted; chroot runtime sync deferred.'
 fi
+
+# Input protocol receivers keep the executable/libmachook mapping they had at
+# launch. Runtime disassembly on 2026-09-07 showed a live ABI-5 Dock still
+# rejecting ABI-6 fullscreen pointer records after package files had already
+# been replaced. Reload only jobs that are currently loaded; a package install
+# while macOS is stopped must preserve that stopped state.
+reload_loaded_input_job() {
+    label="$1"
+    plist="$2"
+    [ -f "$plist" ] || return 0
+    if ! /var/jb/usr/bin/launchctl list "$label" >/dev/null 2>&1; then
+        return 0
+    fi
+    /var/jb/usr/bin/launchctl unload "$plist" 2>/dev/null || true
+    if ! /var/jb/usr/bin/launchctl load "$plist"; then
+        echo "ERROR: failed to reload live input job $label" >&2
+        return 1
+    fi
+    echo "Reloaded live input job $label."
+}
+
+reload_loaded_input_job \
+    'UIKitApplication:com.macwsguide.input' \
+    '/var/jb/usr/macOS/LaunchDaemons/com.macwsguide.input.plist' || exit 1
+reload_loaded_input_job \
+    'com.macwsguide.dock' \
+    '/var/jb/usr/macOS/gui-launchd/com.macwsguide.dock.plist' || exit 1
 
 if [ -f "$HOSTD_PLIST" ]; then
     /var/jb/usr/bin/launchctl unload "$HOSTD_PLIST" 2>/dev/null || true
@@ -733,6 +804,7 @@ for proxy in \
     "$VIEWBRIDGE_PROXY" \
     "$HISERVICES_PROXY" \
     "$OPEN_SAVE_PANEL_PROXY" \
+    "$QUICKLOOK_UI_PROXY" \
     "$DOCK_HELPER_PROXY" \
     "$EXTENSIONKIT_PROXY" \
     "$GEOD_PROXY" \

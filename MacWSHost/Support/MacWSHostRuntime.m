@@ -119,7 +119,10 @@ BOOL MacWSSendInputRecord(const MacWSInputRecord *record, int *errorOut) {
             }
         }
 
-        ssize_t written = send(socketFD, record, sizeof(*record), MSG_DONTWAIT);
+        MacWSInputRecord wireRecord = *record;
+        wireRecord.version = MacWSInputWireVersionForKind(wireRecord.kind);
+        ssize_t written = send(socketFD, &wireRecord, sizeof(wireRecord),
+                               MSG_DONTWAIT);
         sent = written == (ssize_t)sizeof(*record);
         if (sent) break;
         savedError = written < 0 ? errno : EMSGSIZE;

@@ -2,6 +2,8 @@
 #import <Metal/Metal.h>
 #import <MetalKit/MetalKit.h>
 #import <QuartzCore/QuartzCore.h>
+#import <AVFoundation/AVFoundation.h>
+#import <ImageIO/ImageIO.h>
 #import <IOKit/IOKitLib.h>
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 #import <simd/simd.h>
@@ -70,6 +72,7 @@ static NSMutableDictionary<NSString *, NSUserActivity *> *MacWSSceneBindings;
 static NSMutableSet<NSString *> *MacWSSceneCloseRequestsSent;
 static NSMutableSet<NSString *> *MacWSObservedWindowIdentities;
 static NSMutableSet<NSString *> *MacWSPendingWindowSceneIdentities;
+static NSMutableDictionary<NSString *, NSNumber *> *MacWSClosingWindowIdentities;
 static NSString *const MacWSSceneBindingsDefaultsKey =
     @"MacWSPersistedSceneWindowBindings";
 static NSString *const MacWSWindowingLoadedPath =
@@ -133,8 +136,8 @@ static NSString *MacWSLocalizedPhase(NSString *phase) {
 
 @interface MacWSViewController : UIViewController
     <MacWSMetalViewStatusDelegate, MacWSInteropClientDelegate,
-     UIDocumentPickerDelegate, UIDragInteractionDelegate, UITextFieldDelegate,
-     UIDropInteractionDelegate>
+     UIDragInteractionDelegate, UITextFieldDelegate,
+     UIDropInteractionDelegate, UIGestureRecognizerDelegate>
 - (instancetype)initWithSceneIdentifier:(NSString *)identifier
                               streamMode:(MacWSStreamMode)streamMode
                                 windowID:(uint32_t)windowID
@@ -205,6 +208,55 @@ static BOOL MacWSSceneIsFullscreenWorkspace(NSDictionary *info) {
         [info[@"mode"] unsignedIntValue] == MacWSStreamModeFullscreen;
 }
 
+static void MacWSEnsureRequestedSceneIsForeground(
+        UIWindowScene *windowScene, NSUserActivity *activity,
+        UIScene *preferredRequestingScene, NSUInteger attempt) {
+    if (!windowScene || !windowScene.session || attempt > 2) return;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                 (attempt == 0 ? 250 : 500) * NSEC_PER_MSEC),
+                   dispatch_get_main_queue(), ^{
+        UISceneActivationState state = windowScene.activationState;
+        MacWSLog(@"scene-foreground-postcondition id=%@ attempt=%lu state=%ld",
+                 windowScene.session.persistentIdentifier,
+                 (unsigned long)attempt, (long)state);
+        if (state == UISceneActivationStateForegroundActive) return;
+
+        UIScene *requestingScene = nil;
+        if (preferredRequestingScene != windowScene &&
+            preferredRequestingScene.activationState ==
+                UISceneActivationStateForegroundActive) {
+            requestingScene = preferredRequestingScene;
+        } else {
+            for (UIScene *candidate in
+                    UIApplication.sharedApplication.connectedScenes) {
+                if (candidate != windowScene && candidate.activationState ==
+                        UISceneActivationStateForegroundActive) {
+                    requestingScene = candidate;
+                    break;
+                }
+            }
+        }
+        UISceneActivationRequestOptions *options =
+            [UISceneActivationRequestOptions new];
+        options.requestingScene = requestingScene ?: windowScene;
+        [UIApplication.sharedApplication
+            requestSceneSessionActivation:windowScene.session
+            userActivity:activity
+            options:options
+            errorHandler:^(NSError *error) {
+                MacWSLog(@"scene-foreground-retry failed id=%@ attempt=%lu error=%@",
+                         windowScene.session.persistentIdentifier,
+                         (unsigned long)attempt, error);
+            }];
+        MacWSLog(@"scene-foreground-retry requested id=%@ attempt=%lu source=%@",
+                 windowScene.session.persistentIdentifier,
+                 (unsigned long)attempt,
+                 requestingScene.session.persistentIdentifier ?: @"self");
+        MacWSEnsureRequestedSceneIsForeground(
+            windowScene, activity, requestingScene, attempt + 1);
+    });
+}
+
 static void MacWSRequestNewScene(UIScene *requestingScene,
                                  uint32_t windowID,
                                  int32_t ownerPID,
@@ -229,6 +281,11 @@ static void MacWSRequestNewScene(UIScene *requestingScene,
         @"minimum_height": @(windowID ? minimumSize.height : 0),
         @"resizable": @(windowID ? resizable : NO),
         @"title": activity.title,
+        // A user action or a newly discovered AppKit document requested this
+        // Scene for immediate presentation.  Preserve that intent through
+        // willConnectToSession:, where UIKit has finally created a concrete
+        // UIWindowScene whose foreground state can be verified.
+        @"foreground_on_connect": @YES,
     };
     UISceneSession *existingSession = nil;
     if (windowID != 0 && ownerPID > 1) {
@@ -279,6 +336,19 @@ static void MacWSRequestNewScene(UIScene *requestingScene,
         MacWSLog(@"scene-activation failed: %@", error);
         if (failureHandler) failureHandler(error);
     }];
+    if (existingSession) {
+        // willConnectToSession: does not run when a document belongs to an
+        // already connected background Scene. Verify that reuse path here as
+        // well, otherwise opening the same Finder item can update the AppKit
+        // window without bringing its existing iPadOS window to the front.
+        for (UIScene *candidate in application.connectedScenes) {
+            if (candidate.session != existingSession ||
+                ![candidate isKindOfClass:UIWindowScene.class]) continue;
+            MacWSEnsureRequestedSceneIsForeground(
+                (UIWindowScene *)candidate, activity, requestingScene, 0);
+            break;
+        }
+    }
 }
 
 // A fullscreen Scene is a Primary AppLayout.  On iPadOS 16, asking
@@ -755,12 +825,23 @@ static BOOL MacWSCloseMacWindowForSceneSession(UISceneSession *session,
         session.stateRestorationActivity;
     NSDictionary *info = activity.userInfo;
     int32_t ownerPID = 0;
-    uint32_t windowID = 0;
-    if (!MacWSSceneOwnedWindowFields(info, &ownerPID, &windowID, NULL))
+    uint32_t windowID = 0, logicalGroupID = 0;
+    if (!MacWSSceneOwnedWindowFields(
+            info, &ownerPID, &windowID, &logicalGroupID))
         return NO;
     int sendError = 0;
     BOOL sent = MacWSSendCloseWindow(windowID, ownerPID, &sendError);
     if (sent) {
+        NSString *windowIdentity = MacWSWindowIdentity(
+            ownerPID, windowID, logicalGroupID);
+        if (windowIdentity) {
+            if (!MacWSClosingWindowIdentities)
+                MacWSClosingWindowIdentities = [NSMutableDictionary dictionary];
+            MacWSClosingWindowIdentities[windowIdentity] =
+                @(CACurrentMediaTime());
+            [MacWSObservedWindowIdentities removeObject:windowIdentity];
+            [MacWSPendingWindowSceneIdentities removeObject:windowIdentity];
+        }
         [MacWSSceneCloseRequestsSent addObject:identifier];
         [MacWSSceneBindings removeObjectForKey:identifier];
         MacWSSetPersistedSceneBinding(identifier, nil);
@@ -975,7 +1056,6 @@ typedef void (^MacWSCompactMenuSelection)(MacWSMenuItem *item);
     UILabel *_displaySectionLabel;
     UILabel *_performanceSectionLabel;
     UILabel *_applicationsSectionLabel;
-    UILabel *_interopSectionLabel;
     UILabel *_zoomSectionLabel;
     UILabel *_languageSectionLabel;
     UILabel *_startupLogSectionLabel;
@@ -993,9 +1073,28 @@ typedef void (^MacWSCompactMenuSelection)(MacWSMenuItem *item);
     UIButton *_windowPickerButton;
     UIButton *_closeWindowButton;
     UIButton *_menuBarButton;
-    UIButton *_clipboardButton;
-    UIButton *_importButton;
-    UIButton *_macFilesButton;
+    UIButton *_crossAppDragButton;
+    UIButton *_crossAppDragSurface;
+    UIButton *_crossAppDragHandle;
+    UIVisualEffectView *_crossAppDragHandleMaterial;
+    UIView *_crossAppDragHandleTint;
+    UIImageView *_crossAppDragHandleBackIcon;
+    UIImageView *_crossAppDragHandleMiddleIcon;
+    UIImageView *_crossAppDragHandleIcon;
+    UILabel *_crossAppDragHandleBadge;
+    UILabel *_crossAppDragHandleTitle;
+    UIDragInteraction *_contentDragInteraction;
+    UITapGestureRecognizer *_crossAppDragPrepareTap;
+    UITapGestureRecognizer *_crossAppDragSelectionTap;
+    UILongPressGestureRecognizer *_crossAppDragTwoFingerHold;
+    CGPoint _crossAppDragSelectionPoint;
+    BOOL _crossAppDragSelectionPointValid;
+    NSArray<NSItemProvider *> *_preparedMacOSDragProviders;
+    NSArray<NSURL *> *_preparedMacOSDragURLs;
+    BOOL _crossAppDragPreparing;
+    uint64_t _crossAppDragPrepareSerial;
+    BOOL _crossAppDragArmed;
+    BOOL _crossAppDragTransferPending;
     UIButton *_keyboardButton;
     UIButton *_retryStartupButton;
     UITextField *_keyboardProxy;
@@ -1026,7 +1125,6 @@ typedef void (^MacWSCompactMenuSelection)(MacWSMenuItem *item);
     NSString *_lastLoggedControlSummary;
     NSString *_lastStartupLog;
     NSArray<MacWSStreamWindow *> *_streamWindows;
-    NSArray<NSURL *> *_receivedMacOSFiles;
     int32_t _pendingFinderWindowPID;
     NSUInteger _pendingFinderMenuAttempts;
     BOOL _finderMenuRequestInFlight;
@@ -1036,6 +1134,9 @@ typedef void (^MacWSCompactMenuSelection)(MacWSMenuItem *item);
     BOOL _pendingApplicationWindowRetryScheduled;
     uint32_t _pendingApplicationCandidateWindowID;
     CFTimeInterval _pendingApplicationCandidateSince;
+    uint64_t _constrainedSceneResizeSerial;
+    CGSize _lastConstrainedSceneTargetSize;
+    CFTimeInterval _lastConstrainedSceneResizeRequestTime;
     int32_t _fullscreenCatalogRetainedInputPID;
     uint32_t _fullscreenActivatedInputWindowID;
     int32_t _fullscreenActivatedInputOwnerPID;
@@ -1821,6 +1922,148 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
     _metalView.targetWindowID = _streamMode == MacWSStreamModeWindow ? _windowID : 0;
     _metalView.targetPID = _windowOwnerPID;
     [root addSubview:_metalView];
+    // A stationary two-finger hold is an explicit cross-App intent that does
+    // not overlap Finder's ordinary single-finger selection, context click,
+    // or internal drag. UIKit cancels the otherwise-idle two-finger contact
+    // only after the hold has actually recognized.
+    if (_windowID != 0) {
+        _crossAppDragSelectionTap = [[UITapGestureRecognizer alloc]
+            initWithTarget:self
+                    action:@selector(crossAppDragSelectionTapped:)];
+        _crossAppDragSelectionTap.numberOfTouchesRequired = 1;
+        _crossAppDragSelectionTap.cancelsTouchesInView = NO;
+        _crossAppDragSelectionTap.delaysTouchesBegan = NO;
+        _crossAppDragSelectionTap.delaysTouchesEnded = NO;
+        _crossAppDragSelectionTap.delegate = self;
+        [_metalView addGestureRecognizer:_crossAppDragSelectionTap];
+
+        _crossAppDragTwoFingerHold = [[UILongPressGestureRecognizer alloc]
+            initWithTarget:self
+                    action:@selector(crossAppDragTwoFingerHeld:)];
+        _crossAppDragTwoFingerHold.minimumPressDuration = 0.48;
+        _crossAppDragTwoFingerHold.numberOfTouchesRequired = 2;
+        _crossAppDragTwoFingerHold.allowableMovement = 12.0;
+        _crossAppDragTwoFingerHold.cancelsTouchesInView = YES;
+        _crossAppDragTwoFingerHold.delaysTouchesBegan = NO;
+        _crossAppDragTwoFingerHold.allowedTouchTypes = @[@(UITouchTypeDirect)];
+        _crossAppDragTwoFingerHold.delegate = self;
+        [_metalView addGestureRecognizer:_crossAppDragTwoFingerHold];
+    }
+    // A plain UIKit source surface isolates the system drag recognizer from
+    // MTKView's rendering/input recognizers. It is present only for the one
+    // explicitly armed cross-app transaction and otherwise cannot intercept
+    // macOS clicks, context clicks, or internal drags.
+    _crossAppDragSurface = [UIButton buttonWithType:UIButtonTypeCustom];
+    _crossAppDragSurface.translatesAutoresizingMaskIntoConstraints = NO;
+    _crossAppDragSurface.backgroundColor = UIColor.clearColor;
+    _crossAppDragSurface.accessibilityLabel = @"macOS 跨 App 拖动区域";
+    _crossAppDragSurface.hidden = YES;
+    [root addSubview:_crossAppDragSurface];
+    // Runtime-confirmed via /var/mobile/Library/Logs/MacWSHost.log: the same
+    // staged provider ended with Files operation=1 from the full-canvas source
+    // and operation=2 from a compact 58x58 source at the picked file. Keep the
+    // real UIDragInteraction source compact; decorative text lives outside it.
+    _crossAppDragHandle = [UIButton buttonWithType:UIButtonTypeSystem];
+    _crossAppDragHandle.bounds = CGRectMake(0, 0, 58, 58);
+    _crossAppDragHandle.backgroundColor = UIColor.clearColor;
+    _crossAppDragHandle.layer.cornerRadius = 16;
+    _crossAppDragHandle.layer.shadowColor = UIColor.blackColor.CGColor;
+    _crossAppDragHandle.layer.shadowOpacity = 0.30;
+    _crossAppDragHandle.layer.shadowRadius = 8;
+    _crossAppDragHandle.layer.shadowOffset = CGSizeMake(0, 4);
+
+    _crossAppDragHandleMaterial = [[UIVisualEffectView alloc]
+        initWithEffect:[UIBlurEffect effectWithStyle:
+            UIBlurEffectStyleSystemChromeMaterialDark]];
+    _crossAppDragHandleMaterial.frame = _crossAppDragHandle.bounds;
+    _crossAppDragHandleMaterial.autoresizingMask =
+        UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    _crossAppDragHandleMaterial.userInteractionEnabled = NO;
+    _crossAppDragHandleMaterial.clipsToBounds = YES;
+    _crossAppDragHandleMaterial.layer.cornerRadius = 16;
+    _crossAppDragHandleMaterial.layer.borderWidth = 1.0;
+    _crossAppDragHandleMaterial.layer.borderColor =
+        [UIColor.whiteColor colorWithAlphaComponent:0.36].CGColor;
+    [_crossAppDragHandle addSubview:_crossAppDragHandleMaterial];
+
+    _crossAppDragHandleTint = [[UIView alloc]
+        initWithFrame:_crossAppDragHandleMaterial.bounds];
+    _crossAppDragHandleTint.autoresizingMask =
+        UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    _crossAppDragHandleTint.userInteractionEnabled = NO;
+    _crossAppDragHandleTint.backgroundColor =
+        [UIColor.systemIndigoColor colorWithAlphaComponent:0.20];
+    [_crossAppDragHandleMaterial.contentView
+        addSubview:_crossAppDragHandleTint];
+
+    // iPadOS represents a multi-item drag as a small fan of the actual item
+    // previews. Keep those cards inside the runtime-confirmed 58x58 UIKit drag
+    // source so Files still negotiates a copy operation, while the file-name
+    // pill remains a noninteractive sibling below it.
+    _crossAppDragHandleBackIcon = [[UIImageView alloc] initWithFrame:CGRectZero];
+    _crossAppDragHandleMiddleIcon = [[UIImageView alloc] initWithFrame:CGRectZero];
+    _crossAppDragHandleIcon = [[UIImageView alloc] initWithFrame:CGRectZero];
+    for (UIImageView *thumbnailView in @[
+             _crossAppDragHandleBackIcon,
+             _crossAppDragHandleMiddleIcon,
+             _crossAppDragHandleIcon]) {
+        thumbnailView.contentMode = UIViewContentModeScaleAspectFit;
+        thumbnailView.backgroundColor = UIColor.secondarySystemBackgroundColor;
+        thumbnailView.tintColor = UIColor.systemIndigoColor;
+        thumbnailView.clipsToBounds = YES;
+        thumbnailView.layer.cornerRadius = 6.5;
+        thumbnailView.layer.borderWidth = 1.0;
+        thumbnailView.layer.borderColor =
+            [UIColor.whiteColor colorWithAlphaComponent:0.72].CGColor;
+        thumbnailView.userInteractionEnabled = NO;
+        thumbnailView.hidden = YES;
+        [_crossAppDragHandle addSubview:thumbnailView];
+    }
+
+    _crossAppDragHandleBadge = [[UILabel alloc]
+        initWithFrame:CGRectMake(39, -5, 24, 24)];
+    _crossAppDragHandleBadge.backgroundColor = UIColor.systemOrangeColor;
+    _crossAppDragHandleBadge.textColor = UIColor.whiteColor;
+    _crossAppDragHandleBadge.font = [UIFont monospacedDigitSystemFontOfSize:12
+                                                                    weight:UIFontWeightBold];
+    _crossAppDragHandleBadge.textAlignment = NSTextAlignmentCenter;
+    _crossAppDragHandleBadge.adjustsFontSizeToFitWidth = YES;
+    _crossAppDragHandleBadge.minimumScaleFactor = 0.7;
+    _crossAppDragHandleBadge.layer.cornerRadius = 12;
+    _crossAppDragHandleBadge.layer.borderWidth = 2;
+    _crossAppDragHandleBadge.layer.borderColor =
+        UIColor.systemBackgroundColor.CGColor;
+    _crossAppDragHandleBadge.clipsToBounds = YES;
+    _crossAppDragHandleBadge.userInteractionEnabled = NO;
+    _crossAppDragHandleBadge.hidden = YES;
+    [_crossAppDragHandle addSubview:_crossAppDragHandleBadge];
+
+    _crossAppDragHandle.accessibilityLabel = @"已准备的 macOS 文件";
+    _crossAppDragHandle.accessibilityHint = @"长按并拖到另一个应用";
+    [_crossAppDragHandle addTarget:self
+                            action:@selector(cancelPreparedCrossAppDragHandle)
+                  forControlEvents:UIControlEventTouchUpInside];
+    _crossAppDragHandle.hidden = YES;
+    [root addSubview:_crossAppDragHandle];
+
+    _crossAppDragHandleTitle = [[UILabel alloc] initWithFrame:CGRectZero];
+    _crossAppDragHandleTitle.bounds = CGRectMake(0, 0, 110, 26);
+    _crossAppDragHandleTitle.backgroundColor =
+        [UIColor.labelColor colorWithAlphaComponent:0.78];
+    _crossAppDragHandleTitle.textColor = UIColor.systemBackgroundColor;
+    _crossAppDragHandleTitle.font = [UIFont systemFontOfSize:12
+                                                     weight:UIFontWeightSemibold];
+    _crossAppDragHandleTitle.textAlignment = NSTextAlignmentCenter;
+    _crossAppDragHandleTitle.lineBreakMode = NSLineBreakByTruncatingMiddle;
+    _crossAppDragHandleTitle.layer.cornerRadius = 9;
+    _crossAppDragHandleTitle.layer.shadowColor = UIColor.blackColor.CGColor;
+    _crossAppDragHandleTitle.layer.shadowOpacity = 0.22;
+    _crossAppDragHandleTitle.layer.shadowRadius = 4;
+    _crossAppDragHandleTitle.layer.shadowOffset = CGSizeMake(0, 2);
+    _crossAppDragHandleTitle.clipsToBounds = YES;
+    _crossAppDragHandleTitle.userInteractionEnabled = NO;
+    _crossAppDragHandleTitle.hidden = YES;
+    [root addSubview:_crossAppDragHandleTitle];
     MacWSPerformanceHUDMode savedHUDMode = (MacWSPerformanceHUDMode)
         [NSUserDefaults.standardUserDefaults integerForKey:
             @"MacWSPerformanceHUDMode"];
@@ -2077,18 +2320,16 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
     UIStackView *appRow1 = [[UIStackView alloc] initWithArrangedSubviews:@[glassDemo, terminal]];
     UIStackView *appRow2 = [[UIStackView alloc] initWithArrangedSubviews:@[activity, finder]];
     UIStackView *appRow3 = [[UIStackView alloc] initWithArrangedSubviews:@[vscode, settings]];
-    UIStackView *appRow4 = [[UIStackView alloc] initWithArrangedSubviews:@[maps]];
+    UIStackView *appRow4 = [[UIStackView alloc]
+        initWithArrangedSubviews:@[maps, weather]];
     UIStackView *appRow5 = [[UIStackView alloc]
-        initWithArrangedSubviews:@[weather, sublime]];
+        initWithArrangedSubviews:@[sublime, steam]];
     UIStackView *appRow6 = [[UIStackView alloc]
-        initWithArrangedSubviews:@[steam, amadine]];
+        initWithArrangedSubviews:@[amadine, word]];
     UIStackView *appRow7 = [[UIStackView alloc]
-        initWithArrangedSubviews:@[word, excel]];
-    UIStackView *appRow8 = [[UIStackView alloc]
-        initWithArrangedSubviews:@[powerpoint]];
+        initWithArrangedSubviews:@[excel, powerpoint]];
     for (UIStackView *row in @[
-             appRow1, appRow2, appRow3, appRow4, appRow5, appRow6, appRow7,
-             appRow8]) {
+             appRow1, appRow2, appRow3, appRow4, appRow5, appRow6, appRow7]) {
         row.axis = UILayoutConstraintAxisHorizontal;
         row.distribution = UIStackViewDistributionFillEqually;
         row.spacing = 8;
@@ -2141,34 +2382,19 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
                                      image:@"arrow.up.left.and.arrow.down.right"
                                     action:@selector(openFullscreenWorkspace)
                                  prominent:NO];
-    _clipboardButton = [self buttonWithTitle:@"同步剪贴板到 macOS"
-                                       image:@"doc.on.clipboard"
-                                      action:@selector(syncClipboardAction)
-                                   prominent:NO];
-    _importButton = [self buttonWithTitle:@"导入文件到 macOS"
-                                    image:@"square.and.arrow.down.on.square"
-                                   action:@selector(importFilesAction)
-                                prominent:NO];
-    _macFilesButton = [self buttonWithTitle:@"macOS 文件"
-                                      image:@"arrow.up.doc"
-                                     action:@selector(shareMacOSFiles)
-                                  prominent:NO];
-    _macFilesButton.enabled = NO;
-    UIStackView *interopRow = [[UIStackView alloc]
-        initWithArrangedSubviews:@[_clipboardButton, _importButton]];
-    interopRow.axis = UILayoutConstraintAxisHorizontal;
-    interopRow.distribution = UIStackViewDistributionFillEqually;
-    interopRow.spacing = 8;
-    [_macFilesButton addInteraction:[[UIDragInteraction alloc]
-        initWithDelegate:self]];
-    // In per-window mode, a long press on rendered macOS content asks the
-    // source AppKit view to populate NSDragPboard, then promotes those exact
-    // representations into a native iPadOS drag session.
+    // Interoperability no longer needs manual Control Center entry points.
+    // Clipboard exchange is automatic, rendered content remains a native drop
+    // target, and a stationary two-finger hold prepares the Finder selection
+    // for a cross-application drag. Keep only those direct interactions here.
     if (_windowID != 0) {
-        UIDragInteraction *contentDrag = [[UIDragInteraction alloc]
+        _contentDragInteraction = [[UIDragInteraction alloc]
             initWithDelegate:self];
-        contentDrag.enabled = YES;
-        [_metalView addInteraction:contentDrag];
+        _contentDragInteraction.enabled = NO;
+        [_crossAppDragHandle addInteraction:_contentDragInteraction];
+        _crossAppDragPrepareTap = [[UITapGestureRecognizer alloc]
+            initWithTarget:self action:@selector(prepareCrossAppDrag:)];
+        _crossAppDragPrepareTap.enabled = NO;
+        [_crossAppDragSurface addGestureRecognizer:_crossAppDragPrepareTap];
     }
     [_metalView addInteraction:[[UIDropInteraction alloc]
         initWithDelegate:self]];
@@ -2312,7 +2538,6 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
     _displaySectionLabel = [self sectionTitle:@"显示密度"];
     _performanceSectionLabel = [self sectionTitle:@"性能测量"];
     _applicationsSectionLabel = [self sectionTitle:@"macOS 应用"];
-    _interopSectionLabel = [self sectionTitle:@"iOS / macOS 互操作"];
     _zoomSectionLabel = [self sectionTitle:@"放大视角"];
     _startupLogSectionLabel = [self sectionTitle:@"启动日志（实时）"];
     _startupLogSectionLabel.hidden = YES;
@@ -2353,13 +2578,9 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
         appRow5,
         appRow6,
         appRow7,
-        appRow8,
         _windowPickerButton,
         _menuBarButton,
         _closeWindowButton,
-        _interopSectionLabel,
-        interopRow,
-        _macFilesButton,
         _zoomSectionLabel,
         _zoomScaleControl,
         _resetZoomButton,
@@ -2416,6 +2637,10 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
         [_metalView.trailingAnchor constraintEqualToAnchor:root.trailingAnchor],
         [_metalView.topAnchor constraintEqualToAnchor:metalTop],
         [_metalView.bottomAnchor constraintEqualToAnchor:_softwareKeyBar.topAnchor],
+        [_crossAppDragSurface.leadingAnchor constraintEqualToAnchor:_metalView.leadingAnchor],
+        [_crossAppDragSurface.trailingAnchor constraintEqualToAnchor:_metalView.trailingAnchor],
+        [_crossAppDragSurface.topAnchor constraintEqualToAnchor:_metalView.topAnchor],
+        [_crossAppDragSurface.bottomAnchor constraintEqualToAnchor:_metalView.bottomAnchor],
         [_softwareKeyBar.leadingAnchor constraintEqualToAnchor:root.leadingAnchor],
         [_softwareKeyBar.trailingAnchor constraintEqualToAnchor:root.trailingAnchor],
         [_softwareKeyBar.bottomAnchor constraintEqualToAnchor:root.bottomAnchor],
@@ -2504,7 +2729,6 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
     _displaySectionLabel.text = (english ? @"DISPLAY DENSITY" : @"显示密度");
     _performanceSectionLabel.text = (english ? @"PERFORMANCE" : @"性能测量");
     _applicationsSectionLabel.text = (english ? @"MACOS APPS" : @"MACOS 应用");
-    _interopSectionLabel.text = (english ? @"IOS / MACOS INTEROP" : @"IOS / MACOS 互操作");
     _zoomSectionLabel.text = (english ? @"ZOOM VIEW" : @"放大视角");
     _startupLogSectionLabel.text = english
         ? @"STARTUP LOG (LIVE)" : @"启动日志（实时）";
@@ -2591,12 +2815,7 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
               image:@"macwindow.on.rectangle"];
     [self setButton:_closeWindowButton title:english ? @"Close This macOS Window" : @"关闭此 macOS 窗口"
               image:@"xmark.square"];
-    [self setButton:_clipboardButton title:english ? @"Sync Clipboard to macOS" : @"同步剪贴板到 macOS"
-              image:@"doc.on.clipboard"];
-    [self setButton:_importButton title:english ? @"Import Files to macOS" : @"导入文件到 macOS"
-              image:@"square.and.arrow.down.on.square"];
-    [self setButton:_macFilesButton title:english ? @"macOS Files" : @"macOS 文件"
-              image:@"arrow.up.doc"];
+    [self updateCrossAppDragButton];
     [self setButton:_performanceResetButton title:english ? @"Reset Timing" : @"重新计时"
               image:@"stopwatch"];
     [self setButton:_performanceExportButton title:english ? @"Export JSON" : @"导出 JSON"
@@ -2733,9 +2952,8 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
     _windowPickerButton.enabled = enabled;
     _closeWindowButton.enabled = enabled && _windowID != 0;
     _menuBarButton.enabled = enabled;
-    _clipboardButton.enabled = enabled;
-    _importButton.enabled = enabled;
-    _macFilesButton.enabled = _receivedMacOSFiles.count > 0;
+    _crossAppDragButton.enabled = enabled && _windowID != 0 &&
+        !_crossAppDragTransferPending;
     _experimentalSwitch.enabled = enabled;
     _inputModeControl.enabled = enabled;
     _performanceHUDControl.enabled = YES;
@@ -3101,40 +3319,536 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
     [self setNotice:@"已退出放大视角并恢复中心位置" success:YES];
 }
 
-- (void)syncClipboardAction {
-    [_interopClient publishGeneralPasteboard];
+- (NSString *)crossAppDragSymbolForURL:(NSURL *)url {
+    if (url.hasDirectoryPath) return @"folder.fill";
+    UTType *type = url.pathExtension.length
+        ? [UTType typeWithFilenameExtension:url.pathExtension] : nil;
+    if ([type conformsToType:UTTypeImage]) return @"photo.fill";
+    if ([type conformsToType:UTTypeMovie]) return @"film.fill";
+    if ([type conformsToType:UTTypeAudio]) return @"waveform";
+    if ([type conformsToType:UTTypePDF]) return @"doc.richtext.fill";
+    if ([type conformsToType:UTTypeArchive]) return @"doc.zipper";
+    if ([type conformsToType:UTTypeText]) return @"doc.text.fill";
+    return @"doc.fill";
 }
 
-- (void)importFilesAction {
-    UIDocumentPickerViewController *picker = [[UIDocumentPickerViewController alloc]
-        initForOpeningContentTypes:@[UTTypeItem] asCopy:YES];
-    picker.allowsMultipleSelection = YES;
-    picker.delegate = self;
-    [self presentViewController:picker animated:YES completion:nil];
+- (UIColor *)crossAppDragTintForURL:(NSURL *)url {
+    if (url.hasDirectoryPath) return UIColor.systemBlueColor;
+    UTType *type = url.pathExtension.length
+        ? [UTType typeWithFilenameExtension:url.pathExtension] : nil;
+    if ([type conformsToType:UTTypeImage]) return UIColor.systemPurpleColor;
+    if ([type conformsToType:UTTypeMovie]) return UIColor.systemPinkColor;
+    if ([type conformsToType:UTTypeAudio]) return UIColor.systemOrangeColor;
+    if ([type conformsToType:UTTypePDF]) return UIColor.systemRedColor;
+    if ([type conformsToType:UTTypeArchive]) return UIColor.systemTealColor;
+    return UIColor.systemIndigoColor;
 }
 
-- (void)documentPicker:(UIDocumentPickerViewController *)controller
-  didPickDocumentsAtURLs:(NSArray<NSURL *> *)urls {
-    (void)controller;
-    [_interopClient stageAndPublishFiles:urls
-        completion:^(NSArray<NSURL *> *stagedURLs, NSError *error) {
-            [self setNotice:error ? error.localizedDescription :
-                [NSString stringWithFormat:@"已导入 %lu 个文件；macOS 应用可直接粘贴。",
-                 (unsigned long)stagedURLs.count]
-                success:error == nil];
-        }];
+- (void)configureCrossAppDragThumbnailView:(UIImageView *)thumbnailView
+                                    forURL:(NSURL *)url {
+    NSString *symbolName = [self crossAppDragSymbolForURL:url];
+    UIImageSymbolConfiguration *symbol = [UIImageSymbolConfiguration
+        configurationWithPointSize:27 weight:UIImageSymbolWeightSemibold];
+    thumbnailView.image = [UIImage systemImageNamed:symbolName
+                                  withConfiguration:symbol];
+    thumbnailView.contentMode = UIViewContentModeScaleAspectFit;
+    thumbnailView.backgroundColor = UIColor.secondarySystemBackgroundColor;
+    thumbnailView.tintColor = [self crossAppDragTintForURL:url];
 }
 
-- (void)shareMacOSFiles {
-    if (!_receivedMacOSFiles.count) {
-        [self setNotice:@"macOS 剪贴板中还没有可导出的文件" success:NO];
+- (UIImage *)crossAppDragPDFThumbnailAtURL:(NSURL *)url {
+    CGPDFDocumentRef document = CGPDFDocumentCreateWithURL(
+        (__bridge CFURLRef)url);
+    if (!document) return nil;
+    CGPDFPageRef page = CGPDFDocumentGetPage(document, 1);
+    if (!page) {
+        CGPDFDocumentRelease(document);
+        return nil;
+    }
+    CGRect box = CGPDFPageGetBoxRect(page, kCGPDFCropBox);
+    if (CGRectIsEmpty(box)) box = CGPDFPageGetBoxRect(page, kCGPDFMediaBox);
+    if (CGRectIsEmpty(box)) {
+        CGPDFDocumentRelease(document);
+        return nil;
+    }
+
+    CGSize canvasSize = CGSizeMake(180, 180);
+    UIGraphicsImageRendererFormat *format =
+        [UIGraphicsImageRendererFormat preferredFormat];
+    format.scale = 1.0;
+    format.opaque = YES;
+    UIGraphicsImageRenderer *renderer = [[UIGraphicsImageRenderer alloc]
+        initWithSize:canvasSize format:format];
+    UIImage *thumbnail = [renderer imageWithActions:
+        ^(UIGraphicsImageRendererContext *rendererContext) {
+        [UIColor.whiteColor setFill];
+        UIRectFill((CGRect){CGPointZero, canvasSize});
+        CGFloat scale = MIN(canvasSize.width / CGRectGetWidth(box),
+                            canvasSize.height / CGRectGetHeight(box));
+        CGFloat width = CGRectGetWidth(box) * scale;
+        CGFloat height = CGRectGetHeight(box) * scale;
+        CGContextRef context = rendererContext.CGContext;
+        CGContextSaveGState(context);
+        CGContextTranslateCTM(context,
+            (canvasSize.width - width) * 0.5,
+            (canvasSize.height - height) * 0.5 + height);
+        CGContextScaleCTM(context, scale, -scale);
+        CGContextTranslateCTM(context, -CGRectGetMinX(box),
+                              -CGRectGetMinY(box));
+        CGContextDrawPDFPage(context, page);
+        CGContextRestoreGState(context);
+    }];
+    CGPDFDocumentRelease(document);
+    return thumbnail;
+}
+
+- (UIImage *)crossAppDragContentThumbnailAtURL:(NSURL *)url {
+    if (!url.isFileURL || url.hasDirectoryPath) return nil;
+    UTType *type = url.pathExtension.length
+        ? [UTType typeWithFilenameExtension:url.pathExtension] : nil;
+    if ([type conformsToType:UTTypePDF])
+        return [self crossAppDragPDFThumbnailAtURL:url];
+    if ([type conformsToType:UTTypeMovie]) {
+        AVURLAsset *asset = [AVURLAsset URLAssetWithURL:url options:nil];
+        AVAssetImageGenerator *generator =
+            [[AVAssetImageGenerator alloc] initWithAsset:asset];
+        generator.appliesPreferredTrackTransform = YES;
+        generator.maximumSize = CGSizeMake(180, 180);
+        generator.requestedTimeToleranceBefore = kCMTimePositiveInfinity;
+        generator.requestedTimeToleranceAfter = kCMTimePositiveInfinity;
+        NSError *error = nil;
+        CGImageRef frame = [generator copyCGImageAtTime:
+            CMTimeMakeWithSeconds(0.05, 600) actualTime:NULL error:&error];
+        (void)error;
+        if (!frame) return nil;
+        UIImage *thumbnail = [UIImage imageWithCGImage:frame];
+        CGImageRelease(frame);
+        return thumbnail;
+    }
+    if (![type conformsToType:UTTypeImage]) return nil;
+
+    CGImageSourceRef source = CGImageSourceCreateWithURL(
+        (__bridge CFURLRef)url, NULL);
+    if (!source) return nil;
+    NSDictionary *options = @{
+        (__bridge NSString *)kCGImageSourceCreateThumbnailFromImageAlways:
+            @YES,
+        (__bridge NSString *)kCGImageSourceCreateThumbnailWithTransform:
+            @YES,
+        (__bridge NSString *)kCGImageSourceThumbnailMaxPixelSize: @180,
+        (__bridge NSString *)kCGImageSourceShouldCacheImmediately: @YES
+    };
+    CGImageRef image = CGImageSourceCreateThumbnailAtIndex(
+        source, 0, (__bridge CFDictionaryRef)options);
+    CFRelease(source);
+    if (!image) return nil;
+    UIImage *thumbnail = [UIImage imageWithCGImage:image];
+    CGImageRelease(image);
+    return thumbnail;
+}
+
+- (void)configureCrossAppDragThumbnailStackForURLs:(NSArray<NSURL *> *)urls
+                                              count:(NSUInteger)count {
+    NSArray<UIImageView *> *allViews = @[
+        _crossAppDragHandleBackIcon,
+        _crossAppDragHandleMiddleIcon,
+        _crossAppDragHandleIcon
+    ];
+    for (UIImageView *thumbnailView in allViews) {
+        thumbnailView.hidden = YES;
+        thumbnailView.transform = CGAffineTransformIdentity;
+    }
+
+    NSUInteger cardCount = MIN(MAX(count, (NSUInteger)1), (NSUInteger)3);
+    NSMutableArray<NSDictionary *> *jobs = [NSMutableArray array];
+    void (^configure)(UIImageView *, NSUInteger, CGRect, CGFloat) =
+        ^(UIImageView *view, NSUInteger urlIndex, CGRect frame,
+          CGFloat rotationDegrees) {
+        NSURL *url = urlIndex < urls.count ? urls[urlIndex] : nil;
+        [self configureCrossAppDragThumbnailView:view forURL:url];
+        view.frame = frame;
+        view.transform = CGAffineTransformMakeRotation(
+            rotationDegrees * M_PI / 180.0);
+        view.hidden = NO;
+        if (url) [jobs addObject:@{ @"url": url, @"view": view }];
+    };
+
+    if (cardCount == 1) {
+        configure(_crossAppDragHandleIcon, 0, CGRectMake(7, 5, 44, 48), 0);
+    } else if (cardCount == 2) {
+        configure(_crossAppDragHandleBackIcon, 1,
+                  CGRectMake(8, 7, 39, 44), -9);
+        configure(_crossAppDragHandleIcon, 0,
+                  CGRectMake(12, 6, 40, 45), 7);
+    } else {
+        configure(_crossAppDragHandleBackIcon, 2,
+                  CGRectMake(6, 8, 37, 42), -11);
+        configure(_crossAppDragHandleMiddleIcon, 1,
+                  CGRectMake(10, 5, 38, 43), 0);
+        configure(_crossAppDragHandleIcon, 0,
+                  CGRectMake(14, 7, 39, 44), 9);
+    }
+
+    uint64_t serial = _crossAppDragPrepareSerial;
+    __weak typeof(self) weakSelf = self;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        for (NSDictionary *job in jobs) {
+            typeof(self) self = weakSelf;
+            if (!self) return;
+            NSURL *url = job[@"url"];
+            UIImageView *view = job[@"view"];
+            UIImage *thumbnail = [self crossAppDragContentThumbnailAtURL:url];
+            if (!thumbnail) continue;
+            dispatch_async(dispatch_get_main_queue(), ^{
+                typeof(self) self = weakSelf;
+                if (!self || serial != self->_crossAppDragPrepareSerial ||
+                    self->_crossAppDragHandle.hidden ||
+                    ![self->_preparedMacOSDragURLs containsObject:url]) return;
+                view.image = thumbnail;
+                view.contentMode = UIViewContentModeScaleAspectFill;
+                view.backgroundColor = UIColor.secondarySystemBackgroundColor;
+            });
+        }
+    });
+}
+
+- (void)hideCrossAppDragHandle {
+    _crossAppDragHandle.hidden = YES;
+    _crossAppDragHandleTitle.hidden = YES;
+    _crossAppDragHandle.alpha = 1.0;
+    _crossAppDragHandleTitle.alpha = 1.0;
+    _crossAppDragHandle.transform = CGAffineTransformIdentity;
+    _crossAppDragHandleTitle.transform = CGAffineTransformIdentity;
+}
+
+- (void)presentCrossAppDragHandleAtRootPoint:(CGPoint)rootPoint
+                                    providers:(NSArray<NSItemProvider *> *)providers
+                                         URLs:(NSArray<NSURL *> *)urls {
+    NSUInteger count = MAX(providers.count, urls.count);
+    if (count == 0) {
+        [self hideCrossAppDragHandle];
         return;
     }
-    UIActivityViewController *activity = [[UIActivityViewController alloc]
-        initWithActivityItems:_receivedMacOSFiles applicationActivities:nil];
-    activity.popoverPresentationController.sourceView = _macFilesButton;
-    activity.popoverPresentationController.sourceRect = _macFilesButton.bounds;
-    [self presentViewController:activity animated:YES completion:nil];
+
+    BOOL multiple = count > 1;
+    NSURL *primaryURL = urls.firstObject;
+    [self configureCrossAppDragThumbnailStackForURLs:urls count:count];
+    _crossAppDragHandleBadge.hidden = !multiple;
+    _crossAppDragHandleBadge.text = count > 99 ? @"99+"
+        : [NSString stringWithFormat:@"%lu", (unsigned long)count];
+    _crossAppDragHandleBadge.frame = count > 99
+        ? CGRectMake(35, -5, 30, 24) : CGRectMake(39, -5, 24, 24);
+    _crossAppDragHandleTint.backgroundColor =
+        [[self crossAppDragTintForURL:primaryURL] colorWithAlphaComponent:0.20];
+
+    NSString *title = nil;
+    if (multiple) {
+        title = MacWSControlCenterUsesEnglish()
+            ? [NSString stringWithFormat:@"%lu files", (unsigned long)count]
+            : [NSString stringWithFormat:@"%lu 个文件", (unsigned long)count];
+    } else {
+        title = primaryURL.lastPathComponent ?:
+            providers.firstObject.suggestedName ?:
+            MacWSLocalized(@"文件", @"File");
+    }
+    _crossAppDragHandleTitle.text = title;
+    CGFloat titleWidth = ceil([title sizeWithAttributes:@{
+        NSFontAttributeName: _crossAppDragHandleTitle.font
+    }].width) + 22.0;
+    titleWidth = MIN(MAX(titleWidth, 72.0), 184.0);
+    _crossAppDragHandleTitle.bounds = CGRectMake(0, 0, titleWidth, 26);
+
+    CGRect safeBounds = UIEdgeInsetsInsetRect(self.view.bounds,
+                                               self.view.safeAreaInsets);
+    CGFloat halfWidth = CGRectGetWidth(_crossAppDragHandle.bounds) * 0.5;
+    CGFloat halfHeight = CGRectGetHeight(_crossAppDragHandle.bounds) * 0.5;
+    rootPoint.x = MIN(MAX(rootPoint.x, CGRectGetMinX(safeBounds) + halfWidth),
+        CGRectGetMaxX(safeBounds) - halfWidth);
+    rootPoint.y = MIN(MAX(rootPoint.y, CGRectGetMinY(safeBounds) + halfHeight),
+        CGRectGetMaxY(safeBounds) - halfHeight);
+    _crossAppDragHandle.center = rootPoint;
+
+    CGFloat titleHalfWidth = titleWidth * 0.5;
+    CGFloat titleX = MIN(MAX(rootPoint.x,
+        CGRectGetMinX(safeBounds) + titleHalfWidth),
+        CGRectGetMaxX(safeBounds) - titleHalfWidth);
+    CGFloat titleY = rootPoint.y + halfHeight + 8.0 + 13.0;
+    if (titleY + 13.0 > CGRectGetMaxY(safeBounds))
+        titleY = rootPoint.y - halfHeight - 8.0 - 13.0;
+    _crossAppDragHandleTitle.center = CGPointMake(titleX, titleY);
+
+    _crossAppDragHandle.accessibilityLabel = multiple
+        ? title
+        : [NSString stringWithFormat:MacWSLocalized(@"已准备：%@",
+                                                     @"Ready: %@"), title];
+    [self.view bringSubviewToFront:_crossAppDragHandleTitle];
+    [self.view bringSubviewToFront:_crossAppDragHandle];
+    _crossAppDragHandle.hidden = NO;
+    _crossAppDragHandleTitle.hidden = NO;
+    _crossAppDragHandle.alpha = 0.0;
+    _crossAppDragHandleTitle.alpha = 0.0;
+    _crossAppDragHandle.transform = CGAffineTransformMakeScale(0.74, 0.74);
+    _crossAppDragHandleTitle.transform = CGAffineTransformMakeTranslation(0, -4);
+    [UIView animateWithDuration:0.42
+                          delay:0
+         usingSpringWithDamping:0.68
+          initialSpringVelocity:0.45
+                        options:UIViewAnimationOptionBeginFromCurrentState |
+                                UIViewAnimationOptionAllowUserInteraction
+                     animations:^{
+        self->_crossAppDragHandle.alpha = 1.0;
+        self->_crossAppDragHandleTitle.alpha = 1.0;
+        self->_crossAppDragHandle.transform = CGAffineTransformIdentity;
+        self->_crossAppDragHandleTitle.transform = CGAffineTransformIdentity;
+    } completion:nil];
+    UIImpactFeedbackGenerator *feedback = [[UIImpactFeedbackGenerator alloc]
+        initWithStyle:UIImpactFeedbackStyleLight];
+    [feedback prepare];
+    [feedback impactOccurred];
+}
+
+- (void)updateCrossAppDragButton {
+    BOOL english = MacWSControlCenterUsesEnglish();
+    NSString *title = nil;
+    NSString *image = nil;
+    if (_crossAppDragTransferPending) {
+        title = english ? @"Transferring…" : @"正在传输…";
+        image = @"arrow.left.arrow.right";
+    } else if (_crossAppDragPreparing) {
+        title = english ? @"Preparing File…" : @"正在准备文件…";
+        image = @"hourglass";
+    } else if (_crossAppDragArmed && _preparedMacOSDragProviders.count) {
+        title = english ? @"Ready · Cancel" : @"已准备 · 取消";
+        image = @"checkmark.circle";
+    } else if (_crossAppDragArmed) {
+        title = english ? @"Tap File to Prepare" : @"轻点文件以准备";
+        image = @"hand.tap";
+    } else {
+        title = english ? @"Prepare Drag Manually" : @"手动准备拖出";
+        image = @"hand.draw";
+    }
+    [self setButton:_crossAppDragButton title:title image:image];
+    if (_crossAppDragTransferPending) _crossAppDragButton.enabled = NO;
+}
+
+- (void)setCrossAppDragArmed:(BOOL)armed notice:(BOOL)showNotice {
+    _crossAppDragArmed = armed && _windowID != 0;
+    if (!_crossAppDragArmed) {
+        _crossAppDragPrepareSerial++;
+        _crossAppDragPreparing = NO;
+        _preparedMacOSDragProviders = nil;
+        _preparedMacOSDragURLs = nil;
+    }
+    _crossAppDragSurface.hidden = !_crossAppDragArmed;
+    [self hideCrossAppDragHandle];
+    _contentDragInteraction.enabled = _crossAppDragArmed &&
+        _preparedMacOSDragProviders.count > 0;
+    _crossAppDragPrepareTap.enabled = _crossAppDragArmed &&
+        !_crossAppDragPreparing && !_preparedMacOSDragProviders.count;
+    _metalView.crossAppDragModeEnabled = _crossAppDragArmed;
+    [self updateCrossAppDragButton];
+    if (!showNotice) return;
+    if (_crossAppDragArmed) {
+        [self setNotice:@"请先轻点要拖出的 macOS 文件；显示“已准备”后再长按拖到 iPadOS。"
+                 success:YES];
+    } else {
+        [self setNotice:@"已恢复 macOS 长按右键与窗口内拖动。" success:YES];
+    }
+}
+
+- (void)toggleCrossAppDrag {
+    if (!_interopClient.isConnected) {
+        [self setNotice:@"iOS/macOS 互操作服务尚未连接" success:NO];
+        return;
+    }
+    if (_crossAppDragTransferPending) {
+        [self setNotice:@"上一次跨 App 文件仍在传输" success:NO];
+        return;
+    }
+    [self setCrossAppDragArmed:!_crossAppDragArmed notice:YES];
+}
+
+- (void)cancelPreparedCrossAppDragHandle {
+    if (_crossAppDragTransferPending) return;
+    [self setCrossAppDragArmed:NO notice:NO];
+}
+
+- (void)beginCrossAppDragPreparationAtPoint:(CGPoint)point
+                            usingFullSurface:(BOOL)usingFullSurface
+                                      source:(NSString *)source {
+    if (_crossAppDragTransferPending || _crossAppDragPreparing ||
+        _preparedMacOSDragProviders.count || !_interopClient.isConnected ||
+        (usingFullSurface && !_crossAppDragArmed)) return;
+    if (!usingFullSurface) {
+        _crossAppDragArmed = YES;
+        _crossAppDragSurface.hidden = YES;
+        // The drag source is the small sibling UIButton, so normal touches
+        // elsewhere still belong to AppKit. No full-surface arbitration is
+        // needed for automatic preparation.
+        _metalView.crossAppDragModeEnabled = NO;
+    }
+    _crossAppDragPreparing = YES;
+    _crossAppDragPrepareTap.enabled = NO;
+    _contentDragInteraction.enabled = NO;
+    uint64_t serial = ++_crossAppDragPrepareSerial;
+    [self updateCrossAppDragButton];
+    [self setNotice:@"正在准备所选文件…" success:YES];
+    MacWSLog(@"interop-drag-prepare requested window=%u pid=%d point=(%.1f,%.1f) serial=%llu source=%@",
+        _windowID, _metalView.targetPID, point.x, point.y,
+        (unsigned long long)serial, source ?: @"unknown");
+
+    __weak typeof(self) weakSelf = self;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        typeof(self) self = weakSelf;
+        if (!self) return;
+        uint64_t changeCount = [self->_interopClient
+            macOSDragPasteboardChangeCount];
+        __block BOOL began = NO;
+        dispatch_sync(dispatch_get_main_queue(), ^{
+            if (serial != self->_crossAppDragPrepareSerial ||
+                !self->_crossAppDragArmed) return;
+            began = [self->_metalView
+                beginInteropDragProbeAtViewPoint:point];
+            if (began)
+                [self->_metalView finishInteropDragProbeCancelled:YES];
+        });
+        NSArray<NSURL *> *stagedURLs = nil;
+        NSArray<NSItemProvider *> *providers = began ? [self->_interopClient
+            macOSDragItemProvidersAfterChangeCount:changeCount
+                                      waitMilliseconds:500
+                                            stagedURLs:&stagedURLs] : @[];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (serial != self->_crossAppDragPrepareSerial ||
+                !self->_crossAppDragArmed) return;
+            self->_crossAppDragPreparing = NO;
+            self->_preparedMacOSDragProviders = [providers copy];
+            // The staged URLs are part of this exact pasteboard snapshot.
+            // Do not recover them indirectly through the asynchronous
+            // clipboard delegate: another scene or clipboard event can race
+            // that shared state to an empty/older array. Retain both the URLs
+            // and their file-backed providers until UIKit confirms that its
+            // cross-process copy has completed.
+            self->_preparedMacOSDragURLs = [stagedURLs copy];
+            self->_contentDragInteraction.enabled = providers.count > 0;
+            self->_crossAppDragPrepareTap.enabled =
+                usingFullSurface && providers.count == 0;
+            self->_crossAppDragSurface.hidden =
+                !usingFullSurface || providers.count > 0;
+            if (providers.count) {
+                // The handle itself isolates UIKit drag recognition. Restore
+                // ordinary macOS gestures everywhere outside its 58x58 frame.
+                self->_metalView.crossAppDragModeEnabled = NO;
+                CGPoint rootPoint = [self.view convertPoint:point
+                                                   fromView:self->_metalView];
+                [self presentCrossAppDragHandleAtRootPoint:rootPoint
+                                                 providers:providers
+                                                      URLs:self->_preparedMacOSDragURLs];
+            } else {
+                [self hideCrossAppDragHandle];
+                if (!usingFullSurface) {
+                    self->_crossAppDragArmed = NO;
+                    self->_preparedMacOSDragProviders = nil;
+                    self->_preparedMacOSDragURLs = nil;
+                    self->_metalView.crossAppDragModeEnabled = NO;
+                }
+            }
+            [self updateCrossAppDragButton];
+            NSMutableArray<NSString *> *types = [NSMutableArray array];
+            for (NSItemProvider *provider in providers)
+                [types addObject:[provider.registeredTypeIdentifiers
+                    componentsJoinedByString:@","]];
+            MacWSLog(@"interop-drag-prepare completed window=%u pid=%d "
+                "serial=%llu source=%@ began=%@ providers=%lu urls=%lu types=%@",
+                self->_windowID, self->_metalView.targetPID,
+                (unsigned long long)serial, source ?: @"unknown",
+                began ? @"YES" : @"NO",
+                (unsigned long)providers.count,
+                (unsigned long)self->_preparedMacOSDragURLs.count,
+                [types componentsJoinedByString:@" | "]);
+            [self setNotice:providers.count
+                ? @"文件已准备；请长按文件堆栈并拖到 iPadOS。"
+                : @"当前位置没有可拖出的项目，请在所选文件上两指长按。"
+                success:providers.count > 0];
+        });
+    });
+}
+
+- (void)prepareCrossAppDrag:(UITapGestureRecognizer *)recognizer {
+    if (recognizer.state != UIGestureRecognizerStateEnded) return;
+    [self beginCrossAppDragPreparationAtPoint:
+        [recognizer locationInView:_metalView]
+                              usingFullSurface:YES
+                                        source:@"manual-surface"];
+}
+
+- (BOOL)gestureRecognizer:(UIGestureRecognizer *)gestureRecognizer
+        shouldReceiveTouch:(UITouch *)touch {
+    if (gestureRecognizer == _crossAppDragSelectionTap ||
+        gestureRecognizer == _crossAppDragTwoFingerHold)
+        return touch.type != UITouchTypePencil;
+    return YES;
+}
+
+- (BOOL)gestureRecognizerShouldBegin:(UIGestureRecognizer *)gestureRecognizer {
+    if (gestureRecognizer == _crossAppDragTwoFingerHold) {
+        return _streamMode == MacWSStreamModeWindow && _windowID != 0 &&
+            _interopClient.isConnected && !_crossAppDragTransferPending;
+    }
+    return YES;
+}
+
+- (BOOL)gestureRecognizer:(UIGestureRecognizer *)gestureRecognizer
+ shouldRecognizeSimultaneouslyWithGestureRecognizer:
+        (UIGestureRecognizer *)otherGestureRecognizer {
+    // The one-finger observer never owns input. The two-finger hold stays
+    // exclusive once recognized so Maps-style pan/pinch/rotation cannot emit
+    // a partial macOS gesture during a file-export transaction.
+    return gestureRecognizer == _crossAppDragSelectionTap ||
+        otherGestureRecognizer == _crossAppDragSelectionTap;
+}
+
+- (void)crossAppDragSelectionTapped:(UITapGestureRecognizer *)recognizer {
+    if (recognizer.state != UIGestureRecognizerStateEnded) return;
+    _crossAppDragSelectionPoint = [recognizer locationInView:_metalView];
+    _crossAppDragSelectionPointValid = YES;
+    if (_crossAppDragArmed && _preparedMacOSDragProviders.count &&
+        !_crossAppDragTransferPending)
+        [self setCrossAppDragArmed:NO notice:NO];
+}
+
+- (void)crossAppDragTwoFingerHeld:(UILongPressGestureRecognizer *)recognizer {
+    if (recognizer.state != UIGestureRecognizerStateBegan ||
+        _crossAppDragTransferPending || !_interopClient.isConnected) return;
+    CGPoint holdPoint = [recognizer locationInView:_metalView];
+    CGPoint probePoint = holdPoint;
+    if (_crossAppDragSelectionPointValid) {
+        CGFloat distance = hypot(
+            holdPoint.x - _crossAppDragSelectionPoint.x,
+            holdPoint.y - _crossAppDragSelectionPoint.y);
+        // A two-finger centroid naturally falls around rather than exactly on
+        // a small Finder icon. Reuse the preceding selection point only while
+        // it is local to this hold; a distant or scrolled selection is stale.
+        if (distance <= 140.0) probePoint = _crossAppDragSelectionPoint;
+    }
+
+    _crossAppDragPrepareSerial++;
+    _crossAppDragPreparing = NO;
+    _crossAppDragArmed = NO;
+    _preparedMacOSDragProviders = nil;
+    _preparedMacOSDragURLs = nil;
+    _contentDragInteraction.enabled = NO;
+    _crossAppDragPrepareTap.enabled = NO;
+    _crossAppDragSurface.hidden = YES;
+    _metalView.crossAppDragModeEnabled = NO;
+    [self hideCrossAppDragHandle];
+    [self updateCrossAppDragButton];
+    MacWSLog(@"interop-drag-two-finger recognized window=%u pid=%d hold=(%.1f,%.1f) probe=(%.1f,%.1f) reused-selection=%@",
+        _windowID, _metalView.targetPID, holdPoint.x, holdPoint.y,
+        probePoint.x, probePoint.y,
+        CGPointEqualToPoint(holdPoint, probePoint) ? @"NO" : @"YES");
+    [self beginCrossAppDragPreparationAtPoint:probePoint
+                              usingFullSurface:NO
+                                        source:@"two-finger-hold"];
 }
 
 - (void)interopClient:(MacWSInteropClient *)client
@@ -3151,49 +3865,110 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
 - (void)interopClient:(MacWSInteropClient *)client
  receivedMacOSFilesAtURLs:(NSArray<NSURL *> *)urls {
     (void)client;
-    _receivedMacOSFiles = [urls copy];
-    _macFilesButton.enabled = urls.count > 0;
-    [self setButton:_macFilesButton
-              title:[NSString stringWithFormat:@"拖出/分享 macOS 文件 · %lu",
-                     (unsigned long)urls.count]
-              image:@"arrow.up.doc"];
+    // The remote file representations are already installed atomically on
+    // UIPasteboard by MacWSInteropClient. There is intentionally no manual
+    // Control Center export button; Files/Notes/Photos consume the native
+    // pasteboard or drag representations directly.
+    MacWSLog(@"interop-remote-files-ready count=%lu route=native-pasteboard",
+             (unsigned long)urls.count);
 }
 
 - (NSArray<UIDragItem *> *)dragInteraction:(UIDragInteraction *)interaction
                      itemsForBeginningSession:(id<UIDragSession>)session {
     NSMutableArray<UIDragItem *> *items = [NSMutableArray array];
-    if (interaction.view == _metalView) {
-        if (_windowID == 0 || !_interopClient.isConnected) return @[];
+    if (interaction == _contentDragInteraction) {
+        if (_windowID == 0 || !_interopClient.isConnected ||
+            !_crossAppDragArmed || !_preparedMacOSDragProviders.count)
+            return @[];
         CGPoint point = [session locationInView:_metalView];
-        uint64_t changeCount = [_interopClient macOSDragPasteboardChangeCount];
-        if (![_metalView beginInteropDragProbeAtViewPoint:point]) return @[];
-        // Complete the native AppKit drag transaction before snapshotting.
-        // Runtime evidence from Finder on the target shows its first
-        // mouseDragged publishes only com.apple.finder.node; the matching
-        // release promotes that item to public.file-url on NSDragPboard.
-        [_metalView finishInteropDragProbeCancelled:YES];
-        NSArray<NSItemProvider *> *providers = [_interopClient
-            macOSDragItemProvidersAfterChangeCount:changeCount
-                                  waitMilliseconds:500];
-        for (NSItemProvider *provider in providers)
+        NSMutableArray<NSString *> *typeSummaries = [NSMutableArray array];
+        NSArray<NSItemProvider *> *providers = _preparedMacOSDragProviders;
+        NSString *route = @"prepared-file-representation";
+        for (NSItemProvider *provider in providers) {
             [items addObject:[[UIDragItem alloc] initWithItemProvider:provider]];
+            [typeSummaries addObject:[NSString stringWithFormat:@"%@[%@]",
+                provider.suggestedName ?: @"(nil)",
+                [provider.registeredTypeIdentifiers componentsJoinedByString:@","]]];
+        }
         if (items.count) {
             [self setNotice:[NSString stringWithFormat:
                 @"已从 macOS 窗口提取 %lu 个可跨 App 拖放项目",
                 (unsigned long)items.count] success:YES];
         }
-        MacWSLog(@"interop-drag-source window=%u pid=%d point=(%.1f,%.1f) before=%llu providers=%lu",
+        CGRect sourceRect = [interaction.view convertRect:interaction.view.bounds
+                                                   toView:nil];
+        MacWSLog(@"interop-drag-source window=%u pid=%d point=(%.1f,%.1f) "
+            "source=(%.1f,%.1f %.1fx%.1f) route=%@ providers=%lu types=%@",
             _windowID, _metalView.targetPID, point.x, point.y,
-            (unsigned long long)changeCount, (unsigned long)items.count);
+            sourceRect.origin.x, sourceRect.origin.y,
+            sourceRect.size.width, sourceRect.size.height,
+            route, (unsigned long)items.count,
+            [typeSummaries componentsJoinedByString:@" | "]);
+        if (!items.count) [self setCrossAppDragArmed:NO notice:NO];
         return items;
     }
-    for (NSURL *url in _receivedMacOSFiles) {
-        NSItemProvider *provider = [[NSItemProvider alloc]
-            initWithContentsOfURL:url];
-        if (provider)
-            [items addObject:[[UIDragItem alloc] initWithItemProvider:provider]];
+    return @[];
+}
+
+- (void)dragInteraction:(UIDragInteraction *)interaction
+         sessionWillBegin:(id<UIDragSession>)session {
+    (void)session;
+    if (interaction == _contentDragInteraction)
+        MacWSLog(@"interop-drag-session began window=%u pid=%d",
+                 _windowID, _metalView.targetPID);
+}
+
+- (BOOL)dragInteraction:(UIDragInteraction *)interaction
+ sessionIsRestrictedToDraggingApplication:(id<UIDragSession>)session {
+    (void)session;
+    if (interaction == _contentDragInteraction) {
+        MacWSLog(@"interop-drag-session cross-app-allowed window=%u pid=%d",
+                 _windowID, _metalView.targetPID);
     }
-    return items;
+    return NO;
+}
+
+- (void)dragInteraction:(UIDragInteraction *)interaction
+                 session:(id<UIDragSession>)session
+     didEndWithOperation:(UIDropOperation)operation {
+    (void)session;
+    if (interaction == _contentDragInteraction) {
+        MacWSLog(@"interop-drag-session ended window=%u pid=%d operation=%lu",
+                 _windowID, _metalView.targetPID, (unsigned long)operation);
+        if (operation == UIDropOperationCopy ||
+            operation == UIDropOperationMove) {
+            // UIDragInteraction.h states that cross-process data transfer
+            // starts *after* this callback. Restore MacWS touch arbitration
+            // now, but keep the interaction/provider alive until UIKit sends
+            // sessionDidTransferItems:.
+            _crossAppDragArmed = NO;
+            _crossAppDragTransferPending = YES;
+            _metalView.crossAppDragModeEnabled = NO;
+            [self updateCrossAppDragButton];
+            MacWSLog(@"interop-drag-session transfer-pending window=%u pid=%d",
+                     _windowID, _metalView.targetPID);
+        } else {
+            _crossAppDragTransferPending = NO;
+            [self setCrossAppDragArmed:NO notice:NO];
+        }
+    }
+}
+
+- (void)dragInteraction:(UIDragInteraction *)interaction
+ sessionDidTransferItems:(id<UIDragSession>)session {
+    (void)session;
+    if (interaction != _contentDragInteraction) return;
+    _crossAppDragTransferPending = NO;
+    _contentDragInteraction.enabled = NO;
+    _crossAppDragSurface.hidden = YES;
+    [self hideCrossAppDragHandle];
+    _preparedMacOSDragProviders = nil;
+    _preparedMacOSDragURLs = nil;
+    _metalView.crossAppDragModeEnabled = NO;
+    [self updateCrossAppDragButton];
+    _crossAppDragButton.enabled = _windowID != 0 && _interopClient.isConnected;
+    MacWSLog(@"interop-drag-session transfer-complete window=%u pid=%d",
+             _windowID, _metalView.targetPID);
 }
 
 - (BOOL)dropInteraction:(UIDropInteraction *)interaction
@@ -3215,6 +3990,14 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
     NSMutableArray<NSItemProvider *> *providers = [NSMutableArray array];
     for (UIDragItem *dragItem in session.items)
         if (dragItem.itemProvider) [providers addObject:dragItem.itemProvider];
+    NSMutableArray<NSString *> *typeSummaries = [NSMutableArray array];
+    for (NSItemProvider *provider in providers)
+        [typeSummaries addObject:[provider.registeredTypeIdentifiers
+            componentsJoinedByString:@","]];
+    MacWSLog(@"interop-drop-received window=%u pid=%d point=(%.1f,%.1f) providers=%lu types=%@",
+        _windowID, _metalView.targetPID, point.x, point.y,
+        (unsigned long)providers.count,
+        [typeSummaries componentsJoinedByString:@" | "]);
     [_interopClient publishItemProviders:providers
         completion:^(BOOL applied, NSError *error) {
             MacWSLog(@"interop-drop-target window=%u pid=%d point=(%.1f,%.1f) providers=%lu applied=%@ error=%@",
@@ -3334,6 +4117,9 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
                                       window.descriptor.logicalHeight);
     _windowResizable =
         (window.descriptor.flags & MacWSStreamWindowResizable) != 0;
+    [_metalView observeTargetWindowLogicalSize:
+        CGSizeMake(window.descriptor.logicalWidth,
+                   window.descriptor.logicalHeight)];
     _metalView.minimumLogicalSize = _windowMinimumSize;
     _metalView.targetWindowResizable = _windowResizable;
     // openWindowIDInCurrentScene: establishes the stream before catalog
@@ -4221,6 +5007,17 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
         MacWSLog(@"interop-pasteboard-probe wrote-ios items=%lu change=%ld",
             (unsigned long)UIPasteboard.generalPasteboard.items.count,
             (long)UIPasteboard.generalPasteboard.changeCount);
+    } else if ([action isEqualToString:@"test-pasteboard-abstract-text"]) {
+        // Exercise the representation used by iOS producers that publish the
+        // abstract public.text supertype rather than AppKit's concrete
+        // public.utf8-plain-text spelling.
+        NSString *text = [NSString stringWithFormat:
+            @"MacWS abstract iPadOS text %@", NSUUID.UUID.UUIDString];
+        UIPasteboard.generalPasteboard.items = @[@{
+            UTTypeText.identifier: text
+        }];
+        MacWSLog(@"interop-pasteboard-abstract-probe text=%@ change=%ld",
+            text, (long)UIPasteboard.generalPasteboard.changeCount);
     } else if ([action isEqualToString:@"test-pasteboard-read"]) {
         NSMutableArray *types = [NSMutableArray array];
         NSUInteger representationCount = 0;
@@ -4237,15 +5034,18 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
             (long)UIPasteboard.generalPasteboard.changeCount);
     } else if ([action isEqualToString:@"test-drag-snapshot"]) {
         uint64_t change = [_interopClient macOSDragPasteboardChangeCount];
+        NSArray<NSURL *> *stagedURLs = nil;
         NSArray<NSItemProvider *> *providers = [_interopClient
             macOSDragItemProvidersAfterChangeCount:(change ? change - 1 : 0)
-                                  waitMilliseconds:0];
+                                  waitMilliseconds:0
+                                        stagedURLs:&stagedURLs];
         NSMutableArray *types = [NSMutableArray array];
         for (NSItemProvider *provider in providers)
             [types addObject:[provider.registeredTypeIdentifiers
                 componentsJoinedByString:@","]];
-        MacWSLog(@"interop-drag-probe change=%llu providers=%lu types=%@",
+        MacWSLog(@"interop-drag-probe change=%llu providers=%lu urls=%lu types=%@",
             (unsigned long long)change, (unsigned long)providers.count,
+            (unsigned long)stagedURLs.count,
             [types componentsJoinedByString:@" | "]);
     } else if ([action isEqualToString:@"test-drop-file"]) {
         NSString *directory = @"/var/mobile/Library/Caches/MacWSDropProbe";
@@ -4267,6 +5067,30 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
                 if (applied)
                     [self->_metalView performInteropPasteAtViewPoint:point];
                 MacWSLog(@"interop-drop-probe file=%@ window=%u pid=%d applied=%@ error=%@",
+                    name, self->_windowID, self->_metalView.targetPID,
+                    applied ? @"YES" : @"NO", error ?: @"nil");
+            }];
+    } else if ([action isEqualToString:@"test-drop-data"]) {
+        NSString *name = [NSString stringWithFormat:
+            @"macws-data-drop-probe-%@.txt", NSUUID.UUID.UUIDString];
+        NSData *payload = [@"MacWS data-only iPadOS-to-macOS drop witness\n"
+            dataUsingEncoding:NSUTF8StringEncoding];
+        NSItemProvider *provider = [NSItemProvider new];
+        provider.suggestedName = name;
+        [provider registerDataRepresentationForTypeIdentifier:
+            UTTypeUTF8PlainText.identifier
+            visibility:NSItemProviderRepresentationVisibilityAll
+            loadHandler:^NSProgress *(void (^handler)(NSData *, NSError *)) {
+                handler(payload, nil);
+                return nil;
+            }];
+        CGPoint point = CGPointMake(CGRectGetMidX(_metalView.bounds),
+                                    CGRectGetMidY(_metalView.bounds));
+        [_interopClient publishItemProviders:@[provider]
+            completion:^(BOOL applied, NSError *error) {
+                if (applied)
+                    [self->_metalView performInteropPasteAtViewPoint:point];
+                MacWSLog(@"interop-drop-data-probe file=%@ window=%u pid=%d applied=%@ error=%@",
                     name, self->_windowID, self->_metalView.targetPID,
                     applied ? @"YES" : @"NO", error ?: @"nil");
             }];
@@ -4655,6 +5479,30 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
             descriptor.windowID, descriptor.logicalGroupID);
         if (identity) current[identity] = window;
     }
+    NSMutableSet<NSString *> *closingGrace = [NSMutableSet set];
+    CFTimeInterval now = CACurrentMediaTime();
+    for (NSString *identity in [MacWSClosingWindowIdentities.allKeys copy]) {
+        if (!current[identity]) {
+            [MacWSClosingWindowIdentities removeObjectForKey:identity];
+            continue;
+        }
+        CFTimeInterval issued =
+            [MacWSClosingWindowIdentities[identity] doubleValue];
+        if (issued > 0.0 && now - issued < 0.75) {
+            [closingGrace addObject:identity];
+        } else {
+            // AppKit kept the window visible after the close transaction.
+            // That is an application-owned veto or confirmation sheet, not a
+            // stale count. Permit one Scene to present the real remaining UI
+            // after the catalog has had time to commit an ordinary close.
+            [MacWSClosingWindowIdentities removeObjectForKey:identity];
+            MacWSLog(@"scene-close retained identity=%@ reason=appkit-window-still-visible-after-750ms",
+                     identity);
+        }
+    }
+    NSMutableSet<NSString *> *observableIdentities =
+        [NSMutableSet setWithArray:current.allKeys];
+    [observableIdentities minusSet:closingGrace];
     if ([self hasForegroundFullscreenWorkspace]) {
         // New AppKit windows are already visible in the desktop stream. They
         // must not become additional iPadOS Scenes until every foreground
@@ -4674,6 +5522,7 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
         MacWSStreamWindow *newTarget = nil;
         NSUInteger newTargetScore = 0;
         for (NSString *identity in current) {
+            if ([closingGrace containsObject:identity]) continue;
             if ([MacWSObservedWindowIdentities containsObject:identity])
                 continue;
             MacWSStreamWindow *window = current[identity];
@@ -4688,8 +5537,7 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
                 newTargetScore = score;
             }
         }
-        [MacWSObservedWindowIdentities setSet:
-            [NSSet setWithArray:current.allKeys]];
+        [MacWSObservedWindowIdentities setSet:observableIdentities];
         [MacWSPendingWindowSceneIdentities removeAllObjects];
         BOOL changesInputOwner = newTarget &&
             newTarget.descriptor.ownerPID != _metalView.targetPID;
@@ -4722,7 +5570,7 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
     }
     if (![self isWindowDiscoveryCoordinator]) return;
     if (!MacWSObservedWindowIdentities) {
-        MacWSObservedWindowIdentities = [NSMutableSet setWithArray:current.allKeys];
+        MacWSObservedWindowIdentities = [observableIdentities mutableCopy];
         MacWSPendingWindowSceneIdentities = [NSMutableSet set];
         return;
     }
@@ -4742,8 +5590,95 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
         if (identity) [occupied addObject:identity];
     }
 
+    // AppKit focus and UIKit Scene foreground are separate lifecycles in this
+    // bridge. Finder can reuse an already-open Preview/TextEdit window for a
+    // document, making that exact CGWindow frontmost without creating a new
+    // catalog identity. Re-activate the existing bound Scene whenever the
+    // authoritative frontmost catalog window lacks a foreground Scene. This
+    // deliberately searches openSessions as well as connectedScenes: iPadOS
+    // can reclaim a background Scene's UIKit connection while preserving its
+    // session, which was the remaining intermittent no-popup path.
+    MacWSStreamWindow *frontmostWindow = nil;
+    NSString *frontmostIdentity = nil;
+    for (NSString *identity in current) {
+        MacWSStreamWindow *window = current[identity];
+        if ((window.descriptor.flags &
+                MacWSStreamWindowFrontmostApplication) == 0 ||
+            [closingGrace containsObject:identity]) continue;
+        frontmostWindow = window;
+        frontmostIdentity = identity;
+        break;
+    }
+    BOOL frontmostAlreadyObserved = frontmostIdentity &&
+        ([occupied containsObject:frontmostIdentity] ||
+         [MacWSObservedWindowIdentities containsObject:frontmostIdentity]);
+    if (frontmostWindow && frontmostAlreadyObserved &&
+        ![MacWSPendingWindowSceneIdentities
+            containsObject:frontmostIdentity]) {
+        UISceneSession *boundSession = nil;
+        for (UISceneSession *session in
+                UIApplication.sharedApplication.openSessions) {
+            NSUserActivity *activity = MacWSSceneBindings[
+                session.persistentIdentifier] ?:
+                MacWSPersistedSceneActivity(session.persistentIdentifier) ?:
+                session.stateRestorationActivity;
+            int32_t ownerPID = 0;
+            uint32_t windowID = 0, groupID = 0;
+            NSString *identity = MacWSSceneOwnedWindowFields(
+                activity.userInfo, &ownerPID, &windowID, &groupID)
+                ? MacWSWindowIdentity(ownerPID, windowID, groupID) : nil;
+            if ([identity isEqualToString:frontmostIdentity]) {
+                boundSession = session;
+                break;
+            }
+        }
+        UIScene *boundScene = nil;
+        for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
+            if (scene.session == boundSession) {
+                boundScene = scene;
+                break;
+            }
+        }
+        // Stage Manager can keep several Scenes ForegroundActive at once;
+        // that state says they are interactive, not which one is visually on
+        // top. Runtime witness on 2026-09-07 showed Maps first in the live CG
+        // z-order while both its and Preview's Scenes had already reported
+        // ForegroundActive, and skipping here left the requested Scene behind.
+        // The activation request itself is the public ordering transaction.
+        MacWSLog(@"scene-foreground follows-frontmost identity=%@ session=%@ connected=%@ state=%ld route=%@",
+                 frontmostIdentity,
+                 boundSession.persistentIdentifier ?: @"none",
+                 boundScene ? @"YES" : @"NO",
+                 boundScene ? (long)boundScene.activationState : -1L,
+                 boundSession ? @"reactivate-session" : @"create-scene");
+        [MacWSPendingWindowSceneIdentities addObject:frontmostIdentity];
+        MacWSRequestNewScene(self.view.window.windowScene,
+            frontmostWindow.descriptor.windowID,
+            frontmostWindow.descriptor.ownerPID,
+            frontmostWindow.descriptor.logicalGroupID,
+            CGSizeMake(frontmostWindow.descriptor.logicalWidth,
+                       frontmostWindow.descriptor.logicalHeight),
+            CGSizeMake(frontmostWindow.descriptor.minimumLogicalWidth,
+                       frontmostWindow.descriptor.minimumLogicalHeight),
+            (frontmostWindow.descriptor.flags &
+                MacWSStreamWindowResizable) != 0,
+            frontmostWindow.title, ^(NSError *error) {
+                [MacWSPendingWindowSceneIdentities
+                    removeObject:frontmostIdentity];
+                MacWSLog(@"scene-foreground follows-frontmost failed identity=%@ error=%@",
+                         frontmostIdentity, error);
+            });
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                     2 * NSEC_PER_SEC),
+                       dispatch_get_main_queue(), ^{
+            [MacWSPendingWindowSceneIdentities
+                removeObject:frontmostIdentity];
+        });
+    }
+
     NSMutableArray<MacWSStreamWindow *> *newWindows = [NSMutableArray array];
     for (NSString *identity in current) {
+        if ([closingGrace containsObject:identity]) continue;
         if ([MacWSObservedWindowIdentities containsObject:identity] ||
             [MacWSPendingWindowSceneIdentities containsObject:identity] ||
             [occupied containsObject:identity]) continue;
@@ -4753,7 +5688,7 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
         BOOL focused = (window.descriptor.flags & MacWSStreamWindowFocused) != 0;
         if (relevantOwner || focused) [newWindows addObject:window];
     }
-    [MacWSObservedWindowIdentities setSet:[NSSet setWithArray:current.allKeys]];
+    [MacWSObservedWindowIdentities setSet:observableIdentities];
 
     // A user gesture normally creates one native window. Bound a pathological
     // application burst so one catalog invalidation cannot flood FrontBoard.
@@ -5101,6 +6036,9 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
                 resolvedWindow.descriptor.logicalHeight);
             _windowResizable =
                 (resolvedWindow.descriptor.flags & MacWSStreamWindowResizable) != 0;
+            [_metalView observeTargetWindowLogicalSize:
+                CGSizeMake(resolvedWindow.descriptor.logicalWidth,
+                           resolvedWindow.descriptor.logicalHeight)];
             _metalView.minimumLogicalSize = _windowMinimumSize;
             _metalView.targetWindowResizable = _windowResizable;
             if (resolvedID != _windowID) {
@@ -5296,6 +6234,7 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
         default: break;
     }
     int sendError = 0;
+    uint16_t wireVersion = MacWSInputWireVersionForKind(record.kind);
     BOOL sent = MacWSSendInputRecord(&record, &sendError);
     [_metalView.performanceMonitor recordInputKind:record.kind
         sampleTime:record.timestamp targetPID:presentationTargetPID
@@ -5307,10 +6246,12 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
                       record.kind == MacWSInputKindMagnify ||
                       record.kind == MacWSInputKindRotate ||
                       record.kind == MacWSInputKindSystemGesture;
-    if (MacWSHostDiagnosticsEnabled() &&
-        (!continuous || (_inputLogSequence % 60) == 0)) {
-        MacWSLog(@"input-v5 transport=%@ errno=%d scene=%llx target=%d kind=%@ source=%u point=(%.2f,%.2f) frame=%ux%u pressure=%.3f contact=%u sample=%u seq=%llu",
-                 sent ? @"sent" : @"failed", sendError, record.sceneID,
+    if (record.kind == MacWSInputKindPerformPaste ||
+        (MacWSHostDiagnosticsEnabled() &&
+         (!continuous || (_inputLogSequence % 60) == 0))) {
+        MacWSLog(@"input transport=%@ errno=%d wire=%u scene=%llx target=%d kind=%@ source=%u point=(%.2f,%.2f) frame=%ux%u pressure=%.3f contact=%u sample=%u seq=%llu",
+                 sent ? @"sent" : @"failed", sendError, wireVersion,
+                 record.sceneID,
                  record.targetPID, phase, record.source, record.x, record.y,
                  record.frameWidth, record.frameHeight,
                  record.pressure, record.contactID, record.sampleSequence,
@@ -5338,6 +6279,49 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
             });
         }
     }
+}
+
+- (void)metalView:(MacWSMetalView *)view
+    windowConfigurationWasConstrainedToLogicalSize:(CGSize)appliedSize
+                                      requestedSize:(CGSize)requestedSize {
+    if (view != _metalView || _streamMode != MacWSStreamModeWindow ||
+        _windowID == 0 || appliedSize.width <= 0.0 ||
+        appliedSize.height <= 0.0) return;
+    _windowPreferredSize = appliedSize;
+    MacWSRememberSceneBinding(self.view.window.windowScene.session,
+                              [self streamRestorationActivity]);
+    CGFloat density = view.effectiveDensityScale;
+    CGSize sceneTarget = {
+        round(appliedSize.width * density),
+        round(appliedSize.height * density),
+    };
+    uint64_t serial = ++_constrainedSceneResizeSerial;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                 300 * NSEC_PER_MSEC),
+                   dispatch_get_main_queue(), ^{
+        if (self->_constrainedSceneResizeSerial != serial ||
+            self->_streamMode != MacWSStreamModeWindow ||
+            self->_windowID == 0) return;
+        UIWindowScene *scene = self.view.window.windowScene;
+        CGRect bounds = self.view.window.bounds;
+        if (fabs(bounds.size.width - sceneTarget.width) < 1.0 &&
+            fabs(bounds.size.height - sceneTarget.height) < 1.0) return;
+        CFTimeInterval now = CACurrentMediaTime();
+        if (fabs(sceneTarget.width -
+                 self->_lastConstrainedSceneTargetSize.width) < 1.0 &&
+            fabs(sceneTarget.height -
+                 self->_lastConstrainedSceneTargetSize.height) < 1.0 &&
+            now - self->_lastConstrainedSceneResizeRequestTime < 1.5)
+            return;
+        self->_lastConstrainedSceneTargetSize = sceneTarget;
+        self->_lastConstrainedSceneResizeRequestTime = now;
+        MacWSLog(@"scene-size follows-appkit window=%u pid=%d requested-logical=%.1fx%.1f applied-logical=%.1fx%.1f density=%.3f scene-target=%.1fx%.1f",
+                 self->_windowID, self->_windowOwnerPID,
+                 requestedSize.width, requestedSize.height,
+                 appliedSize.width, appliedSize.height, density,
+                 sceneTarget.width, sceneTarget.height);
+        MacWSRequestNativeSceneSizeWithRole(scene, sceneTarget, NO);
+    });
 }
 @end
 
@@ -5533,6 +6517,7 @@ static void MacWSDeduplicateWindowScenes(void) {
 @end
 
 @implementation MacWSSceneDelegate
+
 - (void)scene:(UIScene *)scene
     willConnectToSession:(UISceneSession *)session
                  options:(UISceneConnectionOptions *)connectionOptions {
@@ -5614,6 +6599,14 @@ static void MacWSDeduplicateWindowScenes(void) {
              windowScene.coordinateSpace.bounds.size.height,
              preferredSize.width, preferredSize.height, minimumSize.width,
              minimumSize.height, resizable ? @"YES" : @"NO");
+    if ([activity.userInfo[@"foreground_on_connect"] boolValue]) {
+        // requestSceneSessionActivation may connect the requested window but
+        // leave it Background under Stage Manager.  Connection is not the
+        // user's postcondition: verify ForegroundActive and retry the same
+        // public session-activation transaction a bounded number of times.
+        MacWSEnsureRequestedSceneIsForeground(
+            windowScene, activity, nil, 0);
+    }
     NSString *replacedIdentifier =
         [activity.userInfo[@"replaces_session_identifier"]
             isKindOfClass:NSString.class]
@@ -5682,7 +6675,9 @@ static void MacWSDeduplicateWindowScenes(void) {
 }
 
 - (void)sceneDidBecomeActive:(UIScene *)scene {
-    (void)scene;
+    MacWSLog(@"scene-became-active id=%@ state=%ld",
+             scene.session.persistentIdentifier,
+             (long)scene.activationState);
     UIApplication.sharedApplication.idleTimerDisabled = YES;
     MacWSViewController *controller =
         (MacWSViewController *)self.window.rootViewController;
@@ -5885,8 +6880,10 @@ static void MacWSDeduplicateWindowScenes(void) {
                     [controller metalView:nil emittedInput:secondTap];
                 });
             }
-            MacWSLog(@"input-v5 synthetic kind=%@ routed-through-controller scene=%llx target=%d point=(%.2f,%.2f) frame=%ux%u",
-                     requestedKind, record.sceneID, record.targetPID,
+            MacWSLog(@"input synthetic kind=%@ wire=%u routed-through-controller scene=%llx target=%d point=(%.2f,%.2f) frame=%ux%u",
+                     requestedKind,
+                     MacWSInputWireVersionForKind(record.kind),
+                     record.sceneID, record.targetPID,
                      record.x, record.y, record.frameWidth,
                      record.frameHeight);
             break;
@@ -5909,17 +6906,41 @@ static void MacWSDeduplicateWindowScenes(void) {
             uint64_t before = [interop macOSDragPasteboardChangeCount];
             BOOL began = [metalView beginInteropDragProbeAtViewPoint:point];
             if (began) [metalView finishInteropDragProbeCancelled:YES];
+            NSArray<NSURL *> *stagedURLs = nil;
             NSArray<NSItemProvider *> *providers = began ? [interop
                 macOSDragItemProvidersAfterChangeCount:before
-                                      waitMilliseconds:500] : @[];
+                                      waitMilliseconds:500
+                                            stagedURLs:&stagedURLs] : @[];
             NSMutableArray *types = [NSMutableArray array];
             for (NSItemProvider *provider in providers)
                 [types addObject:[provider.registeredTypeIdentifiers
                     componentsJoinedByString:@","]];
-            MacWSLog(@"interop-drag-source-probe window=%u pid=%d point=(%.1f,%.1f) before=%llu began=%@ providers=%lu types=%@",
+            NSItemProvider *probeProvider = providers.firstObject;
+            NSString *probeType = nil;
+            for (NSString *type in probeProvider.registeredTypeIdentifiers) {
+                if ([type isEqualToString:UTTypeFileURL.identifier] ||
+                    [type isEqualToString:UTTypeURL.identifier] ||
+                    [type hasPrefix:@"com.apple.finder."]) continue;
+                probeType = type;
+                break;
+            }
+            if (probeType.length) {
+                [probeProvider loadFileRepresentationForTypeIdentifier:probeType
+                    completionHandler:^(NSURL *url, NSError *providerError) {
+                        NSError *readError = nil;
+                        NSData *data = url ? [NSData dataWithContentsOfURL:url
+                            options:NSDataReadingMappedIfSafe error:&readError] : nil;
+                        MacWSLog(@"interop-drag-source-load type=%@ file=%@ bytes=%lu error=%@",
+                            probeType, url.lastPathComponent ?: @"(nil)",
+                            (unsigned long)data.length,
+                            providerError ?: readError ?: @"nil");
+                    }];
+            }
+            MacWSLog(@"interop-drag-source-probe window=%u pid=%d point=(%.1f,%.1f) before=%llu began=%@ providers=%lu urls=%lu types=%@",
                 metalView.targetWindowID, metalView.targetPID, x, y,
                 (unsigned long long)before, began ? @"YES" : @"NO",
                 (unsigned long)providers.count,
+                (unsigned long)stagedURLs.count,
                 [types componentsJoinedByString:@" | "]);
             break;
         }
@@ -5965,8 +6986,9 @@ static void MacWSDeduplicateWindowScenes(void) {
                @"powerpoint", @"asphalt",
                @"recover", @"repair", @"repair-desktop", @"capture",
                @"test-open-file", @"test-quit", @"test-pasteboard-write",
+               @"test-pasteboard-abstract-text",
                @"test-pasteboard-read", @"test-drag-snapshot",
-               @"test-drop-file", @"fullscreen",
+               @"test-drop-file", @"test-drop-data", @"fullscreen",
                @"enter-workspace", @"exit-workspace",
                @"close-window",
                @"screenshot-ui", @"screenshot-automation",

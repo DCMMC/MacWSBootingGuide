@@ -7,6 +7,11 @@
 
 set -e
 
+# Non-interactive SSH does not inherit Procursus' login PATH. Theos invokes
+# both Procursus tools and Apple's /usr/sbin/sysctl by name, so make the build
+# environment deterministic before running any guardrail or make phase.
+export PATH=/var/jb/usr/bin:/var/jb/usr/sbin:/usr/local/bin:/usr/bin:/usr/sbin:/bin:/sbin
+
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 
@@ -51,6 +56,7 @@ if [ "$FAST" = "1" ] && [ "$FAST_FORCE" != "1" ]; then
                      macwsthermal macwslocationd \
                      mountdevfs ViewBridgeChrootProxy \
                      HIServicesChrootProxy OpenAndSavePanelChrootProxy \
+                     QuickLookUIServiceChrootProxy \
                      DockHelperChrootProxy \
                      ExtensionKitChrootProxy \
                      SettingsExtensionChrootProxy \

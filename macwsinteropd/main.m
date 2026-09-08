@@ -47,6 +47,9 @@ static NSString *const MacWSArchiveFilePathKey = @"file_path";
 static const NSUInteger MacWSArchiveVersion = 1;
 static NSString *const MacWSImportsRoot = @"/Users/Shared/MacWS Imports";
 static NSString *const MacWSExportsRoot = @"/Users/Shared/MacWS Exports";
+static NSString *const MacWSLocationWitnessBundleID =
+    @"com.macwsguide.interopd";
+static NSString *const MacWSMapsBundleID = @"com.apple.Maps";
 
 @interface MacWSArchivePasteboardWriter : NSObject <NSPasteboardWriting>
 @property(nonatomic, copy) NSArray<NSDictionary *> *representations;
@@ -304,6 +307,101 @@ static BOOL LocationControlConnectionIsCurrent(NSXPCConnection *connection) {
     return connection && LocationControlConnection == connection;
 }
 
+static BOOL MacWSLocationAuthorizationStatusIsUsable(int status) {
+    return status == kCLAuthorizationStatusAuthorizedAlways ||
+        status == kMacWSAuthorizationStatusAuthorizedWhenInUse;
+}
+
+static void RestartVenturaLocationWitnessClient(void) {
+    CFRunLoopPerformBlock(CFRunLoopGetMain(), kCFRunLoopCommonModes, ^{
+        if (!LocationKeepaliveManager) return;
+        [LocationKeepaliveManager stopUpdatingLocation];
+        [LocationKeepaliveManager startUpdatingLocation];
+        InteropLog(@"Ventura CLLocationManager witness restarted after "
+                   "authorization verification");
+    });
+    CFRunLoopWakeUp(CFRunLoopGetMain());
+}
+
+static void CompleteVenturaLocationAuthorization(
+        NSXPCConnection *expectedConnection) {
+    id<MacWSLocationInternalServiceProtocol> readbackControl =
+        LocationControlProxy;
+    [readbackControl
+        getAuthorizationStatusForBundleID:MacWSLocationWitnessBundleID
+        orBundlePath:nil
+        replyBlock:^(NSError *witnessReadbackError, int witnessStatus) {
+        dispatch_async(InteropQueue, ^{
+            if (!LocationControlConnectionIsCurrent(expectedConnection))
+                return;
+            if (witnessReadbackError ||
+                !MacWSLocationAuthorizationStatusIsUsable(witnessStatus)) {
+                InteropLog(@"Ventura location witness authorization "
+                           "readback failed status=%d error=%@",
+                           witnessStatus,
+                           witnessReadbackError ?: @"(nil)");
+                ResetLocationControl();
+                ScheduleLocationRetry();
+                return;
+            }
+            id<MacWSLocationInternalServiceProtocol> mapsReadback =
+                LocationControlProxy;
+            [mapsReadback
+                getAuthorizationStatusForBundleID:MacWSMapsBundleID
+                orBundlePath:nil
+                replyBlock:^(NSError *mapsReadbackError, int mapsStatus) {
+                dispatch_async(InteropQueue, ^{
+                    if (!LocationControlConnectionIsCurrent(
+                            expectedConnection)) return;
+                    if (mapsReadbackError ||
+                        !MacWSLocationAuthorizationStatusIsUsable(
+                            mapsStatus)) {
+                        InteropLog(@"Ventura Maps authorization readback "
+                                   "failed status=%d error=%@",
+                                   mapsStatus,
+                                   mapsReadbackError ?: @"(nil)");
+                        ResetLocationControl();
+                        ScheduleLocationRetry();
+                        return;
+                    }
+                    LocationControlReady = YES;
+                    LocationControlInFlight = NO;
+                    InteropLog(@"Ventura location witness and Maps "
+                               "authorization verified witness=%d maps=%d",
+                               witnessStatus, mapsStatus);
+                    RestartVenturaLocationWitnessClient();
+                    if (LastNativeLocation)
+                        SubmitVenturaLocation(LastNativeLocation);
+                });
+            }];
+        });
+    }];
+}
+
+static void AuthorizeVenturaMapsAfterWitness(
+        NSXPCConnection *expectedConnection) {
+    id<MacWSLocationInternalServiceProtocol> authorizationControl =
+        LocationControlProxy;
+    [authorizationControl setAuthorizationStatus:YES
+        withCorrectiveCompensation:0
+                        forBundleID:MacWSMapsBundleID
+                       orBundlePath:nil
+                         replyBlock:^(NSError *authorizationError) {
+        dispatch_async(InteropQueue, ^{
+            if (!LocationControlConnectionIsCurrent(expectedConnection))
+                return;
+            if (authorizationError) {
+                InteropLog(@"Ventura Maps authorization failed: %@",
+                           authorizationError);
+                ResetLocationControl();
+                ScheduleLocationRetry();
+                return;
+            }
+            CompleteVenturaLocationAuthorization(expectedConnection);
+        });
+    }];
+}
+
 static void PrepareVenturaLocationControl(void) {
     if (LocationControlReady || LocationControlInFlight) return;
     LocationControlInFlight = YES;
@@ -369,62 +467,22 @@ static void PrepareVenturaLocationControl(void) {
                 LocationControlProxy;
             [authorizationControl setAuthorizationStatus:YES
                 withCorrectiveCompensation:0
-                                forBundleID:@"com.apple.Maps"
+                                forBundleID:MacWSLocationWitnessBundleID
                                orBundlePath:nil
                                  replyBlock:^(NSError *authorizationError) {
-                if (authorizationError) {
-                    dispatch_async(InteropQueue, ^{
-                        NSXPCConnection *failedConnection = weakConnection;
-                        if (!LocationControlConnectionIsCurrent(
-                                failedConnection))
-                            return;
-                        InteropLog(@"Ventura Maps authorization failed: %@",
-                                   authorizationError);
-                        ResetLocationControl();
-                        ScheduleLocationRetry();
-                    });
-                    return;
-                }
                 dispatch_async(InteropQueue, ^{
                     NSXPCConnection *authorizedConnection = weakConnection;
                     if (!LocationControlConnectionIsCurrent(
                             authorizedConnection))
                         return;
-                    id<MacWSLocationInternalServiceProtocol> readbackControl =
-                        LocationControlProxy;
-                    [readbackControl
-                        getAuthorizationStatusForBundleID:@"com.apple.Maps"
-                        orBundlePath:nil
-                        replyBlock:^(NSError *readbackError, int status) {
-                        dispatch_async(InteropQueue, ^{
-                            NSXPCConnection *readbackConnection =
-                                weakConnection;
-                            if (!LocationControlConnectionIsCurrent(
-                                    readbackConnection))
-                                return;
-                            BOOL authorized = status ==
-                                    kCLAuthorizationStatusAuthorizedAlways ||
-                                status ==
-                                    kMacWSAuthorizationStatusAuthorizedWhenInUse;
-                            if (readbackError || !authorized) {
-                                InteropLog(@"Ventura Maps authorization "
-                                           "readback failed status=%d "
-                                           "error=%@",
-                                           status,
-                                           readbackError ?: @"(nil)");
-                                ResetLocationControl();
-                                ScheduleLocationRetry();
-                                return;
-                            }
-                            LocationControlReady = YES;
-                            LocationControlInFlight = NO;
-                            InteropLog(@"Ventura location services and Maps "
-                                       "authorization verified status=%d",
-                                       status);
-                            if (LastNativeLocation)
-                                SubmitVenturaLocation(LastNativeLocation);
-                        });
-                    }];
+                    if (authorizationError) {
+                        InteropLog(@"Ventura location witness authorization "
+                                   "failed: %@", authorizationError);
+                        ResetLocationControl();
+                        ScheduleLocationRetry();
+                        return;
+                    }
+                    AuthorizeVenturaMapsAfterWitness(authorizedConnection);
                 });
             }];
         });

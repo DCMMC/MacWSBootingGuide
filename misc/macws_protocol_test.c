@@ -47,7 +47,8 @@ int main(void) {
         0.0, 0.0, 1194.0, 834.0));
     assert(!MacWSLayerCoversLogicalDisplay(
         0.0, 0.0, 1194.0, 417.0, 0.0, 0.0, 1194.0, 834.0));
-    assert(MACWS_INPUT_VERSION == 5u);
+    assert(MACWS_INPUT_VERSION == 6u);
+    assert(MACWS_INPUT_LEGACY_VERSION == 5u);
     assert(MACWS_STREAM_VERSION == 8u);
     assert(MACWS_FINAL_COMPOSITE_VERSION == 1u);
     assert(sizeof(MacWSFinalCompositeRecord) == 56);
@@ -56,6 +57,21 @@ int main(void) {
     assert(MacWSInputKindDesktopCommand == 20);
     assert(MacWSInputKindSystemGesture == 21);
     assert(MacWSInputKindRotate == 22);
+    assert(MacWSInputKindPerformPaste == 23);
+    assert(MacWSInputKindOpenDocuments == 24);
+    assert(MacWSInputVersionSupportsKind(
+        MACWS_INPUT_LEGACY_VERSION, MacWSInputKindTouchDown));
+    assert(MacWSInputVersionSupportsKind(
+        MACWS_INPUT_VERSION, MacWSInputKindTouchDown));
+    assert(!MacWSInputVersionSupportsKind(
+        MACWS_INPUT_LEGACY_VERSION, MacWSInputKindOpenDocuments));
+    assert(MacWSInputVersionSupportsKind(
+        MACWS_INPUT_VERSION, MacWSInputKindOpenDocuments));
+    assert(MacWSInputWireVersionForKind(MacWSInputKindTouchDown) ==
+           MACWS_INPUT_LEGACY_VERSION);
+    assert(MacWSInputWireVersionForKind(MacWSInputKindOpenDocuments) ==
+           MACWS_INPUT_VERSION);
+    assert(sizeof(MacWSOpenDocumentAck) == 24);
     assert(MacWSSystemGestureAxisHorizontal == 1);
     assert(MacWSSystemGestureAxisVertical == 2);
     assert(!MacWSStreamFrameSupersedesLayerRemoval(7, 41, 7, 41));

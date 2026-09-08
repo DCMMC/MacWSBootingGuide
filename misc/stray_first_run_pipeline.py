@@ -615,7 +615,7 @@ def capture_host_rendered(remote: Remote, destination: pathlib.Path):
     command = (
         "LOG=/var/mobile/Library/Logs/MacWSHost.log; "
         "START=$(( $(wc -l < \"$LOG\") + 1 )); "
-        "/var/jb/usr/bin/uiopen macwshost://screenshot-rendered "
+        "/var/jb/usr/bin/uiopen --url macwshost://screenshot-rendered "
         ">/dev/null 2>&1; "
         "I=0; LINE=; while [ $I -lt 50 ]; do I=$((I + 1)); "
         "LINE=$(tail -n +\"$START\" \"$LOG\" | "

@@ -120,6 +120,14 @@ static int MacWSIsSettingsExtensionTarget(const char *target) {
     return !*right;
 }
 
+static int MacWSIsAuthdTarget(const char *target) {
+    static const char authdTarget[] =
+        "/System/Library/Frameworks/Security.framework/Versions/A/"
+        "XPCServices/authd.xpc/Contents/MacOS/authd";
+    return target && MacWSStringContains(target, authdTarget) &&
+        MacWSStringContains(authdTarget, target);
+}
+
 static const char *MacWSTargetForProxy(const char *program, char *envp[]) {
     // RunningBoard cannot submit a macOS .appex path to the iPadOS launchd
     // service cache.  MacWSCatalystLaunch therefore submits this already
@@ -145,6 +153,17 @@ static const char *MacWSTargetForProxy(const char *program, char *envp[]) {
         MacWSStringContains(csNamedDataTarget, xpcTarget)) {
         return csNamedDataTarget;
     }
+    // Authorization.framework asks launchd for the system XPC service
+    // `com.apple.authd`. MacWS publishes the unmodified Ventura service on a
+    // private endpoint because iPadOS owns the public name with an incompatible
+    // protocol. Preserve the one-shot XPC launch context through this
+    // freestanding proxy just as for csnameddatad above.
+    static const char authdTarget[] =
+        "/System/Library/Frameworks/Security.framework/Versions/A/"
+        "XPCServices/authd.xpc/Contents/MacOS/authd";
+    if (xpcTarget && MacWSIsAuthdTarget(xpcTarget)) {
+        return authdTarget;
+    }
     if (MacWSStringContains(program, "SettingsExtensionProxy")) {
         return "/System/Library/ExtensionKit/Extensions/Appearance.appex/"
                "Contents/MacOS/Appearance";
@@ -159,6 +178,11 @@ static const char *MacWSTargetForProxy(const char *program, char *envp[]) {
         return "/System/Library/Frameworks/AppKit.framework/Versions/C/"
                "XPCServices/com.apple.appkit.xpc.openAndSavePanelService.xpc/"
                "Contents/MacOS/com.apple.appkit.xpc.openAndSavePanelService";
+    }
+    if (MacWSStringContains(program, "QuickLookUIServiceProxy")) {
+        return "/System/Library/Frameworks/QuickLookUI.framework/Versions/A/"
+               "XPCServices/QuickLookUIService.xpc/Contents/MacOS/"
+               "QuickLookUIService";
     }
     if (MacWSStringContains(program, "DockHelperProxy")) {
         return "/System/Library/CoreServices/Dock.app/Contents/XPCServices/"
@@ -258,7 +282,8 @@ int main(int argc, char *argv[], char *envp[]) {
         if (MacWSHasEnvironmentKey(*entry, "DYLD_INSERT_LIBRARIES") ||
             MacWSHasEnvironmentKey(*entry, "HOME") ||
             MacWSHasEnvironmentKey(*entry, "TMPDIR") ||
-            MacWSHasEnvironmentKey(*entry, "MallocNanoZone")) continue;
+            MacWSHasEnvironmentKey(*entry, "MallocNanoZone"))
+            continue;
         targetEnvironment[environmentCount++] = *entry;
     }
     // Settings panes are sandboxed ExtensionKit processes.  They cannot fork,

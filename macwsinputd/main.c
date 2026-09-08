@@ -157,6 +157,8 @@ static const char *KindName(MacWSInputKind kind) {
         case MacWSInputKindReopenApplication: return "reopen-application";
         case MacWSInputKindDesktopCommand: return "desktop-command";
         case MacWSInputKindSystemGesture: return "system-gesture";
+        case MacWSInputKindPerformPaste: return "perform-paste";
+        case MacWSInputKindOpenDocuments: return "open-documents";
     }
     return "invalid";
 }
@@ -179,7 +181,7 @@ static bool IsSystemPointerKind(MacWSInputKind kind) {
 
 static bool RecordIsValid(const MacWSInputRecord *record) {
     if (record->magic != MACWS_INPUT_MAGIC ||
-        record->version != MACWS_INPUT_VERSION ||
+        !MacWSInputVersionSupportsKind(record->version, record->kind) ||
         !isfinite(record->x) || !isfinite(record->y) ||
         record->frameWidth == 0 || record->frameHeight == 0 ||
         record->targetPID < 0 ||
@@ -208,6 +210,8 @@ static bool RecordIsValid(const MacWSInputRecord *record) {
         return record->targetPID > 1;
     if (record->kind == MacWSInputKindPerformPaste)
         return record->targetPID > 1;
+    if (record->kind == MacWSInputKindOpenDocuments)
+        return record->targetPID > 1 && record->sceneID != 0;
     if (record->kind == MacWSInputKindDesktopCommand)
         return record->targetPID > 1 &&
             record->contactID >= MacWSDesktopCommandSpaceLeft &&
@@ -251,7 +255,7 @@ static bool RecordIsValid(const MacWSInputRecord *record) {
         record->x < 0.0f || record->y < 0.0f ||
         record->x >= record->frameWidth || record->y >= record->frameHeight ||
         record->kind < MacWSInputKindTouchDown ||
-        record->kind > MacWSInputKindPerformPaste) {
+        record->kind > MacWSInputKindOpenDocuments) {
         return false;
     }
     return true;
@@ -871,6 +875,42 @@ static bool SendToAppInputBridge(int socketFD,
     return sent == (ssize_t)sizeof(*record);
 }
 
+// A zero-window fullscreen pointer belongs to WindowServer's current global
+// presentation, not to the NSWindow whose pre-Mission-Control pixels happen
+// to occupy that point. The installed OSXvnc process is the only runtime-
+// proven producer that completes Dock's cross-Space window drag. Forward the
+// already-validated wire record to its root-only local endpoint and keep the
+// complete down/move/up transaction on that single system owner. If the
+// endpoint is absent during an upgrade or restart, the caller retains the
+// existing Dock/AppInput fallback rather than dropping input.
+static bool SendToVNCPointerProxy(int socketFD,
+                                  const MacWSInputRecord *record,
+                                  int *errorOut) {
+    struct sockaddr_un address = {0};
+    address.sun_family = AF_UNIX;
+    strlcpy(address.sun_path, MACWS_VNC_POINTER_PROXY_SOCKET_PATH,
+            sizeof(address.sun_path));
+    bool continuous = record->kind == MacWSInputKindTouchMove ||
+                      record->kind == MacWSInputKindHover ||
+                      record->kind == MacWSInputKindMenuHover;
+    unsigned attempts = continuous ? 1 : 2;
+    ssize_t sent = -1;
+    int savedError = 0;
+    for (unsigned attempt = 0; attempt < attempts; attempt++) {
+        sent = sendto(socketFD, record, sizeof(*record), MSG_DONTWAIT,
+                      (const struct sockaddr *)&address, sizeof(address));
+        if (sent == (ssize_t)sizeof(*record)) break;
+        savedError = sent < 0 ? errno : EMSGSIZE;
+        if (continuous || (savedError != EAGAIN && savedError != ENOBUFS) ||
+            attempt + 1 >= attempts) break;
+        struct pollfd descriptor = {.fd = socketFD, .events = POLLOUT};
+        if (poll(&descriptor, 1, 2) <= 0) break;
+    }
+    if (errorOut) *errorOut = sent == (ssize_t)sizeof(*record)
+        ? 0 : savedError;
+    return sent == (ssize_t)sizeof(*record);
+}
+
 static size_t AppInputBridgePIDs(pid_t *pids, size_t capacity);
 
 // The normal Workspace activation broadcast is absent in the chroot. A real
@@ -1306,10 +1346,11 @@ int main(void) {
     size_t pixelHeight;
     ReadDisplayGeometry(&display, &bounds, &pixelWidth, &pixelHeight);
     fprintf(stderr,
-            "MACWS-INPUT READY socket=%s abi=%u record=%zu display=%u "
+            "MACWS-INPUT READY socket=%s abi=%u-%u record=%zu display=%u "
             "bounds=(%.0f,%.0f %.0fx%.0f) pixels=%zux%zu postAccess=%s "
             "targetSocket=%s\n",
-            InputSocketPath, MACWS_INPUT_VERSION, sizeof(MacWSInputRecord),
+            InputSocketPath, MACWS_INPUT_LEGACY_VERSION,
+            MACWS_INPUT_VERSION, sizeof(MacWSInputRecord),
             display, bounds.origin.x, bounds.origin.y,
             bounds.size.width, bounds.size.height, pixelWidth, pixelHeight,
             CGPreflightPostEventAccess() ? "YES" : "NO",
@@ -1367,6 +1408,12 @@ int main(void) {
             fflush(stderr);
             continue;
         }
+
+        // Normalize before any direct or derived AppInput delivery.  Old
+        // ABI-5 AppKit/Dock endpoints remain alive across package installs;
+        // all legacy kinds have the same 84-byte layout and are deliberately
+        // emitted as v5 so a new broker can talk to either endpoint revision.
+        record.version = MacWSInputWireVersionForKind(record.kind);
 
         NoteUserInteraction();
 
@@ -1498,6 +1545,43 @@ int main(void) {
         bool systemGestureRecord =
             record.kind == MacWSInputKindSystemGesture;
         bool gestureRecord = scrollRecord || magnifyRecord || rotateRecord;
+        if (fullscreenGlobalPointerRecord) {
+            int proxyError = 0;
+            bool proxySent = SendToVNCPointerProxy(
+                socketFD, &record, &proxyError);
+            if (proxySent) {
+                sequence++;
+                if (RuntimeDiagnosticsEnabled() &&
+                    record.kind != MacWSInputKindTouchMove &&
+                    record.kind != MacWSInputKindHover &&
+                    record.kind != MacWSInputKindMenuHover) {
+                    fprintf(stderr,
+                        "MACWS-INPUT GLOBAL-POINTER seq=%llu kind=%s "
+                        "contact=%u route=osxvnc-proxy sent=YES\n",
+                        (unsigned long long)sequence,
+                        KindName((MacWSInputKind)record.kind),
+                        record.contactID);
+                    fflush(stderr);
+                }
+                if (record.kind == MacWSInputKindTouchUp ||
+                    record.kind == MacWSInputKindTouchCancel ||
+                    record.kind == MacWSInputKindTap ||
+                    record.kind == MacWSInputKindSecondaryTap)
+                    gestureTarget = (MacWSWindowTarget){0};
+                continue;
+            }
+            if (RuntimeDiagnosticsEnabled() &&
+                record.kind != MacWSInputKindTouchMove &&
+                record.kind != MacWSInputKindHover &&
+                record.kind != MacWSInputKindMenuHover) {
+                fprintf(stderr,
+                    "MACWS-INPUT GLOBAL-POINTER kind=%s contact=%u "
+                    "route=osxvnc-proxy sent=NO errno=%d fallback=app-input\n",
+                    KindName((MacWSInputKind)record.kind),
+                    record.contactID, proxyError);
+                fflush(stderr);
+            }
+        }
         if (fullscreenGlobalPointerRecord) {
             // A fullscreen workspace is a hardware-style global input
             // surface. Its composited Mission Control/Dock transforms are
@@ -2053,7 +2137,8 @@ int main(void) {
         bool continuous = record.kind == MacWSInputKindTouchMove ||
                           record.kind == MacWSInputKindHover ||
                           record.kind == MacWSInputKindMenuHover;
-        if (RuntimeDiagnosticsEnabled() &&
+        if ((RuntimeDiagnosticsEnabled() ||
+             record.contactID == MACWS_INPUT_CONTACT_DIAGNOSTIC) &&
             (!continuous || (sequence % 60) == 0)) {
             fprintf(stderr,
                     "MACWS-INPUT RX seq=%llu scene=%llx kind=%s "

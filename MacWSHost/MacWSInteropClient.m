@@ -3,7 +3,10 @@
 #import <UIKit/UIKit.h>
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 
+#import "MacWSHostDiagnostics.h"
+
 #include <CommonCrypto/CommonDigest.h>
+#include <dirent.h>
 #include <dlfcn.h>
 #include <stdatomic.h>
 #include <xpc/xpc.h>
@@ -19,6 +22,8 @@ static NSString *const MacWSArchiveRepresentationsKey = @"representations";
 static NSString *const MacWSArchiveTypeKey = @"type";
 static NSString *const MacWSArchiveDataKey = @"data";
 static NSString *const MacWSArchiveFilePathKey = @"file_path";
+static NSString *const MacWSObservedPasteboardChangeDefaultsKey =
+    @"MacWSObservedPasteboardChange";
 static const NSUInteger MacWSArchiveVersion = 1;
 
 static __weak MacWSInteropClient *MacWSClipboardPublisher;
@@ -154,6 +159,264 @@ static NSData *MacWSArchiveData(NSArray<NSDictionary *> *items,
     return data;
 }
 
+static NSString *MacWSTransferFilename(NSString *suggestedName,
+                                       NSString *type,
+                                       NSUInteger index) {
+    NSString *name = [suggestedName isKindOfClass:NSString.class]
+        ? suggestedName.lastPathComponent : nil;
+    if (!name.length || [name isEqualToString:@"."] ||
+        [name isEqualToString:@".."]) {
+        name = [NSString stringWithFormat:@"Imported-%lu",
+            (unsigned long)index + 1];
+    }
+    if (!name.pathExtension.length && type.length) {
+        UTType *uniformType = [UTType typeWithIdentifier:type];
+        NSString *extension = uniformType.preferredFilenameExtension;
+        if (extension.length) name = [name stringByAppendingPathExtension:extension];
+    }
+    return name;
+}
+
+static NSString *MacWSContentTypeForFileURL(NSURL *url) {
+    NSNumber *isDirectory = nil;
+    [url getResourceValue:&isDirectory forKey:NSURLIsDirectoryKey error:nil];
+    if (isDirectory.boolValue) return UTTypeFolder.identifier;
+    UTType *type = url.pathExtension.length
+        ? [UTType typeWithFilenameExtension:url.pathExtension] : nil;
+    return type.identifier ?: UTTypeData.identifier;
+}
+
+static NSItemProvider *MacWSFileDragItemProvider(NSURL *url,
+                                                 NSString *suggestedName) {
+    if (![url isKindOfClass:NSURL.class] || !url.isFileURL ||
+        ![NSFileManager.defaultManager fileExistsAtPath:url.path]) return nil;
+
+    NSNumber *isDirectory = nil;
+    [url getResourceValue:&isDirectory forKey:NSURLIsDirectoryKey error:nil];
+    NSString *contentType = MacWSContentTypeForFileURL(url);
+    NSString *acceptedFallback = isDirectory.boolValue
+        ? UTTypeDirectory.identifier : UTTypeContent.identifier;
+    NSItemProvider *provider = [NSItemProvider new];
+    provider.suggestedName = suggestedName.lastPathComponent.length
+        ? suggestedName.lastPathComponent : url.lastPathComponent;
+
+    // Files 16.3 does not treat public.file-url as a generic import. Its
+    // actual canHandle path checks a fixed list headed by public.content and
+    // public.directory. Publish the inferred type first for fidelity, then a
+    // file-backed generic type so an otherwise opaque Finder file (p12,
+    // extensionless data, etc.) still has a representation Files accepts.
+    // fileOptions=0 makes NSItemProvider copy the URL before this callback
+    // returns, which is the supported cross-process lifetime boundary.
+    NSMutableArray<NSString *> *types = [NSMutableArray arrayWithObject:
+        contentType];
+    if (![acceptedFallback isEqualToString:contentType])
+        [types addObject:acceptedFallback];
+    for (NSString *type in types) {
+        [provider registerFileRepresentationForTypeIdentifier:type
+            fileOptions:0
+            visibility:NSItemProviderRepresentationVisibilityAll
+            loadHandler:^NSProgress *(void (^handler)(NSURL *, BOOL,
+                                                       NSError *)) {
+                MacWSLog(@"interop-provider-file-request type=%@ file=%@",
+                    type, url.lastPathComponent);
+                handler(url, NO, nil);
+                return nil;
+            }];
+    }
+    return provider;
+}
+
+static NSURL *MacWSHostDataContainerURL(void) {
+    static NSURL *containerURL;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        NSString *rootPath = @"/var/mobile/Containers/Data/Application";
+        NSURL *root = [NSURL fileURLWithPath:rootPath isDirectory:YES];
+        NSError *enumerationError = nil;
+        NSArray<NSURL *> *candidates = [NSFileManager.defaultManager
+            contentsOfDirectoryAtURL:root
+            includingPropertiesForKeys:nil options:0
+            error:&enumerationError];
+        NSString *bundleIdentifier = NSBundle.mainBundle.bundleIdentifier;
+        NSMutableArray<NSURL *> *allCandidates =
+            [NSMutableArray arrayWithArray:candidates ?: @[]];
+
+        // UIKit apps carrying no-container do not get their data-container URL
+        // through NSHomeDirectory(). On the current rootless runtime Foundation
+        // can also return an empty container-root enumeration even though the
+        // unsandboxed process can traverse it. Use the same POSIX lookup that
+        // succeeds from the device shell as a bounded fallback.
+        if (!allCandidates.count) {
+            DIR *directory = opendir(rootPath.fileSystemRepresentation);
+            if (directory) {
+                struct dirent *entry = NULL;
+                while ((entry = readdir(directory)) != NULL) {
+                    if (entry->d_name[0] == '.') continue;
+                    NSString *name = [NSString stringWithUTF8String:entry->d_name];
+                    if (!name.length) continue;
+                    [allCandidates addObject:[root
+                        URLByAppendingPathComponent:name isDirectory:YES]];
+                }
+                closedir(directory);
+            }
+        }
+
+        NSError *lastMetadataError = nil;
+        for (NSURL *candidate in allCandidates) {
+            NSURL *metadata = [candidate URLByAppendingPathComponent:
+                @".com.apple.mobile_container_manager.metadata.plist"];
+            NSData *metadataData = [NSData dataWithContentsOfURL:metadata
+                options:NSDataReadingMappedIfSafe error:&lastMetadataError];
+            NSDictionary *values = metadataData ?
+                [NSPropertyListSerialization propertyListWithData:metadataData
+                    options:NSPropertyListImmutable format:nil
+                    error:&lastMetadataError] : nil;
+            if ([values[@"MCMMetadataIdentifier"]
+                    isEqualToString:bundleIdentifier]) {
+                containerURL = candidate;
+                break;
+            }
+        }
+        MacWSLog(@"interop-provider-container-resolve bundle=%@ candidates=%lu "
+            "resolved=%@ enumeration-error=%@ metadata-error=%@",
+            bundleIdentifier ?: @"(nil)", (unsigned long)allCandidates.count,
+            containerURL.path ?: @"(nil)", enumerationError ?: @"nil",
+            containerURL ? @"nil" : (lastMetadataError ?: @"nil"));
+    });
+    return containerURL;
+}
+
+static NSURL *MacWSStageDragProviderURL(NSURL *sourceURL, NSError **error) {
+    NSURL *container = MacWSHostDataContainerURL();
+    NSURL *cache = nil;
+    if (container) {
+        cache = [[container URLByAppendingPathComponent:@"Library"
+                                            isDirectory:YES]
+            URLByAppendingPathComponent:@"Caches/MacWSDragExports"
+                             isDirectory:YES];
+    } else {
+        // MacWSHost intentionally carries no-container and therefore runs with
+        // CFFIXED_USER_HOME=/var/mobile. Its own per-bundle cache is the
+        // writable iOS-native staging area in that configuration. The
+        // file-backed NSItemProvider copies from this URL for the receiver;
+        // the raw path itself is never advertised.
+        NSString *homePath = NSProcessInfo.processInfo.environment[
+            @"CFFIXED_USER_HOME"] ?: NSHomeDirectory();
+        NSString *standardHome = homePath.stringByStandardizingPath;
+        if (![standardHome isEqualToString:@"/var/mobile"] &&
+            ![standardHome hasPrefix:@"/var/mobile/"]) {
+            if (error) *error = MacWSError(23,
+                @"找不到可用的 macPad iOS 文件暂存目录");
+            return nil;
+        }
+        cache = [NSURL fileURLWithPath:[[standardHome
+            stringByAppendingPathComponent:@"Library/Caches"]
+            stringByAppendingPathComponent:
+                NSBundle.mainBundle.bundleIdentifier ?: @"com.macwsguide.host"]
+                            isDirectory:YES];
+        cache = [cache URLByAppendingPathComponent:@"MacWSDragExports"
+                                       isDirectory:YES];
+    }
+    NSURL *batch = [cache URLByAppendingPathComponent:NSUUID.UUID.UUIDString
+                                          isDirectory:YES];
+    if (![NSFileManager.defaultManager createDirectoryAtURL:batch
+                                withIntermediateDirectories:YES
+                                                 attributes:nil error:error])
+        return nil;
+    NSString *name = sourceURL.lastPathComponent.length
+        ? sourceURL.lastPathComponent : @"MacWS Export";
+    NSURL *destination = [batch URLByAppendingPathComponent:name];
+    if (![NSFileManager.defaultManager copyItemAtURL:sourceURL
+                                               toURL:destination error:error])
+        return nil;
+    return destination;
+}
+
+static BOOL MacWSStageProviderURL(NSURL *url, NSString *suggestedName,
+                                  NSString *type, NSUInteger index,
+                                  NSString **chrootPath, NSError **error) {
+    if (![url isKindOfClass:NSURL.class] || !url.isFileURL) {
+        if (error) *error = MacWSError(19, @"项目没有可读取的文件表示");
+        return NO;
+    }
+    NSString *batch = [MacWSImportsHostRoot stringByAppendingPathComponent:
+        NSUUID.UUID.UUIDString];
+    if (![NSFileManager.defaultManager createDirectoryAtPath:batch
+                                  withIntermediateDirectories:YES
+                                                   attributes:nil error:error])
+        return NO;
+    NSString *name = MacWSTransferFilename(
+        suggestedName.length ? suggestedName : url.lastPathComponent,
+        type, index);
+    NSURL *destination = [NSURL fileURLWithPath:
+        [batch stringByAppendingPathComponent:name]];
+    BOOL scoped = [url startAccessingSecurityScopedResource];
+    BOOL copied = [NSFileManager.defaultManager copyItemAtURL:url
+                                                        toURL:destination
+                                                        error:error];
+    if (scoped) [url stopAccessingSecurityScopedResource];
+    if (!copied) return NO;
+    if (chrootPath) *chrootPath = [destination.path substringFromIndex:
+        MacWSRootFSHostPrefix.length];
+    return YES;
+}
+
+static BOOL MacWSStageProviderData(NSData *data, NSString *suggestedName,
+                                   NSString *type, NSUInteger index,
+                                   NSString **chrootPath, NSError **error) {
+    if (![data isKindOfClass:NSData.class] || !data.length) return NO;
+    NSString *batch = [MacWSImportsHostRoot stringByAppendingPathComponent:
+        NSUUID.UUID.UUIDString];
+    if (![NSFileManager.defaultManager createDirectoryAtPath:batch
+                                  withIntermediateDirectories:YES
+                                                   attributes:nil error:error])
+        return NO;
+    NSString *name = MacWSTransferFilename(suggestedName, type, index);
+    NSURL *destination = [NSURL fileURLWithPath:
+        [batch stringByAppendingPathComponent:name]];
+    if (![data writeToURL:destination options:NSDataWritingAtomic error:error])
+        return NO;
+    if (chrootPath) *chrootPath = [destination.path substringFromIndex:
+        MacWSRootFSHostPrefix.length];
+    return YES;
+}
+
+static BOOL MacWSSlotHasFileURL(NSArray<NSDictionary *> *slot) {
+    for (NSDictionary *representation in slot) {
+        if ([representation[MacWSArchiveTypeKey]
+                isEqualToString:UTTypeFileURL.identifier] &&
+            representation[MacWSArchiveFilePathKey]) return YES;
+    }
+    return NO;
+}
+
+static NSString *MacWSPreferredMaterializationType(
+    NSArray<NSString *> *types) {
+    NSString *bestType = nil;
+    NSInteger bestScore = NSIntegerMin;
+    for (NSString *type in types) {
+        if (![type isKindOfClass:NSString.class] || !type.length ||
+            [type isEqualToString:UTTypeFileURL.identifier] ||
+            [type hasPrefix:@"com.apple.finder."] ||
+            [type isEqualToString:UTTypeItem.identifier] ||
+            [type isEqualToString:UTTypeContent.identifier] ||
+            [type isEqualToString:UTTypeData.identifier]) continue;
+        UTType *uniformType = [UTType typeWithIdentifier:type];
+        NSInteger score = uniformType ? 10 : 1;
+        if (uniformType.preferredFilenameExtension.length) score += 20;
+        if ([uniformType conformsToType:UTTypeText]) score += 30;
+        if ([uniformType conformsToType:UTTypePDF]) score += 40;
+        if ([uniformType conformsToType:UTTypeAudio] ||
+            [uniformType conformsToType:UTTypeMovie]) score += 50;
+        if ([uniformType conformsToType:UTTypeImage]) score += 60;
+        if (score > bestScore) {
+            bestScore = score;
+            bestType = type;
+        }
+    }
+    return bestType;
+}
+
 static BOOL MacWSStageURLs(NSArray<NSURL *> *urls,
                            NSArray<NSURL *> **stagedURLs,
                            NSArray<NSString *> **chrootPaths,
@@ -243,7 +506,9 @@ static NSURL *MacWSResolvedProviderFileURL(id item) {
 @property(nonatomic) xpc_connection_t connection;
 @property(nonatomic, readwrite, getter=isConnected) BOOL connected;
 @property(nonatomic) NSInteger lastLocalPasteboardChange;
+@property(nonatomic) NSInteger pendingLocalPasteboardChange;
 @property(nonatomic) uint64_t localPublishSerial;
+@property(nonatomic) dispatch_source_t pasteboardPollTimer;
 @end
 
 @implementation MacWSInteropClient
@@ -258,7 +523,10 @@ static NSURL *MacWSResolvedProviderFileURL(id item) {
             arc4random_buf(&MacWSProcessOriginID, sizeof(MacWSProcessOriginID));
             if (!MacWSProcessOriginID) MacWSProcessOriginID = 1;
         });
-        _lastLocalPasteboardChange = UIPasteboard.generalPasteboard.changeCount;
+        NSNumber *observed = [NSUserDefaults.standardUserDefaults
+            objectForKey:MacWSObservedPasteboardChangeDefaultsKey];
+        _lastLocalPasteboardChange = observed ? observed.integerValue : -1;
+        _pendingLocalPasteboardChange = -1;
         if (!MacWSClipboardPublisher) MacWSClipboardPublisher = self;
         [NSNotificationCenter.defaultCenter addObserver:self
             selector:@selector(localPasteboardChanged:)
@@ -266,13 +534,48 @@ static NSURL *MacWSResolvedProviderFileURL(id item) {
         [NSNotificationCenter.defaultCenter addObserver:self
             selector:@selector(localPasteboardChanged:)
             name:UIApplicationDidBecomeActiveNotification object:nil];
+        [NSNotificationCenter.defaultCenter addObserver:self
+            selector:@selector(localPasteboardChanged:)
+            name:UISceneDidActivateNotification object:nil];
+        if (MacWSClipboardPublisher == self) [self startPasteboardPolling];
     }
     return self;
 }
 
 - (void)dealloc {
+    if (_pasteboardPollTimer) dispatch_source_cancel(_pasteboardPollTimer);
     [NSNotificationCenter.defaultCenter removeObserver:self];
     [self invalidate];
+}
+
+- (void)startPasteboardPolling {
+    if (self.pasteboardPollTimer) return;
+    dispatch_source_t timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER,
+        0, 0, dispatch_get_main_queue());
+    if (!timer) return;
+    self.pasteboardPollTimer = timer;
+    __weak typeof(self) weakSelf = self;
+    dispatch_source_set_timer(timer,
+        dispatch_time(DISPATCH_TIME_NOW, 750 * NSEC_PER_MSEC),
+        750 * NSEC_PER_MSEC, 200 * NSEC_PER_MSEC);
+    dispatch_source_set_event_handler(timer, ^{
+        MacWSInteropClient *strongSelf = weakSelf;
+        if (!strongSelf || MacWSClipboardPublisher != strongSelf ||
+            MacWSApplyingRemotePasteboard ||
+            UIApplication.sharedApplication.applicationState !=
+                UIApplicationStateActive) return;
+        NSInteger change = UIPasteboard.generalPasteboard.changeCount;
+        if (change != strongSelf.lastLocalPasteboardChange &&
+            change != strongSelf.pendingLocalPasteboardChange) {
+            // UIPasteboardChangedNotification is not a sufficient cross-app
+            // witness in macPad's multi-scene layout: runtime logs showed a
+            // UIScene becoming active without an application activation or a
+            // pasteboard notification. Poll only the cheap metadata counter;
+            // payload access still happens once, after a new count is seen.
+            [strongSelf localPasteboardChanged:nil];
+        }
+    });
+    dispatch_resume(timer);
 }
 
 - (void)publishStatus:(NSString *)status connected:(BOOL)connected {
@@ -327,13 +630,24 @@ static NSURL *MacWSResolvedProviderFileURL(id item) {
         });
         return;
     }
-    if (!MacWSClipboardPublisher) MacWSClipboardPublisher = self;
-    if (MacWSClipboardPublisher != self || MacWSApplyingRemotePasteboard ||
-        UIApplication.sharedApplication.applicationState !=
-            UIApplicationStateActive) return;
+    if (!MacWSClipboardPublisher) {
+        MacWSClipboardPublisher = self;
+        [self startPasteboardPolling];
+    }
+    UIApplicationState state =
+        UIApplication.sharedApplication.applicationState;
     NSInteger change = UIPasteboard.generalPasteboard.changeCount;
-    if (change == self.lastLocalPasteboardChange) return;
-    self.lastLocalPasteboardChange = change;
+    MacWSLog(@"interop-local-pasteboard notification=%@ change=%ld last=%ld "
+        "state=%ld applying-remote=%@ publisher=%@",
+        notification.name ?: @"manual", (long)change,
+        (long)self.lastLocalPasteboardChange, (long)state,
+        MacWSApplyingRemotePasteboard ? @"YES" : @"NO",
+        MacWSClipboardPublisher == self ? @"YES" : @"NO");
+    if (MacWSClipboardPublisher != self || MacWSApplyingRemotePasteboard ||
+        state != UIApplicationStateActive) return;
+    if (change == self.lastLocalPasteboardChange ||
+        change == self.pendingLocalPasteboardChange) return;
+    self.pendingLocalPasteboardChange = change;
     uint64_t serial = ++self.localPublishSerial;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 150 * NSEC_PER_MSEC),
                    dispatch_get_main_queue(), ^{
@@ -361,6 +675,8 @@ static NSURL *MacWSResolvedProviderFileURL(id item) {
             id value = item[type];
             NSDictionary *representation = nil;
             NSURL *fileURL = [value isKindOfClass:NSURL.class] ? value : nil;
+            if (!fileURL && [type isEqualToString:UTTypeFileURL.identifier])
+                fileURL = MacWSResolvedProviderFileURL(value);
             if (!fileURL && [value isKindOfClass:NSString.class] &&
                 [type isEqualToString:UTTypeFileURL.identifier]) {
                 NSURL *candidate = [NSURL URLWithString:value];
@@ -461,7 +777,52 @@ static NSURL *MacWSResolvedProviderFileURL(id item) {
 }
 
 - (void)publishGeneralPasteboard {
-    NSArray *pasteItems = [UIPasteboard.generalPasteboard.items copy];
+    if (!NSThread.isMainThread) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [self publishGeneralPasteboard];
+        });
+        return;
+    }
+    UIPasteboard *pasteboard = UIPasteboard.generalPasteboard;
+    NSInteger snapshotChange = pasteboard.changeCount;
+    if (self.pendingLocalPasteboardChange < 0)
+        self.pendingLocalPasteboardChange = snapshotChange;
+    NSMutableArray *pasteItems = [NSMutableArray array];
+    for (NSDictionary *item in pasteboard.items)
+        [pasteItems addObject:[item mutableCopy]];
+
+    // UIKit producers are allowed to publish an abstract public.text or
+    // public.plain-text representation. AppKit's NSPasteboardTypeString
+    // consumers ask for public.utf8-plain-text. Preserve every original type,
+    // but add that concrete UTF-8 representation to the same logical item.
+    NSUInteger textItemIndex = NSNotFound;
+    BOOL hasUTF8Text = NO;
+    for (NSUInteger index = 0; index < pasteItems.count; index++) {
+        NSDictionary *item = pasteItems[index];
+        for (NSString *typeIdentifier in item) {
+            if ([typeIdentifier isEqualToString:
+                    UTTypeUTF8PlainText.identifier]) hasUTF8Text = YES;
+            UTType *type = [UTType typeWithIdentifier:typeIdentifier];
+            if (textItemIndex == NSNotFound &&
+                [type conformsToType:UTTypeText]) textItemIndex = index;
+        }
+    }
+    NSString *plainText = textItemIndex != NSNotFound && !hasUTF8Text
+        ? pasteboard.string : nil;
+    if (plainText) {
+        NSMutableDictionary *textItem = pasteItems[textItemIndex];
+        textItem[UTTypeUTF8PlainText.identifier] = plainText;
+    }
+    NSMutableArray<NSString *> *typeSummaries = [NSMutableArray array];
+    for (NSDictionary *item in pasteItems)
+        [typeSummaries addObject:[[item.allKeys
+            sortedArrayUsingSelector:@selector(compare:)]
+            componentsJoinedByString:@","]];
+    MacWSLog(@"interop-local-publish change=%ld items=%lu types=%@ "
+        "canonical-text=%@", (long)pasteboard.changeCount,
+        (unsigned long)pasteItems.count,
+        [typeSummaries componentsJoinedByString:@" | "],
+        plainText ? @"added" : (hasUTF8Text ? @"present" : @"none"));
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         NSError *error = nil;
         NSArray *items = [self archiveItemsForUIKitItems:pasteItems
@@ -469,9 +830,37 @@ static NSURL *MacWSResolvedProviderFileURL(id item) {
         NSData *archive = items ? MacWSArchiveData(items, &error) : nil;
         if (!archive) {
             [self publishStatus:error.localizedDescription connected:self.isConnected];
+            dispatch_async(dispatch_get_main_queue(), ^{
+                if (self.pendingLocalPasteboardChange == snapshotChange)
+                    self.pendingLocalPasteboardChange = -1;
+            });
             return;
         }
-        [self sendArchiveData:archive completion:nil];
+        [self sendArchiveData:archive completion:^(BOOL applied,
+                                                   NSError *sendError) {
+            (void)sendError;
+            if (applied) {
+                self.lastLocalPasteboardChange = snapshotChange;
+                [NSUserDefaults.standardUserDefaults
+                    setInteger:snapshotChange
+                    forKey:MacWSObservedPasteboardChangeDefaultsKey];
+            }
+            if (self.pendingLocalPasteboardChange == snapshotChange)
+                self.pendingLocalPasteboardChange = -1;
+            MacWSLog(@"interop-local-publish-result change=%ld applied=%@ "
+                "current=%ld pending=%ld", (long)snapshotChange,
+                applied ? @"YES" : @"NO",
+                (long)UIPasteboard.generalPasteboard.changeCount,
+                (long)self.pendingLocalPasteboardChange);
+            if (!applied && UIApplication.sharedApplication.applicationState ==
+                    UIApplicationStateActive) {
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                              500 * NSEC_PER_MSEC),
+                               dispatch_get_main_queue(), ^{
+                    [self localPasteboardChanged:nil];
+                });
+            }
+        }];
     });
 }
 
@@ -513,15 +902,18 @@ static NSURL *MacWSResolvedProviderFileURL(id item) {
             return [a[@"order"] compare:b[@"order"]];
         }];
         NSMutableArray *representations = [NSMutableArray array];
+        NSMutableSet<NSString *> *acceptedTypes = [NSMutableSet set];
         for (NSDictionary *loaded in slot) {
             if (totalRepresentations >= MACWS_INTEROP_MAX_REPRESENTATIONS)
                 break;
             NSString *path = loaded[MacWSArchiveFilePathKey];
             NSData *data = loaded[MacWSArchiveDataKey];
+            NSString *type = loaded[MacWSArchiveTypeKey];
+            if (!type.length || [acceptedTypes containsObject:type]) continue;
             if (path) {
                 if (!MacWSSharedTransferPath(path)) continue;
                 [representations addObject:@{
-                    MacWSArchiveTypeKey: loaded[MacWSArchiveTypeKey],
+                    MacWSArchiveTypeKey: type,
                     MacWSArchiveFilePathKey: path
                 }];
             } else {
@@ -529,10 +921,11 @@ static NSURL *MacWSResolvedProviderFileURL(id item) {
                     MACWS_INTEROP_MAX_INLINE_BYTES - totalBytes) continue;
                 totalBytes += data.length;
                 [representations addObject:@{
-                    MacWSArchiveTypeKey: loaded[MacWSArchiveTypeKey],
+                    MacWSArchiveTypeKey: type,
                     MacWSArchiveDataKey: data
                 }];
             }
+            [acceptedTypes addObject:type];
             totalRepresentations++;
         }
         if (representations.count) [archiveItems addObject:@{
@@ -566,14 +959,29 @@ static NSURL *MacWSResolvedProviderFileURL(id item) {
     for (NSUInteger itemIndex = 0; itemIndex < itemLimit; itemIndex++) {
         NSItemProvider *provider = providers[itemIndex];
         NSArray<NSString *> *types = provider.registeredTypeIdentifiers;
+        MacWSLog(@"interop-provider-input item=%lu name=%@ types=%@",
+            (unsigned long)itemIndex, provider.suggestedName ?: @"(nil)",
+            [types componentsJoinedByString:@","]);
         if (scheduledRepresentations < MACWS_INTEROP_MAX_REPRESENTATIONS &&
             [provider hasItemConformingToTypeIdentifier:UTTypeFileURL.identifier]) {
             [jobs addObject:@{
                 @"provider": provider,
                 @"item_index": @(itemIndex),
-                @"order": @(-1),
+                @"order": @(-2),
                 MacWSArchiveTypeKey: UTTypeFileURL.identifier,
-                @"file": @YES
+                @"kind": @"file-url"
+            }];
+            scheduledRepresentations++;
+        }
+        NSString *materializationType = MacWSPreferredMaterializationType(types);
+        if (materializationType &&
+            scheduledRepresentations < MACWS_INTEROP_MAX_REPRESENTATIONS) {
+            [jobs addObject:@{
+                @"provider": provider,
+                @"item_index": @(itemIndex),
+                @"order": @(-1),
+                MacWSArchiveTypeKey: materializationType,
+                @"kind": @"materialize"
             }];
             scheduledRepresentations++;
         }
@@ -592,7 +1000,9 @@ static NSURL *MacWSResolvedProviderFileURL(id item) {
                 @"item_index": @(itemIndex),
                 @"order": @(typeIndex),
                 MacWSArchiveTypeKey: type,
-                @"file": @NO
+                @"kind": @"data",
+                @"materialize_data": @([type isEqualToString:
+                    materializationType])
             }];
             scheduledRepresentations++;
         }
@@ -605,7 +1015,8 @@ static NSURL *MacWSResolvedProviderFileURL(id item) {
     // NSItemProvider is allowed to call every representation loader on a
     // different queue. Starting all 128 at once can transiently materialize
     // gigabytes even though the final archive is capped at 64 MiB. Load one
-    // representation at a time and cap the whole acquisition at five seconds;
+    // representation at a time and cap the whole acquisition at fifteen
+    // seconds (Photos/iCloud may need to materialize an asset);
     // this keeps peak retained payload bounded to the accepted archive plus
     // the single active provider result.
     dispatch_queue_t loadQueue = dispatch_queue_create(
@@ -626,20 +1037,64 @@ static NSURL *MacWSResolvedProviderFileURL(id item) {
         NSItemProvider *provider = job[@"provider"];
         NSUInteger itemIndex = [job[@"item_index"] unsignedIntegerValue];
         NSString *type = job[MacWSArchiveTypeKey];
-        if ([job[@"file"] boolValue]) {
+        NSString *kind = job[@"kind"];
+        if ([kind isEqualToString:@"file-url"]) {
             [provider loadItemForTypeIdentifier:type options:nil
                 completionHandler:^(id item, NSError *providerError) {
+                // Provider URLs can be temporary for only this callback.
+                // Resolve and copy synchronously before returning to UIKit.
+                NSURL *url = providerError ? nil :
+                    MacWSResolvedProviderFileURL(item);
+                NSString *path = nil;
+                NSError *stageError = nil;
+                if (url) MacWSStageProviderURL(url, provider.suggestedName,
+                    type, itemIndex, &path, &stageError);
                 dispatch_async(loadQueue, ^{
                     if (finished) return;
-                    NSURL *url = providerError ? nil :
-                        MacWSResolvedProviderFileURL(item);
-                    NSArray *paths = nil;
-                    if (url) MacWSStageURLs(@[url], nil, &paths, nil);
-                    if (paths.count) [slots[itemIndex] addObject:@{
+                    if (path.length) [slots[itemIndex] addObject:@{
                         @"order": job[@"order"],
                         MacWSArchiveTypeKey: type,
-                        MacWSArchiveFilePathKey: paths.firstObject
+                        MacWSArchiveFilePathKey: path
                     }];
+                    MacWSLog(@"interop-provider-load item=%lu kind=%@ type=%@ accepted=%@ error=%@",
+                        (unsigned long)itemIndex, kind, type,
+                        path.length ? @"YES" : @"NO",
+                        providerError ?: stageError ?: @"nil");
+                    jobIndex++;
+                    void (^next)(void) = weakLoadNext;
+                    if (next) next();
+                });
+            }];
+            return;
+        }
+        if ([kind isEqualToString:@"materialize"]) {
+            if (MacWSSlotHasFileURL(slots[itemIndex])) {
+                jobIndex++;
+                void (^next)(void) = weakLoadNext;
+                if (next) next();
+                return;
+            }
+            [provider loadFileRepresentationForTypeIdentifier:type
+                completionHandler:^(NSURL *url, NSError *providerError) {
+                // loadFileRepresentation's URL is explicitly callback-scoped.
+                NSString *path = nil;
+                NSError *stageError = nil;
+                if (!providerError && url) MacWSStageProviderURL(url,
+                    provider.suggestedName, type, itemIndex, &path,
+                    &stageError);
+                dispatch_async(loadQueue, ^{
+                    if (finished) return;
+                    if (path.length && !MacWSSlotHasFileURL(slots[itemIndex])) {
+                        [slots[itemIndex] addObject:@{
+                            @"order": job[@"order"],
+                            MacWSArchiveTypeKey: UTTypeFileURL.identifier,
+                            MacWSArchiveFilePathKey: path
+                        }];
+                    }
+                    MacWSLog(@"interop-provider-load item=%lu kind=%@ type=%@ accepted=%@ error=%@",
+                        (unsigned long)itemIndex, kind, type,
+                        path.length ? @"YES" : @"NO",
+                        providerError ?: stageError ?: @"nil");
                     jobIndex++;
                     void (^next)(void) = weakLoadNext;
                     if (next) next();
@@ -665,7 +1120,28 @@ static NSURL *MacWSResolvedProviderFileURL(id item) {
                         MacWSArchiveTypeKey: type,
                         MacWSArchiveDataKey: data
                     }];
+                    if ([job[@"materialize_data"] boolValue] &&
+                        !MacWSSlotHasFileURL(slots[itemIndex])) {
+                        NSString *path = nil;
+                        NSError *stageError = nil;
+                        if (MacWSStageProviderData(data, provider.suggestedName,
+                                type, itemIndex, &path, &stageError)) {
+                            [slots[itemIndex] addObject:@{
+                                @"order": @(-1),
+                                MacWSArchiveTypeKey: UTTypeFileURL.identifier,
+                                MacWSArchiveFilePathKey: path
+                            }];
+                        } else if (stageError) {
+                            MacWSLog(@"interop-provider-stage-data item=%lu type=%@ error=%@",
+                                (unsigned long)itemIndex, type, stageError);
+                        }
+                    }
                 }
+                MacWSLog(@"interop-provider-load item=%lu kind=%@ type=%@ bytes=%lu accepted=%@ error=%@",
+                    (unsigned long)itemIndex, kind, type,
+                    (unsigned long)data.length,
+                    (!providerError && data.length) ? @"YES" : @"NO",
+                    providerError ?: @"nil");
                 jobIndex++;
                 void (^next)(void) = weakLoadNext;
                 if (next) next();
@@ -674,7 +1150,7 @@ static NSURL *MacWSResolvedProviderFileURL(id item) {
     };
     weakLoadNext = loadNext;
     dispatch_async(loadQueue, loadNext);
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC), loadQueue, ^{
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 15 * NSEC_PER_SEC), loadQueue, ^{
         if (!finished) {
             finished = YES;
             [self sendLoadedProviderSlots:slots completion:completion];
@@ -710,42 +1186,128 @@ static NSURL *MacWSResolvedProviderFileURL(id item) {
 }
 
 - (NSArray<NSItemProvider *> *)itemProvidersForArchiveData:(NSData *)archive
-                                                      error:(NSError **)error {
+                                                stagedURLs:
+                                                    (NSArray<NSURL *> * _Nullable
+                                                     * _Nullable)outURLs
+                                                     error:(NSError **)error {
     NSArray *items = MacWSValidatedArchiveItems(archive, error);
     if (!items) return @[];
     NSMutableArray *providers = [NSMutableArray array];
+    NSMutableArray<NSURL *> *exportedURLs = [NSMutableArray array];
     for (NSDictionary *item in items) {
-        NSItemProvider *provider = [NSItemProvider new];
+        NSURL *primaryURL = nil;
+        for (NSDictionary *representation in
+                item[MacWSArchiveRepresentationsKey]) {
+            NSString *path = representation[MacWSArchiveFilePathKey];
+            if (!path) continue;
+            NSString *hostPath = [MacWSRootFSHostPrefix
+                stringByAppendingString:path.stringByStandardizingPath];
+            if ([NSFileManager.defaultManager fileExistsAtPath:hostPath]) {
+                primaryURL = [NSURL fileURLWithPath:hostPath];
+                break;
+            }
+        }
+        NSItemProvider *provider = nil;
         NSUInteger registered = 0;
+        if (primaryURL) {
+            NSError *stageError = nil;
+            NSURL *providerURL = MacWSStageDragProviderURL(primaryURL,
+                                                           &stageError);
+            provider = providerURL ? MacWSFileDragItemProvider(
+                providerURL, primaryURL.lastPathComponent) : nil;
+            if (provider) {
+                registered = provider.registeredTypeIdentifiers.count;
+                [exportedURLs addObject:providerURL];
+                MacWSLog(@"interop-provider-container-stage source=%@ staged=%@ "
+                    "mode=file types=%@", primaryURL.path, providerURL.path,
+                    [provider.registeredTypeIdentifiers
+                        componentsJoinedByString:@","]);
+            } else {
+                // Keep a readable diagnostic representation if container
+                // resolution fails, but do not re-introduce a raw file URL.
+                provider = MacWSFileDragItemProvider(
+                    primaryURL, primaryURL.lastPathComponent);
+                registered = provider.registeredTypeIdentifiers.count;
+                MacWSLog(@"interop-provider-container-stage source=%@ failed=%@",
+                    primaryURL.path, stageError ?: @"unknown");
+            }
+        }
+        if (!provider) provider = [NSItemProvider new];
         for (NSDictionary *representation in item[MacWSArchiveRepresentationsKey]) {
             NSString *type = representation[MacWSArchiveTypeKey];
             NSString *path = representation[MacWSArchiveFilePathKey];
             if (path) {
+                // A primary file is represented only by the staged iOS URL.
+                // Never re-register the chroot URL or expose public.file-url.
+                if (primaryURL) continue;
                 NSString *hostPath = [MacWSRootFSHostPrefix
                     stringByAppendingString:path.stringByStandardizingPath];
                 NSURL *url = [NSURL fileURLWithPath:hostPath];
                 if (![NSFileManager.defaultManager fileExistsAtPath:hostPath])
                     continue;
-                [provider registerFileRepresentationForTypeIdentifier:type
-                    fileOptions:NSItemProviderFileOptionOpenInPlace
-                    visibility:NSItemProviderRepresentationVisibilityAll
-                    loadHandler:^NSProgress *(void (^handler)(NSURL *, BOOL,
-                                                              NSError *)) {
-                        handler(url, YES, nil);
-                        return nil;
-                    }];
+                if (![provider.registeredTypeIdentifiers containsObject:type]) {
+                    [provider registerFileRepresentationForTypeIdentifier:type
+                        fileOptions:0
+                        visibility:NSItemProviderRepresentationVisibilityAll
+                        loadHandler:^NSProgress *(void (^handler)(NSURL *, BOOL,
+                                                                  NSError *)) {
+                            MacWSLog(@"interop-provider-file-request type=%@ file=%@",
+                                type, url.lastPathComponent);
+                            handler(url, NO, nil);
+                            return nil;
+                        }];
+                }
             } else {
+                // A Finder file must stay file-backed through the drop. In
+                // particular, publishing its inline text flavor lets Files
+                // choose that representation and name the result "text".
+                // Clipboard-only items have no primary URL and retain every
+                // original data representation below.
+                if (primaryURL) continue;
+                if ([type hasPrefix:@"com.apple.finder."] ||
+                    [type isEqualToString:UTTypeFileURL.identifier] ||
+                    [type isEqualToString:UTTypeURL.identifier]) continue;
                 NSData *data = representation[MacWSArchiveDataKey];
-                [provider registerDataRepresentationForTypeIdentifier:type
-                    visibility:NSItemProviderRepresentationVisibilityAll
-                    loadHandler:^NSProgress *(void (^handler)(NSData *, NSError *)) {
-                        handler(data, nil);
-                        return nil;
-                    }];
+                if (![provider.registeredTypeIdentifiers containsObject:type]) {
+                    [provider registerDataRepresentationForTypeIdentifier:type
+                        visibility:NSItemProviderRepresentationVisibilityAll
+                        loadHandler:^NSProgress *(void (^handler)(NSData *, NSError *)) {
+                            MacWSLog(@"interop-provider-data-request type=%@ bytes=%lu",
+                                type, (unsigned long)data.length);
+                            handler(data, nil);
+                            return nil;
+                        }];
+                }
             }
             registered++;
         }
-        if (registered) [providers addObject:provider];
+        if (registered) {
+            BOOL item = [provider hasRepresentationConformingToTypeIdentifier:
+                UTTypeItem.identifier fileOptions:0];
+            BOOL data = [provider hasRepresentationConformingToTypeIdentifier:
+                UTTypeData.identifier fileOptions:0];
+            BOOL fileURL = [provider hasRepresentationConformingToTypeIdentifier:
+                UTTypeFileURL.identifier fileOptions:0];
+            BOOL content = [provider hasRepresentationConformingToTypeIdentifier:
+                UTTypeContent.identifier fileOptions:0];
+            BOOL directory = [provider hasRepresentationConformingToTypeIdentifier:
+                UTTypeDirectory.identifier fileOptions:0];
+            MacWSLog(@"interop-provider-output name=%@ types=%@ conforms="
+                "item:%@ data:%@ file-url:%@ content:%@ directory:%@",
+                provider.suggestedName ?: @"(nil)",
+                [provider.registeredTypeIdentifiers componentsJoinedByString:@","],
+                item ? @"YES" : @"NO", data ? @"YES" : @"NO",
+                fileURL ? @"YES" : @"NO", content ? @"YES" : @"NO",
+                directory ? @"YES" : @"NO");
+            [providers addObject:provider];
+        }
+    }
+    NSArray<NSURL *> *urls = [exportedURLs copy];
+    if (outURLs) *outURLs = urls;
+    if (urls.count && self.delegate) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [self.delegate interopClient:self receivedMacOSFilesAtURLs:urls];
+        });
     }
     return providers;
 }
@@ -782,6 +1344,15 @@ static NSURL *MacWSResolvedProviderFileURL(id item) {
 
 - (NSArray<NSItemProvider *> *)macOSDragItemProvidersAfterChangeCount:
     (uint64_t)changeCount waitMilliseconds:(uint64_t)waitMilliseconds {
+    return [self macOSDragItemProvidersAfterChangeCount:changeCount
+                                       waitMilliseconds:waitMilliseconds
+                                             stagedURLs:nil];
+}
+
+- (NSArray<NSItemProvider *> *)macOSDragItemProvidersAfterChangeCount:
+    (uint64_t)changeCount waitMilliseconds:(uint64_t)waitMilliseconds
+    stagedURLs:(NSArray<NSURL *> * _Nullable * _Nullable)stagedURLs {
+    if (stagedURLs) *stagedURLs = @[];
     xpc_object_t request = xpc_dictionary_create(NULL, NULL, 0);
     xpc_dictionary_set_string(request, MACWS_INTEROP_KEY_OP,
                               MACWS_INTEROP_OP_SNAPSHOT_DRAG_PASTEBOARD);
@@ -795,7 +1366,13 @@ static NSURL *MacWSResolvedProviderFileURL(id item) {
     NSData *archive = reply ? [self archivePayloadFromMessage:reply
                                                    descriptor:&descriptor] : nil;
     NSError *error = nil;
-    return archive ? [self itemProvidersForArchiveData:archive error:&error] : @[];
+    return archive ? [self itemProvidersForArchiveData:archive
+                                            stagedURLs:stagedURLs
+                                                 error:&error] : @[];
+}
+
+- (NSItemProvider *)dragItemProviderForStagedURL:(NSURL *)url {
+    return MacWSFileDragItemProvider(url, url.lastPathComponent);
 }
 
 - (void)handleEvent:(xpc_object_t)event {
@@ -846,8 +1423,31 @@ static NSURL *MacWSResolvedProviderFileURL(id item) {
     dispatch_async(dispatch_get_main_queue(), ^{
         if (descriptor.originID == MacWSLastRemoteOrigin &&
             descriptor.generation <= MacWSLastRemoteGeneration) return;
+        MacWSInteropClient *publisher = MacWSClipboardPublisher;
+        NSInteger currentLocalChange =
+            UIPasteboard.generalPasteboard.changeCount;
+        NSInteger lastObservedLocalChange = publisher
+            ? publisher.lastLocalPasteboardChange
+            : self.lastLocalPasteboardChange;
+        if (!MacWSApplyingRemotePasteboard &&
+            ((publisher && publisher.pendingLocalPasteboardChange >= 0) ||
+             currentLocalChange != lastObservedLocalChange)) {
+            // Runtime boundary: after copying in another iPadOS app, the
+            // global change count advances while this process is suspended.
+            // A queued/stale macOS event must not overwrite that newer local
+            // value before UIApplicationDidBecomeActive publishes it.
+            MacWSLog(@"interop-remote-deferred reason=newer-local change=%ld "
+                "last=%ld pending=%ld remote-origin=%llu remote-generation=%llu",
+                (long)currentLocalChange, (long)lastObservedLocalChange,
+                (long)(publisher ? publisher.pendingLocalPasteboardChange : -1),
+                (unsigned long long)descriptor.originID,
+                (unsigned long long)descriptor.generation);
+            if (publisher) [publisher localPasteboardChanged:nil];
+            return;
+        }
         NSMutableArray *pasteboardItems = [NSMutableArray array];
         NSMutableArray *fileURLs = [NSMutableArray array];
+        NSMutableArray<NSString *> *typeSummaries = [NSMutableArray array];
         for (NSDictionary *item in items) {
             NSMutableDictionary *values = [NSMutableDictionary dictionary];
             for (NSDictionary *representation in
@@ -866,7 +1466,12 @@ static NSURL *MacWSResolvedProviderFileURL(id item) {
                     values[type] = representation[MacWSArchiveDataKey];
                 }
             }
-            if (values.count) [pasteboardItems addObject:values];
+            if (values.count) {
+                [pasteboardItems addObject:values];
+                [typeSummaries addObject:[[values.allKeys
+                    sortedArrayUsingSelector:@selector(compare:)]
+                    componentsJoinedByString:@","]];
+            }
         }
         if (!pasteboardItems.count) return;
         MacWSLastRemoteOrigin = descriptor.originID;
@@ -874,10 +1479,23 @@ static NSURL *MacWSResolvedProviderFileURL(id item) {
         MacWSApplyingRemotePasteboard = YES;
         UIPasteboard.generalPasteboard.items = pasteboardItems;
         self.lastLocalPasteboardChange = UIPasteboard.generalPasteboard.changeCount;
+        self.pendingLocalPasteboardChange = -1;
         MacWSClipboardPublisher.lastLocalPasteboardChange =
             self.lastLocalPasteboardChange;
+        MacWSClipboardPublisher.pendingLocalPasteboardChange = -1;
+        [NSUserDefaults.standardUserDefaults
+            setInteger:self.lastLocalPasteboardChange
+            forKey:MacWSObservedPasteboardChangeDefaultsKey];
         self.localPublishSerial++;
         MacWSApplyingRemotePasteboard = NO;
+        MacWSLog(@"interop-remote-applied change=%ld items=%lu files=%lu "
+            "types=%@ origin=%llu generation=%llu",
+            (long)self.lastLocalPasteboardChange,
+            (unsigned long)pasteboardItems.count,
+            (unsigned long)fileURLs.count,
+            [typeSummaries componentsJoinedByString:@" | "],
+            (unsigned long long)descriptor.originID,
+            (unsigned long long)descriptor.generation);
         if (fileURLs.count)
             [self.delegate interopClient:self receivedMacOSFilesAtURLs:fileURLs];
         [self publishStatus:[NSString stringWithFormat:

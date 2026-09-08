@@ -5,7 +5,8 @@
 
 #define MACWS_FRAME_MAGIC 0x564e4346u /* "VNCF" */
 #define MACWS_INPUT_MAGIC 0x4d574556u /* "MWEV" */
-#define MACWS_INPUT_VERSION 5u
+#define MACWS_INPUT_LEGACY_VERSION 5u
+#define MACWS_INPUT_VERSION 6u
 #define MACWS_INPUT_CONTACT_DIAGNOSTIC 0x44494147u /* "DIAG" */
 #define MACWS_INPUT_WINDOW_SCENE_FLAG UINT64_C(0x0000000080000000)
 #define MACWS_TARGET_PROBE_MAGIC 0x4d575450u /* "MWTP" */
@@ -25,6 +26,8 @@
 #define MACWS_DIRECT_DRAWABLE_ACTIVITY_VERSION 1u
 #define MACWS_VNC_ACTIVATION_REPLY_SOCKET_PATH \
     "/private/tmp/macws_vnc_activation_reply.sock"
+#define MACWS_VNC_POINTER_PROXY_SOCKET_PATH \
+    "/private/tmp/macws_vnc_pointer_proxy.sock"
 
 typedef struct __attribute__((packed)) {
     uint32_t magic;
@@ -163,7 +166,50 @@ enum {
     // The item supplies its real AppKit target/action after the Host has
     // focused the exact drop point and macwsinteropd has committed the data.
     MacWSInputKindPerformPaste = 23,
+    // Complete a document-open transaction inside the target AppKit process.
+    // sceneID is a nonzero hostd-generated nonce naming a mode-0600 sidecar
+    // that contains only already-validated absolute document paths.  This is
+    // version 6's replacement for the missing cross-process AppleEvent
+    // endpoint; the receiver constructs kAEOpenDocuments and passes it to
+    // NSApplication's normal Ventura open-event handler.
+    MacWSInputKindOpenDocuments = 24,
 };
+
+// ABI 6 added only OpenDocuments; the packed record itself is still the
+// 84-byte ABI introduced by version 5.  During a package upgrade, UIKit Host,
+// macwsinputd and long-lived AppKit/Dock processes cannot all replace their
+// mapped code atomically.  Keep every pre-existing kind on the version-5 wire
+// dialect and let current receivers accept either dialect for those kinds.
+// OpenDocuments remains fail-closed on version 6 because an ABI-5 endpoint
+// does not implement its sidecar/ACK transaction.
+static inline int MacWSInputVersionSupportsKind(uint16_t version,
+                                                MacWSInputKind kind) {
+    if (kind == MacWSInputKindOpenDocuments)
+        return version == MACWS_INPUT_VERSION;
+    return kind >= MacWSInputKindTouchDown &&
+        kind <= MacWSInputKindPerformPaste &&
+        (version == MACWS_INPUT_LEGACY_VERSION ||
+         version == MACWS_INPUT_VERSION);
+}
+
+static inline uint16_t MacWSInputWireVersionForKind(MacWSInputKind kind) {
+    return kind == MacWSInputKindOpenDocuments
+        ? MACWS_INPUT_VERSION : MACWS_INPUT_LEGACY_VERSION;
+}
+
+#define MACWS_OPEN_DOCUMENT_SIDECAR_PREFIX \
+    "/private/tmp/macws_open_documents"
+#define MACWS_OPEN_DOCUMENT_ACK_MAGIC 0x4d574f41u /* "MWOA" */
+#define MACWS_OPEN_DOCUMENT_ACK_VERSION 1u
+
+typedef struct __attribute__((packed)) {
+    uint32_t magic;
+    uint16_t version;
+    uint16_t size;
+    uint64_t nonce;
+    int32_t targetPID;
+    uint32_t acceptedCount;
+} MacWSOpenDocumentAck;
 
 typedef uint32_t MacWSDesktopCommand;
 enum {

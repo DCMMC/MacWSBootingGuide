@@ -35,6 +35,29 @@ ASPHALT_OPENSSL_CONFIG="/var/jb/usr/macOS/share/openssl/openssl.cnf"
 MACOS_CA_BUNDLE="/var/mnt/rootfs/etc/ssl/cert.pem"
 ASPHALT_CA_BUNDLE="/var/mnt/rootfs/usr/local/ssl/cert.pem"
 ASPHALT_OPENSSL_CONFIG_DEST="/var/mnt/rootfs/usr/local/ssl/openssl.cnf"
+SUBLIME_SETTINGS_TEMPLATE="/var/jb/usr/macOS/share/sublime/Preferences.sublime-settings"
+
+install_sublime_software_renderer_default() {
+    local sublime_binary="$ROOTFS/Applications/Sublime Text.app/Contents/MacOS/sublime_text"
+    local settings_directory="$ROOTFS/var/root/Library/Application Support/Sublime Text/Packages/User"
+    local settings_path="$settings_directory/Preferences.sublime-settings"
+    [ -x "$sublime_binary" ] || return 0
+    [ -f "$SUBLIME_SETTINGS_TEMPLATE" ] || return 1
+
+    # Sublime 4200's shipped Preferences (OSX).sublime-settings explicitly
+    # selects OpenGL. Runtime sampling on iPad13,6 (2026-09-08) found 547/748
+    # main-thread samples in CAOpenGLLayer and 534/748 in Sublime's
+    # drawInCGLContext:, backed by GLRendererFloat. Install Sublime's supported
+    # CPU-rendering setting only for a pristine profile. An existing User
+    # preferences file is an explicit user choice and is never rewritten.
+    if [ ! -e "$settings_path" ]; then
+        mkdir -p "$settings_directory" || return 1
+        cp "$SUBLIME_SETTINGS_TEMPLATE" "$settings_path" || return 1
+        chown root:wheel "$settings_path" 2>/dev/null || true
+        chmod 0644 "$settings_path" || return 1
+        echo '[INFO] installed MacWS Sublime CPU-renderer default'
+    fi
+}
 
 MACHO_PATCHER="/var/jb/usr/macOS/bin/set_macos_version.py"
 OBJC_TRAMPOLINE_PATCHER="/var/jb/usr/macOS/bin/ensure_objc_trampolines_arm64.py"
@@ -453,6 +476,68 @@ ensure_project_signature_and_trustcache() {
     add_all_trustcache "$path"
 }
 
+# A dylib may not carry the broad application entitlement profile: iPadOS
+# AMFI rejects that shape before dyld can map it with "has entitlements but is
+# not a main binary". Runtime A/B on 2026-09-07 confirmed that Preview's
+# CoreImage libWrapGL has exactly this stale shape; registering its old
+# CDHashes did not help, while an entitlement-free ad-hoc signature removed
+# the libWrapGL rejection and CIContext's "No supported back-end" failure.
+ensure_entitlement_free_signature_and_trustcache() {
+    local path="$1" entitlements=""
+    [ -f "$path" ] || return 0
+    entitlements=$(ldid -e "$path" 2>/dev/null || true)
+    if [ -n "$entitlements" ]; then
+        ldid -S "$path" || return 1
+    fi
+    add_all_trustcache "$path"
+}
+
+# A Ventura LaunchAgent can carry a macOS application identity and seatbelt
+# profile that are invalid when the same executable is hosted as a root Mach
+# service by outer iPadOS launchd. Runtime oslog on 2026-09-06 captured the
+# kernel killing ThumbnailsAgent at exec with "failed to set executable path"
+# while containermanagerd resolved its native application-identifier. Signing
+# the same image with the project's no-container profile (without ldid -M)
+# removed that stale identity and the real agent remained alive. Keep this
+# replacement policy narrow to that proven launch-context mismatch.
+ensure_uncontainered_project_signature_and_trustcache() {
+    local path="$1" required_marker="${2:-}" entitlements=""
+    [ -f "$path" ] || return 0
+    entitlements=$(ldid -e "$path" 2>/dev/null || true)
+    if ! printf '%s\n' "$entitlements" |
+           grep -q '<key>com.apple.private.security.no-container</key>' ||
+       { [ -n "$required_marker" ] &&
+         ! printf '%s\n' "$entitlements" |
+             grep -Fq "$required_marker"; } ||
+       printf '%s\n' "$entitlements" |
+           grep -q '<key>application-identifier</key>' ||
+       printf '%s\n' "$entitlements" |
+           grep -q '<key>com.apple.application-identifier</key>' ||
+       printf '%s\n' "$entitlements" |
+           grep -q '<key>seatbelt-profiles</key>'; then
+        ldid -S"$ENT" "$path" || return 1
+    fi
+    add_all_trustcache "$path"
+}
+
+# DesktopServicesHelper's stock Ventura handshake reads the requesting task's
+# com.apple.private.tcc.allow array and rejects Finder unless it contains the
+# all-files service.  Existing installations may already carry the older
+# project signature, so the generic marker above is not sufficient to migrate
+# this one protocol client after an upgrade.
+ensure_desktopservices_client_signature_and_trustcache() {
+    local path="$1" entitlements=""
+    [ -f "$path" ] || return 0
+    entitlements=$(ldid -e "$path" 2>/dev/null || true)
+    if ! printf '%s\n' "$entitlements" |
+           grep -q '<key>com.apple.private.graphics-restart-no-kill</key>' ||
+       ! printf '%s\n' "$entitlements" |
+           grep -q '<string>kTCCServiceSystemPolicyAllFiles</string>'; then
+        ldid -S"$ENT" -M "$path" || return 1
+    fi
+    add_all_trustcache "$path"
+}
+
 # Keep cfprefsd out of the generic project entitlement profile.  Runtime
 # evidence on iPadOS 16.3 established both failure boundaries: the stock Apple
 # image is rejected by AMFI CT policy 0x8, and adding the generic profile's
@@ -574,6 +659,21 @@ trust_existing_app_bundle() {
         done
 }
 
+# Restore the persistent signatures of a framework tree without changing its
+# nested-code relationship. This is the same cold-boot invariant as an app
+# bundle, but private frameworks do not have a Contents directory.
+trust_existing_macho_tree() {
+    local tree="$1"
+    local name="$2"
+    [ -d "$tree" ] || return 0
+
+    echo "[INFO] Restoring signed Mach-O trustcache entries for $name..."
+    list_macho_files "$tree" |
+        while IFS= read -r -d '' path; do
+            add_all_trustcache "$path"
+        done
+}
+
 # The iOS-native control daemon is the reboot-safe entry point used by the
 # MacWSHost app.  Trust it here, but never unload it from this script: postinst
 # may itself be running as a request served by macwshostd.
@@ -656,6 +756,7 @@ fi
 VIEWBRIDGE_PROXY_EXEC="$VIEWBRIDGE_PROXY/ViewBridgeAuxiliary"
 HISERVICES_PROXY_EXEC="/var/jb/usr/macOS/Frameworks/HIServices.framework/Versions/A/XPCServices/HIServicesProxy.xpc/HIServicesProxy"
 OPEN_SAVE_PANEL_PROXY_EXEC="/var/jb/usr/macOS/Frameworks/AppKit.framework/Versions/C/XPCServices/OpenAndSavePanelProxy.xpc/OpenAndSavePanelProxy"
+QUICKLOOK_UI_PROXY_EXEC="/var/jb/usr/macOS/Frameworks/QuickLookUI.framework/Versions/A/XPCServices/QuickLookUIServiceProxy.xpc/QuickLookUIServiceProxy"
 DOCK_HELPER_PROXY_EXEC="/var/jb/usr/macOS/Frameworks/Dock.framework/Versions/A/XPCServices/DockHelperProxy.xpc/DockHelperProxy"
 GEOD_PROXY_EXEC="/var/jb/usr/macOS/PrivateFrameworks/GeoServices.framework/Versions/A/XPCServices/GeodProxy.xpc/GeodProxy"
 WRITE_CONFIG_PROXY_EXEC="/var/jb/usr/macOS/PrivateFrameworks/SystemAdministration.framework/XPCServices/WriteConfigProxy.xpc/WriteConfigProxy"
@@ -663,6 +764,7 @@ LOCATIOND_PROXY_EXEC="/var/jb/usr/macOS/PrivateFrameworks/CoreLocation.framework
 add_all_trustcache "$VIEWBRIDGE_PROXY_EXEC"
 add_all_trustcache "$HISERVICES_PROXY_EXEC"
 add_all_trustcache "$OPEN_SAVE_PANEL_PROXY_EXEC"
+add_all_trustcache "$QUICKLOOK_UI_PROXY_EXEC"
 add_all_trustcache "$DOCK_HELPER_PROXY_EXEC"
 add_all_trustcache "$GEOD_PROXY_EXEC"
 add_all_trustcache "$WRITE_CONFIG_PROXY_EXEC"
@@ -681,6 +783,7 @@ for proxy in \
     "$VIEWBRIDGE_PROXY_EXEC" \
     "$HISERVICES_PROXY_EXEC" \
     "$OPEN_SAVE_PANEL_PROXY_EXEC" \
+    "$QUICKLOOK_UI_PROXY_EXEC" \
     "$DOCK_HELPER_PROXY_EXEC" \
     "$EXTENSIONKIT_PROXY" \
     "$GEOD_PROXY_EXEC" \
@@ -712,6 +815,7 @@ sign_and_trustcache "/var/mnt/rootfs/System/Library/PrivateFrameworks/ViewBridge
 sign_and_trustcache "/var/mnt/rootfs/System/Library/CoreServices/UIKitSystem.app/Contents/MacOS/UIKitSystem"
 sign_and_trustcache "/var/mnt/rootfs/System/Library/Frameworks/ApplicationServices.framework/Versions/A/Frameworks/HIServices.framework/Versions/A/XPCServices/com.apple.hiservices-xpcservice.xpc/Contents/MacOS/com.apple.hiservices-xpcservice"
 sign_and_trustcache "/var/mnt/rootfs/System/Library/Frameworks/AppKit.framework/Versions/C/XPCServices/com.apple.appkit.xpc.openAndSavePanelService.xpc/Contents/MacOS/com.apple.appkit.xpc.openAndSavePanelService"
+sign_and_trustcache "/var/mnt/rootfs/System/Library/Frameworks/QuickLookUI.framework/Versions/A/XPCServices/QuickLookUIService.xpc/Contents/MacOS/QuickLookUIService"
 sign_and_trustcache_with_entitlements \
     "/var/mnt/rootfs/System/Library/Frameworks/ExtensionFoundation.framework/Versions/A/XPCServices/extensionkitservice.xpc/Contents/MacOS/extensionkitservice" \
     "$EXTENSIONKIT_ENT"
@@ -954,7 +1058,58 @@ add_all_trustcache '/var/mnt/rootfs/System/Applications/Utilities/Activity Monit
 # postinst/cold-start repairs.  The entitlement probe avoids repeatedly
 # changing the signed file and accumulating obsolete trustcache entries.
 FINDER_BIN='/var/mnt/rootfs/System/Library/CoreServices/Finder.app/Contents/MacOS/Finder'
-ensure_project_signature_and_trustcache "$FINDER_BIN" || exit 1
+ensure_desktopservices_client_signature_and_trustcache "$FINDER_BIN" || exit 1
+# Preview is Finder's stock default handler for both PDF and common image
+# documents. Runtime oslog on 2026-09-07 captured its unmodified Ventura
+# executable being killed before libmachook/AppKit startup with:
+# "unsuitable CT policy 0x8 for this platform/device" followed by
+# "code signature validation failed". Like Finder, it is a direct outer-
+# launchd target, so give the executable the persistent project signature once
+# and restore its dynamic trustcache entries on every postinst/reboot repair.
+ensure_project_signature_and_trustcache \
+    '/var/mnt/rootfs/System/Applications/Preview.app/Contents/MacOS/Preview' || exit 1
+# Preview links Hydra before libmachook/autosignd can run. Runtime A/B on the
+# installed Ventura images showed dyld advance from Hydra to libAlembic only
+# after each already-signed Hydra Mach-O CDHash entered the dynamic trustcache.
+trust_existing_macho_tree \
+    '/var/mnt/rootfs/System/Library/PrivateFrameworks/Hydra.framework' \
+    'Hydra.framework' || exit 1
+ensure_entitlement_free_signature_and_trustcache \
+    '/var/mnt/rootfs/System/Library/Frameworks/CoreImage.framework/Versions/A/Frameworks/libWrapGL.dylib' || exit 1
+ensure_uncontainered_project_signature_and_trustcache \
+    '/var/mnt/rootfs/System/Library/Frameworks/QuickLookThumbnailing.framework/Support/com.apple.quicklook.ThumbnailsAgent' || exit 1
+ensure_uncontainered_project_signature_and_trustcache \
+    '/var/mnt/rootfs/System/Library/Frameworks/QuickLook.framework/Versions/A/XPCServices/QuickLookSatellite.xpc/Contents/MacOS/QuickLookSatellite' || exit 1
+ensure_project_signature_and_trustcache \
+    '/var/mnt/rootfs/System/Library/Frameworks/QuickLookUI.framework/Versions/A/XPCServices/QuickLookUIService.xpc/Contents/MacOS/QuickLookUIService' || exit 1
+QUICKLOOK_DISPLAY_ROOT='/var/mnt/rootfs/System/Library/Frameworks/QuickLookUI.framework/Versions/A/PlugIns'
+for quicklook_display_bundle in "$QUICKLOOK_DISPLAY_ROOT"/*.qldisplay; do
+    [ -d "$quicklook_display_bundle" ] || continue
+    quicklook_display_name=${quicklook_display_bundle##*/}
+    quicklook_display_name=${quicklook_display_name%.qldisplay}
+    quicklook_display_executable="$quicklook_display_bundle/Contents/MacOS/$quicklook_display_name"
+    [ ! -f "$quicklook_display_executable" ] || \
+        ensure_project_signature_and_trustcache \
+            "$quicklook_display_executable" || exit 1
+done
+ensure_uncontainered_project_signature_and_trustcache \
+    '/var/mnt/rootfs/usr/libexec/pkd' \
+    '<key>com.apple.runningboard.launch_extensions</key>' || exit 1
+# Ventura pkd's -[PKDPlugIn diagnose] accepts an extension without a
+# containing application only when rootless_check_trusted(bundleURL) reports
+# that its bundle is SIP-protected.  RE-confirmed in Ventura 13.4 pkd UUID
+# 76E60957-... at __TEXT+0x7914..+0x7978.  The extracted macOS filesystem lost
+# SF_RESTRICTED on these two framework-owned Quick Look bundles (runtime stat:
+# flags=0), so iPadOS's real rootless_check_trusted rejected them even after
+# their signed sandbox entitlements were restored.  Mark only the bundle URL
+# that pkd checks; do not bypass rootless_check_trusted or mark user plug-ins.
+for quicklook_system_plugin in \
+    '/var/mnt/rootfs/System/Library/Frameworks/QuickLookThumbnailing.framework/Versions/A/PlugIns/ThumbnailExtension_macOS.appex' \
+    '/var/mnt/rootfs/System/Library/Frameworks/QuickLookUI.framework/Versions/A/PlugIns/QLPreviewGenerationExtension.appex'; do
+    if [ -d "$quicklook_system_plugin" ]; then
+        /var/jb/usr/bin/chflags restricted "$quicklook_system_plugin" || exit 1
+    fi
+done
 sign_and_trustcache_merging_native_entitlements \
     '/var/mnt/rootfs/usr/libexec/diskarbitrationd' \
     "$DISKARBITRATIOND_NATIVE_ENT" \
@@ -970,14 +1125,30 @@ for workspace_binary in \
     '/var/mnt/rootfs/System/Library/CoreServices/sharedfilelistd' \
     '/var/mnt/rootfs/System/Library/CoreServices/iconservicesd' \
     '/var/mnt/rootfs/System/Library/CoreServices/iconservicesagent' \
+    '/var/mnt/rootfs/System/Library/Frameworks/QuickLook.framework/Resources/quicklookd.app/Contents/MacOS/quicklookd' \
     '/var/mnt/rootfs/System/Library/CoreServices/Dock.app/Contents/MacOS/Dock' \
     '/var/mnt/rootfs/System/Library/CoreServices/Dock.app/Contents/XPCServices/DockHelper.xpc/Contents/MacOS/DockHelper' \
     '/var/mnt/rootfs/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/CarbonCore.framework/Versions/A/XPCServices/csnameddatad.xpc/Contents/MacOS/csnameddatad' \
+    '/var/mnt/rootfs/System/Library/Frameworks/Security.framework/Versions/A/XPCServices/authd.xpc/Contents/MacOS/authd' \
+    '/var/mnt/rootfs/System/Library/PrivateFrameworks/DesktopServicesPriv.framework/Versions/A/Resources/DesktopServicesHelper' \
     '/var/mnt/rootfs/System/Library/CoreServices/SystemUIServer.app/Contents/MacOS/SystemUIServer' \
     '/var/mnt/rootfs/System/Library/CoreServices/ControlCenter.app/Contents/MacOS/ControlCenter' \
     '/var/mnt/rootfs/System/Applications/Launchpad.app/Contents/MacOS/Launchpad'; do
     ensure_project_signature_and_trustcache "$workspace_binary" || exit 1
 done
+
+# Finder/qlmanage load the Ventura legacy Quick Look generators with dlopen,
+# so autosignd's exec hook never gets a chance to repair them. Runtime oslog
+# on 2026-09-06 captured Image.qlgenerator rejected by AMFI with CT policy 0x8,
+# immediately followed by Quick Look's "missing or invalid generator" result.
+# These bundle executables run inside the already-authorized client process;
+# give each the same no-container signature and persistent boot trust used by
+# the directly launched Ventura desktop services.
+list_macho_files '/var/mnt/rootfs/System/Library/QuickLook' |
+    while IFS= read -r -d '' quicklook_generator; do
+        ensure_uncontainered_project_signature_and_trustcache \
+            "$quicklook_generator" || exit 1
+    done || exit 1
 ensure_private_cfprefsd_and_trustcache || exit 1
 # Finder's TimelineUI dependency is not present in the iOS dyld shared cache.
 # Once Finder itself passed AMFI, dyld runtime-confirmed this exact on-disk
@@ -1041,6 +1212,7 @@ sign_and_trustcache_with_identifier_requirement \
     '/var/mnt/rootfs/System/Applications/Maps.app/Contents/MacOS/Maps' \
     'com.apple.Maps' || exit 1
 prepare_sign_and_trustcache_weather || exit 1
+install_sublime_software_renderer_default || exit 1
 # GlassDemo is launched directly by macwshostd before libmachook can ask
 # autosignd for help. Its persistent signature survives reboot, while
 # Dopamine's dynamic trustcache does not.
@@ -1441,3 +1613,32 @@ if [ -d "$ROOTFS/opt/local" ]; then
     done
     echo "[INFO] Processed $MACHO_COUNT MacPorts files"
 fi
+
+# Input protocol receivers map libmachook/macwsinputd for their complete
+# lifetime.  Replacing the files on disk cannot update a running Dock or input
+# broker; runtime disassembly on 2026-09-07 showed a live ABI-5 Dock rejecting
+# every ABI-6 fullscreen pointer record after an otherwise successful package
+# install.  Reload only jobs that were already loaded, after the new binaries
+# have been copied, signed and trustcached.  This preserves the stopped-GUI
+# state and does not disturb ordinary AppKit applications.
+reload_loaded_input_job() {
+    local label="$1"
+    local plist="$2"
+    [ -f "$plist" ] || return 0
+    if ! launchctl list "$label" >/dev/null 2>&1; then
+        return 0
+    fi
+    launchctl unload "$plist" 2>/dev/null || true
+    if ! launchctl load "$plist"; then
+        echo "[ERROR] failed to reload live input job $label" >&2
+        return 1
+    fi
+    echo "[INFO] reloaded live input job $label"
+}
+
+reload_loaded_input_job \
+    'UIKitApplication:com.macwsguide.input' \
+    '/var/jb/usr/macOS/LaunchDaemons/com.macwsguide.input.plist' || exit 1
+reload_loaded_input_job \
+    'com.macwsguide.dock' \
+    '/var/jb/usr/macOS/gui-launchd/com.macwsguide.dock.plist' || exit 1

@@ -23,7 +23,9 @@
 #import <sys/socket.h>
 #import <sys/stat.h>
 #import <sys/un.h>
+#import <xpc/xpc.h>
 
+#import "macws_control_protocol.h"
 #import "macws_host_protocol.h"
 #import "macws_menu_protocol.h"
 #import "macws_stream_protocol.h"
@@ -43,15 +45,21 @@ typedef NSInteger (*MacWSMsgInteger)(id, SEL);
 typedef NSInteger (*MacWSMsgIntegerPointInteger)(id, SEL, CGPoint, NSInteger);
 typedef NSUInteger (*MacWSMsgUInteger)(id, SEL);
 typedef CGSize (*MacWSMsgSize)(id, SEL);
+typedef CGSize (*MacWSMsgSizeIDSize)(id, SEL, id, CGSize);
 typedef BOOL (*MacWSMsgBool)(id, SEL);
 typedef BOOL (*MacWSMsgBoolSEL)(id, SEL, SEL);
 typedef BOOL (*MacWSMsgBoolID)(id, SEL, id);
+typedef BOOL (*MacWSMsgBoolIDID)(id, SEL, id, id);
 typedef BOOL (*MacWSMsgBoolSELIDID)(id, SEL, SEL, id, id);
 typedef void (*MacWSMsgVoid)(id, SEL);
 typedef void (*MacWSMsgVoidBool)(id, SEL, BOOL);
 typedef void (*MacWSMsgVoidID)(id, SEL, id);
+typedef void (*MacWSMsgVoidIDID)(id, SEL, id, id);
 typedef void (*MacWSMsgVoidIDBool)(id, SEL, id, BOOL);
 typedef void (*MacWSMsgVoidRectBoolBool)(id, SEL, CGRect, BOOL, BOOL);
+typedef void (*MacWSWorkspaceOpenURLFunction)(id, SEL, id, id, id);
+typedef void (*MacWSWorkspaceOpenURLsFunction)(id, SEL, id, id, id, id);
+typedef void (*MacWSSeamlessOpenFailureFunction)(id, SEL, id, id, id);
 typedef double (*MacWSMsgDouble)(id, SEL);
 typedef float (*MacWSMsgFloat)(id, SEL);
 typedef id (*MacWSMsgIDPoint)(id, SEL, CGPoint);
@@ -120,14 +128,18 @@ static NSData *MacWSLastWindowMetricsEntries;
 static uint64_t MacWSWindowMetricsGeneration;
 static id MacWSWindowGeometryObserverInstance;
 static void MacWSPublishWindowMetrics(void);
+extern void MacWSInstallPreviewCoreImageRendererAdapter(void);
 static void MacWSNotifyDisplayCatalogChanged(uint8_t reason);
 static void MacWSNotifyDisplayGeometryChanged(uint32_t windowID, id window,
                                               CGRect appliedFrame);
 static void MacWSInstallWindowGeometryObservers(void);
+static const char *MacWSAppInputProgramName(void);
 static BOOL MacWSMainBundleUsesFullscreenCanvasPresentation(void);
 static void MacWSInstallFullscreenTransitionPrerequisite(void);
 static BOOL MacWSWindowPresentationIsOnScreen(id window,
                                               BOOL *knownOut);
+static id MacWSPresentingWindow(id window, id application);
+static id MacWSRootPresentingWindow(id window, id application);
 // Main-thread-only semantic menu snapshot cache. ObjC objects never cross the
 // process boundary: Host receives generation-scoped integer IDs, while the
 // target process retains the corresponding item and index path solely long
@@ -170,6 +182,7 @@ static NSUInteger MacWSAppInputRFBTrackingButtons;
 // outside click on the base window.
 static NSHashTable *MacWSOrderedWindowRegistry;
 static MacWSOrderWindow MacWSOriginalOrderWindow;
+static MacWSMsgRectRectID MacWSOriginalConstrainFrameRect;
 static MacWSToggleFullScreen MacWSOriginalToggleFullScreen;
 static MacWSPressedMouseButtons MacWSOriginalPressedMouseButtons;
 static MacWSMouseLocation MacWSOriginalMouseLocation;
@@ -310,6 +323,105 @@ static void MacWSAppInputOrderWindow(id self, SEL selector,
             fflush(stderr);
         }
     }
+}
+
+// A window-mode Scene captures one level-zero AppKit window plus its related
+// transient windows. AppKit normally constrains a menu/panel to the physical
+// NSScreen, which can still place part of that transient outside its Scene's
+// base-window capture. Apply the same containment at NSWindow's real frame
+// constraint boundary: the original implementation keeps ownership, sizing
+// and screen policy, then this adapter translates only the accepted origin so
+// a related transient remains inside its presenting window.
+static CGRect MacWSAppInputConstrainFrameRect(id self, SEL selector,
+                                               CGRect requested, id screen) {
+    CGRect constrained = MacWSOriginalConstrainFrameRect
+        ? MacWSOriginalConstrainFrameRect(self, selector, requested, screen)
+        : requested;
+    Class applicationClass = objc_getClass("NSApplication");
+    id application = applicationClass &&
+        class_respondsToSelector(object_getClass(applicationClass),
+                                 sel_registerName("sharedApplication"))
+        ? ((MacWSMsgID)objc_msgSend)(
+              (id)applicationClass, sel_registerName("sharedApplication"))
+        : nil;
+    if (!application) return constrained;
+
+    id presenter = MacWSPresentingWindow(self, application);
+    NSInteger level = ((MacWSMsgInteger)objc_msgSend)(
+        self, sel_registerName("level"));
+    if (!presenter && level > 0) {
+        presenter = ((MacWSMsgID)objc_msgSend)(
+            application, sel_registerName("keyWindow"));
+        if (!presenter) presenter = ((MacWSMsgID)objc_msgSend)(
+            application, sel_registerName("mainWindow"));
+    }
+    if (!presenter || presenter == self ||
+        !((MacWSMsgBool)objc_msgSend)(
+            presenter, sel_registerName("isVisible"))) return constrained;
+
+    CGRect presenterFrame = ((MacWSMsgRect)objc_msgSend)(
+        presenter, sel_registerName("frame"));
+    if (!isfinite(constrained.origin.x) ||
+        !isfinite(constrained.origin.y) ||
+        !isfinite(constrained.size.width) ||
+        !isfinite(constrained.size.height) ||
+        !isfinite(presenterFrame.origin.x) ||
+        !isfinite(presenterFrame.origin.y) ||
+        !isfinite(presenterFrame.size.width) ||
+        !isfinite(presenterFrame.size.height) ||
+        constrained.size.width <= 0.0 || constrained.size.height <= 0.0 ||
+        presenterFrame.size.width <= 0.0 ||
+        presenterFrame.size.height <= 0.0) return constrained;
+
+    CGRect contained = constrained;
+    CGFloat maximumX = CGRectGetMaxX(presenterFrame) - contained.size.width;
+    CGFloat maximumY = CGRectGetMaxY(presenterFrame) - contained.size.height;
+    contained.origin.x = contained.size.width <= presenterFrame.size.width
+        ? fmin(fmax(contained.origin.x, CGRectGetMinX(presenterFrame)),
+               maximumX)
+        : CGRectGetMinX(presenterFrame);
+    contained.origin.y = contained.size.height <= presenterFrame.size.height
+        ? fmin(fmax(contained.origin.y, CGRectGetMinY(presenterFrame)),
+               maximumY)
+        : CGRectGetMinY(presenterFrame);
+    BOOL adjusted = fabs(contained.origin.x - constrained.origin.x) > 0.25 ||
+        fabs(contained.origin.y - constrained.origin.y) > 0.25;
+    if (adjusted && MacWSRuntimeDiagnosticsEnabled()) {
+        fprintf(stderr,
+            "#### APP-INPUT TRANSIENT-CONSTRAIN pid=%d window=%ld "
+            "presenter=%ld level=%ld requested=(%.1f,%.1f %.1fx%.1f) "
+            "screen-result=(%.1f,%.1f %.1fx%.1f) "
+            "scene-result=(%.1f,%.1f %.1fx%.1f)\n",
+            getpid(),
+            (long)((MacWSMsgInteger)objc_msgSend)(
+                self, sel_registerName("windowNumber")),
+            (long)((MacWSMsgInteger)objc_msgSend)(
+                presenter, sel_registerName("windowNumber")),
+            (long)level,
+            requested.origin.x, requested.origin.y,
+            requested.size.width, requested.size.height,
+            constrained.origin.x, constrained.origin.y,
+            constrained.size.width, constrained.size.height,
+            contained.origin.x, contained.origin.y,
+            contained.size.width, contained.size.height);
+        fflush(stderr);
+    }
+    return contained;
+}
+
+static void MacWSInstallTransientFrameConstraint(void) {
+    if (MacWSOriginalConstrainFrameRect) return;
+    Class windowClass = objc_getClass("NSWindow");
+    SEL selector = sel_registerName("constrainFrameRect:toScreen:");
+    Method method = windowClass
+        ? class_getInstanceMethod(windowClass, selector) : NULL;
+    if (!method) return;
+    IMP implementation = method_getImplementation(method);
+    if (implementation == (IMP)MacWSAppInputConstrainFrameRect) return;
+    MacWSOriginalConstrainFrameRect =
+        (MacWSMsgRectRectID)implementation;
+    method_setImplementation(method,
+                             (IMP)MacWSAppInputConstrainFrameRect);
 }
 
 static void MacWSInstallOrderedWindowRegistry(void) {
@@ -471,6 +583,19 @@ static double MacWSAppInputGestureHitValueBefore;
 static BOOL MacWSAppInputGestureHitHasValue;
 static MacWSSendEvent MacWSOriginalApplicationSendEvent;
 static MacWSHandleApplicationEvent MacWSOriginalHandleActivatedEvent;
+// A tagged second Host tap is posted through CGPostMouseEvent so Finder keeps
+// its real WindowServer target/activation state. That legacy API cannot encode
+// click count, so retain the exact expected native down/up long enough for the
+// NSApplication boundary below to restore kCGMouseEventClickState on those
+// events and those events only.
+typedef struct {
+    NSInteger windowNumber;
+    CGPoint screenPoint;
+    double expiresAt;
+    uint8_t pendingTypes;
+} MacWSPendingSystemDoubleClick;
+static MacWSPendingSystemDoubleClick MacWSSystemDoubleClick;
+static pthread_mutex_t MacWSSystemDoubleClickLock = PTHREAD_MUTEX_INITIALIZER;
 typedef struct {
     Class ownerClass;
     MacWSMenuEventLoop original;
@@ -948,14 +1073,152 @@ static void MacWSScheduleApplicationDisplaySettle(void) {
     });
 }
 
-// Observational witness for the boundary between CoreGraphics' event queue
-// and the target AppKit main thread. OSXvnc logs the same monotonic clock at
-// handleKeyboard entry. Comparing the two proves whether delay occurs before
-// or after NSApplication receives the event; this hook never creates,
-// suppresses, or rewrites an event.
+static void MacWSArmSystemDoubleClick(NSInteger windowNumber,
+                                     CGPoint screenPoint) {
+    pthread_mutex_lock(&MacWSSystemDoubleClickLock);
+    MacWSSystemDoubleClick.windowNumber = windowNumber;
+    MacWSSystemDoubleClick.screenPoint = screenPoint;
+    MacWSSystemDoubleClick.expiresAt =
+        MacWSAppInputMonotonicSeconds() + 1.0;
+    MacWSSystemDoubleClick.pendingTypes = 0x3; // native left down + up
+    pthread_mutex_unlock(&MacWSSystemDoubleClickLock);
+}
+
+static void MacWSCancelSystemDoubleClick(void) {
+    pthread_mutex_lock(&MacWSSystemDoubleClickLock);
+    memset(&MacWSSystemDoubleClick, 0, sizeof(MacWSSystemDoubleClick));
+    pthread_mutex_unlock(&MacWSSystemDoubleClickLock);
+}
+
+// Restore clickCount=2 on the actual NSEvent produced by WindowServer, rather
+// than fabricating a process-local replacement from the Host record. The
+// pending tuple is armed only after the caller proves that the Host-selected
+// content window is also WindowServer's global hit. Match its native window,
+// type, point and a bounded lifetime before touching the event. This preserves
+// every opaque source/connection/activation field that Finder's open action
+// receives on hardware input.
+static id MacWSRestorePendingSystemDoubleClick(id event, NSUInteger type,
+                                                BOOL *matchedEvent) {
+    if (matchedEvent) *matchedEvent = NO;
+    if (!event || (type != 1 && type != 2)) return event;
+    NSInteger windowNumber = ((MacWSMsgInteger)objc_msgSend)(
+        event, sel_registerName("windowNumber"));
+    id window = ((MacWSMsgID)objc_msgSend)(
+        event, sel_registerName("window"));
+    CGPoint localPoint = ((MacWSMsgPoint)objc_msgSend)(
+        event, sel_registerName("locationInWindow"));
+    CGPoint screenPoint = window
+        ? ((MacWSMsgPointPoint)objc_msgSend)(
+            window, sel_registerName("convertPointToScreen:"), localPoint)
+        : (CGPoint){NAN, NAN};
+    uint8_t typeBit = type == 1 ? 0x1 : 0x2;
+    BOOL matched = NO;
+    double now = MacWSAppInputMonotonicSeconds();
+
+    pthread_mutex_lock(&MacWSSystemDoubleClickLock);
+    if (MacWSSystemDoubleClick.pendingTypes != 0 &&
+        now <= MacWSSystemDoubleClick.expiresAt &&
+        (MacWSSystemDoubleClick.pendingTypes & typeBit) != 0 &&
+        MacWSSystemDoubleClick.windowNumber == windowNumber &&
+        isfinite(screenPoint.x) && isfinite(screenPoint.y) &&
+        fabs(screenPoint.x - MacWSSystemDoubleClick.screenPoint.x) <= 2.0 &&
+        fabs(screenPoint.y - MacWSSystemDoubleClick.screenPoint.y) <= 2.0) {
+        matched = YES;
+        MacWSSystemDoubleClick.pendingTypes &= ~typeBit;
+        if (MacWSSystemDoubleClick.pendingTypes == 0)
+            memset(&MacWSSystemDoubleClick, 0,
+                   sizeof(MacWSSystemDoubleClick));
+    } else if (MacWSSystemDoubleClick.pendingTypes != 0 &&
+               now > MacWSSystemDoubleClick.expiresAt) {
+        memset(&MacWSSystemDoubleClick, 0,
+               sizeof(MacWSSystemDoubleClick));
+    }
+    pthread_mutex_unlock(&MacWSSystemDoubleClickLock);
+    if (!matched) return event;
+    if (matchedEvent) *matchedEvent = YES;
+
+    NSInteger before = ((MacWSMsgInteger)objc_msgSend)(
+        event, sel_registerName("clickCount"));
+    static MacWSSetCGEventIntegerField setInteger;
+    static MacWSCopyCGEvent copyEvent;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        setInteger = (MacWSSetCGEventIntegerField)dlsym(
+            RTLD_DEFAULT, "CGEventSetIntegerValueField");
+        copyEvent = (MacWSCopyCGEvent)dlsym(
+            RTLD_DEFAULT, "CGEventCreateCopy");
+    });
+    SEL cgEventSelector = sel_registerName("CGEvent");
+    MacWSCGEventRef nativeEvent = setInteger &&
+        ((MacWSMsgBoolSEL)objc_msgSend)(
+            event, sel_registerName("respondsToSelector:"), cgEventSelector)
+        ? ((MacWSEventRef)objc_msgSend)(event, cgEventSelector) : NULL;
+    if (nativeEvent) setInteger(
+        nativeEvent, 1 /* kCGMouseEventClickState */, 2);
+    NSInteger after = ((MacWSMsgInteger)objc_msgSend)(
+        event, sel_registerName("clickCount"));
+    id replacement = event;
+    const char *route = after == 2 ? "native-record" : "failed";
+
+    // Some NSEvent subclasses cache the click count during initialization.
+    // If their public getter did not observe the in-place record edit, wrap a
+    // copy of that *same native event* and require window, location, type and
+    // click count to round-trip before using it. Failure leaves the original
+    // event untouched rather than forcing Finder behavior.
+    if (after != 2 && nativeEvent && copyEvent) {
+        MacWSCGEventRef copy = copyEvent(nativeEvent);
+        if (copy) {
+            setInteger(copy, 1 /* kCGMouseEventClickState */, 2);
+            Class eventClass = objc_getClass("NSEvent");
+            SEL factory = sel_registerName("eventWithCGEvent:");
+            id candidate = eventClass && class_respondsToSelector(
+                    object_getClass(eventClass), factory)
+                ? ((MacWSEventFromCGEvent)objc_msgSend)(
+                    (id)eventClass, factory, copy) : nil;
+            CFRelease(copy);
+            if (candidate) {
+                NSInteger candidateWindow = ((MacWSMsgInteger)objc_msgSend)(
+                    candidate, sel_registerName("windowNumber"));
+                NSUInteger candidateType = ((MacWSMsgUInteger)objc_msgSend)(
+                    candidate, sel_registerName("type"));
+                NSInteger candidateClicks = ((MacWSMsgInteger)objc_msgSend)(
+                    candidate, sel_registerName("clickCount"));
+                CGPoint candidatePoint = ((MacWSMsgPoint)objc_msgSend)(
+                    candidate, sel_registerName("locationInWindow"));
+                if (candidateWindow == windowNumber &&
+                    candidateType == type && candidateClicks == 2 &&
+                    fabs(candidatePoint.x - localPoint.x) <= 2.0 &&
+                    fabs(candidatePoint.y - localPoint.y) <= 2.0) {
+                    replacement = candidate;
+                    after = candidateClicks;
+                    route = "native-copy-rewrap";
+                }
+            }
+        }
+    }
+    if (MacWSRuntimeDiagnosticsEnabled()) {
+        fprintf(stderr,
+            "#### APP-INPUT DOUBLE-RESTORE pid=%d window=%ld type=%lu "
+            "local=(%.2f,%.2f) screen=(%.2f,%.2f) clicks=%ld->%ld "
+            "route=%s\n",
+            getpid(), (long)windowNumber, (unsigned long)type,
+            localPoint.x, localPoint.y, screenPoint.x, screenPoint.y,
+            (long)before, (long)after, route);
+        fflush(stderr);
+    }
+    return replacement;
+}
+
+// Boundary between CoreGraphics' event queue and the target AppKit main
+// thread. Besides timing witnesses, this restores the double-click field on
+// the exact native down/up pair matched above; every unrelated event passes
+// through byte-for-byte unchanged.
 static void MacWSAppInputApplicationSendEvent(id self, SEL command, id event) {
     NSUInteger type = event ? ((MacWSMsgUInteger)objc_msgSend)(
         event, sel_registerName("type")) : 0;
+    BOOL matchedSystemDoubleClick = NO;
+    event = MacWSRestorePendingSystemDoubleClick(
+        event, type, &matchedSystemDoubleClick);
     MacWSSystemInputLatencyMarker systemLatencyMarker = {0};
     double systemLatencyMainStart = 0.0;
     if (type == 1 || type == 3) {
@@ -979,6 +1242,17 @@ static void MacWSAppInputApplicationSendEvent(id self, SEL command, id event) {
     // state after sendEvent: returns so a mouseDown that entered a nested
     // tracker still sees the button held for that tracker's lifetime.
     NSUInteger savedSyntheticButtons = MacWSAppInputRFBTrackingButtons;
+    BOOL savedSyntheticActive = MacWSAppInputRFBTrackingActive;
+    // The atomic legacy poster queues up before this process can leave the
+    // AppInput callback and dispatch down on its main thread. WindowServer's
+    // global button mask is therefore already clear here (runtime Finder
+    // witness: native second mouseDown clicks=2, pressed=0). Scope the existing
+    // state bridge to the exactly matched second-click pair so Finder sees the
+    // hardware invariant pressed=1 while dispatching down and pressed=0 while
+    // dispatching up. A nested tracker can consume the already-queued up; the
+    // reentrant save/restore below preserves the outer down state correctly.
+    if (matchedSystemDoubleClick)
+        MacWSAppInputRFBTrackingActive = YES;
     BOOL transitionedSyntheticButtons = MacWSAppInputRFBTrackingActive;
     if (transitionedSyntheticButtons) {
         if (type == 1) MacWSAppInputRFBTrackingButtons |= 1u;
@@ -1040,6 +1314,8 @@ static void MacWSAppInputApplicationSendEvent(id self, SEL command, id event) {
         if (logMouseReturn) {
             NSInteger windowNumber = ((MacWSMsgInteger)objc_msgSend)(
                 event, sel_registerName("windowNumber"));
+            NSInteger clickCount = ((MacWSMsgInteger)objc_msgSend)(
+                event, sel_registerName("clickCount"));
             CGPoint location = ((MacWSMsgPoint)objc_msgSend)(
                 event, sel_registerName("locationInWindow"));
             Class eventClass = object_getClass(event);
@@ -1049,9 +1325,11 @@ static void MacWSAppInputApplicationSendEvent(id self, SEL command, id event) {
                 : 0;
             fprintf(stderr,
                 "#### APP-INPUT MOUSE-EVENT pid=%d serial=%llu type=%lu "
-                "window=%ld local=(%.2f,%.2f) pressed=%#lx at=%.6f\n",
+                "window=%ld clicks=%ld local=(%.2f,%.2f) pressed=%#lx "
+                "at=%.6f\n",
                 getpid(), (unsigned long long)mouseSerial,
                 (unsigned long)type, (long)windowNumber,
+                (long)clickCount,
                 location.x, location.y, (unsigned long)pressed,
                 mouseStarted);
             fflush(stderr);
@@ -1158,6 +1436,8 @@ static void MacWSAppInputApplicationSendEvent(id self, SEL command, id event) {
     }
     if (transitionedSyntheticButtons)
         MacWSAppInputRFBTrackingButtons = savedSyntheticButtons;
+    if (matchedSystemDoubleClick)
+        MacWSAppInputRFBTrackingActive = savedSyntheticActive;
     if (logMouseReturn) {
         double finished = MacWSAppInputMonotonicSeconds();
         Class eventClass = object_getClass(event);
@@ -1607,6 +1887,275 @@ static void MacWSLogNSEventFactorySelectors(Class eventClass) {
     });
 }
 
+static MacWSWorkspaceOpenURLFunction MacWSOriginalWorkspaceOpenURL;
+static MacWSWorkspaceOpenURLsFunction MacWSOriginalWorkspaceOpenURLs;
+static MacWSSeamlessOpenFailureFunction MacWSOriginalSeamlessOpenFailure;
+
+extern xpc_connection_t MacWSRawXPCConnectionCreateMachService(
+    const char *, dispatch_queue_t, uint64_t)
+    __asm("_xpc_connection_create_mach_service");
+
+static void MacWSWorkspaceOpenURLWitness(id workspace, SEL command, id url,
+                                         id configuration, id completion) {
+    fprintf(stderr,
+            "#### APP-INPUT WORKSPACE-OPEN selector=%s url=%s "
+            "configuration=%s completion=%p\n",
+            sel_getName(command),
+            [[url description] UTF8String] ?: "(nil)",
+            [[configuration description] UTF8String] ?: "(nil)",
+            completion);
+    fflush(stderr);
+    MacWSOriginalWorkspaceOpenURL(
+        workspace, command, url, configuration, completion);
+}
+
+static void MacWSWorkspaceOpenURLsWitness(id workspace, SEL command, id urls,
+                                          id applicationURL,
+                                          id configuration, id completion) {
+    fprintf(stderr,
+            "#### APP-INPUT WORKSPACE-OPEN selector=%s urls=%s app=%s "
+            "configuration=%s completion=%p\n",
+            sel_getName(command),
+            [[urls description] UTF8String] ?: "(nil)",
+            [[applicationURL description] UTF8String] ?: "(nil)",
+            [[configuration description] UTF8String] ?: "(nil)",
+            completion);
+    fflush(stderr);
+    MacWSOriginalWorkspaceOpenURLs(
+        workspace, command, urls, applicationURL, configuration, completion);
+}
+
+static NSURL *MacWSFinderOpenItemURL(id item) {
+    static const char *const selectors[] = {
+        "fileURL", "previewItemURL", "URL", "url",
+    };
+    for (NSUInteger index = 0;
+         index < sizeof(selectors) / sizeof(selectors[0]); index++) {
+        SEL selector = sel_registerName(selectors[index]);
+        if (![item respondsToSelector:selector]) continue;
+        id value = ((MacWSMsgID)objc_msgSend)(item, selector);
+        if (![value isKindOfClass:[NSURL class]]) continue;
+        NSURL *pathURL = [(NSURL *)value filePathURL];
+        if (pathURL.isFileURL && pathURL.path.length != 0) return pathURL;
+    }
+    return nil;
+}
+
+static NSDictionary<NSString *, NSArray<NSString *> *> *
+MacWSFinderDocumentGroups(id items, id error) {
+    NSInteger errorCode = [error code];
+    // Runtime-confirmed on the device's Finder (2026-09-07): the same
+    // QLSeamlessOpener delegate boundary reports Code=5 when LaunchServices
+    // cannot start the foreign macOS application through RunningBoard, and
+    // Code=-600 (procNotFound) when the target is already running but has no
+    // eligible LaunchServices AppleEvent endpoint.  Both failures occur only
+    // after Finder has resolved the document and its default application.
+    // Preserve every other QL failure for Finder's original handler.
+    BOOL launchTransportFailed = errorCode == 5 || errorCode == -600;
+    if (![[error domain] isEqualToString:
+            MacWSRuntimeString("QLSeamlessOpenerDomain")] ||
+        !launchTransportFailed ||
+        ![items respondsToSelector:sel_registerName("objectEnumerator")]) {
+        return nil;
+    }
+    id workspaceClass = (id)objc_getClass("NSWorkspace");
+    id workspace = workspaceClass && [workspaceClass respondsToSelector:
+        sel_registerName("sharedWorkspace")]
+        ? ((MacWSMsgID)objc_msgSend)(workspaceClass,
+                                    sel_registerName("sharedWorkspace")) : nil;
+    SEL resolver = sel_registerName("URLForApplicationToOpenURL:");
+    if (!workspace || ![workspace respondsToSelector:resolver]) return nil;
+
+    NSMutableDictionary<NSString *, NSMutableArray<NSString *> *> *groups =
+        [NSMutableDictionary dictionary];
+    for (id item in items) {
+        NSURL *documentURL = MacWSFinderOpenItemURL(item);
+        NSString *documentPath = documentURL.path.stringByStandardizingPath;
+        if (!documentPath.length || !documentPath.isAbsolutePath) continue;
+        NSURL *applicationURL = ((MacWSMsgIDID)objc_msgSend)(
+            workspace, resolver, documentURL);
+        applicationURL = [applicationURL filePathURL];
+        NSString *applicationPath =
+            applicationURL.path.stringByStandardizingPath;
+        if (!applicationPath.length || !applicationPath.isAbsolutePath)
+            continue;
+        NSMutableArray<NSString *> *paths = groups[applicationPath];
+        if (!paths) {
+            paths = [NSMutableArray array];
+            groups[applicationPath] = paths;
+        }
+        [paths addObject:documentPath];
+    }
+    if (groups.count == 0) return nil;
+    NSMutableDictionary *immutableGroups = [NSMutableDictionary dictionary];
+    for (NSString *applicationPath in groups)
+        immutableGroups[applicationPath] = [NSArray arrayWithArray:
+            groups[applicationPath]];
+    return immutableGroups;
+}
+
+static BOOL MacWSRequestHostOpenDocuments(NSString *applicationPath,
+                                          NSArray<NSString *> *paths) {
+    if (!applicationPath.length || paths.count == 0) return NO;
+    xpc_connection_t connection = MacWSRawXPCConnectionCreateMachService(
+        MACWS_CONTROL_SERVICE,
+        dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), 0);
+    if (!connection) return NO;
+    xpc_connection_set_event_handler(connection,
+        ^(xpc_object_t event) { (void)event; });
+    xpc_connection_resume(connection);
+    xpc_object_t request = xpc_dictionary_create(NULL, NULL, 0);
+    xpc_dictionary_set_string(request, MACWS_CONTROL_KEY_OP,
+                              MACWS_CONTROL_OP_OPEN_DOCUMENTS);
+    xpc_dictionary_set_string(request, MACWS_CONTROL_KEY_APP_PATH,
+                              applicationPath.fileSystemRepresentation);
+    xpc_object_t documents = xpc_array_create(NULL, 0);
+    for (NSString *path in paths)
+        xpc_array_set_string(documents, XPC_ARRAY_APPEND,
+                             path.fileSystemRepresentation);
+    xpc_dictionary_set_value(request, MACWS_CONTROL_KEY_DOCUMENT_PATHS,
+                             documents);
+    xpc_object_t reply = xpc_connection_send_message_with_reply_sync(
+        connection, request);
+    BOOL accepted = reply && xpc_get_type(reply) == XPC_TYPE_DICTIONARY &&
+        xpc_dictionary_get_bool(reply, "ok");
+    const char *message = reply && xpc_get_type(reply) == XPC_TYPE_DICTIONARY
+        ? xpc_dictionary_get_string(reply, "message") : NULL;
+    int64_t targetPID = reply && xpc_get_type(reply) == XPC_TYPE_DICTIONARY
+        ? xpc_dictionary_get_int64(reply, "launched_app_pid") : 0;
+    fprintf(stderr,
+        "#### APP-INPUT FINDER-OPEN-ROUTE app=%s documents=%lu "
+        "target=%lld result=%s message=%s\n",
+        applicationPath.fileSystemRepresentation,
+        (unsigned long)paths.count, (long long)targetPID,
+        accepted ? "appkit-accepted" : "failed", message ?: "");
+    fflush(stderr);
+    if (reply) xpc_release(reply);
+    xpc_release(documents);
+    xpc_release(request);
+    xpc_connection_cancel(connection);
+    xpc_release(connection);
+    return accepted;
+}
+
+static void MacWSSeamlessOpenFailureWitness(id delegate, SEL command,
+                                            id opener, id items, id error) {
+    NSDictionary<NSString *, NSArray<NSString *> *> *groups =
+        MacWSFinderDocumentGroups(items, error);
+    if (MacWSRuntimeDiagnosticsEnabled()) {
+        fprintf(stderr,
+                "#### APP-INPUT SEAMLESS-OPEN-FAIL selector=%s opener=%s "
+                "items=%s error=%s recoverable=%s\n",
+                sel_getName(command),
+                [[opener description] UTF8String] ?: "(nil)",
+                [[items description] UTF8String] ?: "(nil)",
+                [[error description] UTF8String] ?: "(nil)",
+                groups.count ? "YES" : "NO");
+        for (id item in items) {
+            fprintf(stderr,
+                    "#### APP-INPUT SEAMLESS-OPEN-ITEM class=%s value=%s",
+                    object_getClassName(item) ?: "(nil)",
+                    [[item description] UTF8String] ?: "(nil)");
+            static const char *const selectors[] = {
+                "URL", "url", "fileURL", "previewItemURL", "node",
+            };
+            for (NSUInteger index = 0;
+                 index < sizeof(selectors) / sizeof(selectors[0]); index++) {
+                SEL selector = sel_registerName(selectors[index]);
+                if (![item respondsToSelector:selector]) continue;
+                id value = ((MacWSMsgID)objc_msgSend)(item, selector);
+                fprintf(stderr, " %s=%s", selectors[index],
+                        [[value description] UTF8String] ?: "(nil)");
+            }
+            fprintf(stderr, "\n");
+        }
+        fflush(stderr);
+    }
+    MacWSOriginalSeamlessOpenFailure(
+        delegate, command, opener, items, error);
+    if (groups.count != 0) {
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0),
+                       ^{
+            @autoreleasepool {
+                for (NSString *applicationPath in groups)
+                    (void)MacWSRequestHostOpenDocuments(
+                        applicationPath, groups[applicationPath]);
+            }
+        });
+    }
+}
+
+// Finder's stock QLSeamlessOpener remains the first owner of double-click and
+// Open menu actions. Runtime logs on 2026-09-07 show that it resolves the
+// correct application and then calls this exact delegate method with
+// QLSeamlessOpenerDomain Code=5 after RunningBoard rejects the foreign macOS
+// launch, or Code=-600 when an already-running target has no eligible
+// LaunchServices AppleEvent endpoint. Preserve the original failure callback,
+// then complete only those typed failures through hostd and the target's
+// normal AppKit open-event path.
+// The additional NSWorkspace hooks below remain diagnostic witnesses only.
+static void MacWSInstallWorkspaceOpenWitness(void) {
+    if (strcmp(MacWSAppInputProgramName(), "Finder") != 0) return;
+    id workspaceClass = (id)objc_getClass("NSWorkspace");
+    id sharedWorkspace = workspaceClass &&
+        [workspaceClass respondsToSelector:sel_registerName("sharedWorkspace")]
+        ? ((MacWSMsgID)objc_msgSend)(workspaceClass,
+                                    sel_registerName("sharedWorkspace")) : nil;
+    Class implementationClass = sharedWorkspace
+        ? object_getClass(sharedWorkspace) : (Class)workspaceClass;
+    if (!implementationClass) return;
+
+    Class seamlessDelegate = objc_getClass("TSeamlessOpenerDelegate");
+    SEL seamlessFailure = sel_registerName(
+        "seamlessOpener:failedToOpenItems:withError:");
+    Method seamlessFailureMethod = seamlessDelegate
+        ? class_getInstanceMethod(seamlessDelegate, seamlessFailure) : NULL;
+    if (seamlessFailureMethod && !MacWSOriginalSeamlessOpenFailure) {
+        MacWSOriginalSeamlessOpenFailure = (MacWSSeamlessOpenFailureFunction)
+            method_getImplementation(seamlessFailureMethod);
+        method_setImplementation(seamlessFailureMethod,
+                                 (IMP)MacWSSeamlessOpenFailureWitness);
+        if (MacWSRuntimeDiagnosticsEnabled())
+            fprintf(stderr,
+                    "#### APP-INPUT WORKSPACE-WITNESS selector=%s types=%s\n",
+                    sel_getName(seamlessFailure),
+                    method_getTypeEncoding(seamlessFailureMethod) ?: "(null)");
+    }
+
+    if (!MacWSRuntimeDiagnosticsEnabled()) return;
+
+    SEL openURL = sel_registerName(
+        "openURL:configuration:completionHandler:");
+    Method openURLMethod = class_getInstanceMethod(implementationClass,
+                                                    openURL);
+    if (openURLMethod && !MacWSOriginalWorkspaceOpenURL) {
+        MacWSOriginalWorkspaceOpenURL = (MacWSWorkspaceOpenURLFunction)
+            method_getImplementation(openURLMethod);
+        method_setImplementation(openURLMethod,
+                                 (IMP)MacWSWorkspaceOpenURLWitness);
+        fprintf(stderr,
+                "#### APP-INPUT WORKSPACE-WITNESS selector=%s types=%s\n",
+                sel_getName(openURL),
+                method_getTypeEncoding(openURLMethod) ?: "(null)");
+    }
+
+    SEL openURLs = sel_registerName(
+        "openURLs:withApplicationAtURL:configuration:completionHandler:");
+    Method openURLsMethod = class_getInstanceMethod(implementationClass,
+                                                     openURLs);
+    if (openURLsMethod && !MacWSOriginalWorkspaceOpenURLs) {
+        MacWSOriginalWorkspaceOpenURLs = (MacWSWorkspaceOpenURLsFunction)
+            method_getImplementation(openURLsMethod);
+        method_setImplementation(openURLsMethod,
+                                 (IMP)MacWSWorkspaceOpenURLsWitness);
+        fprintf(stderr,
+                "#### APP-INPUT WORKSPACE-WITNESS selector=%s types=%s\n",
+                sel_getName(openURLs),
+                method_getTypeEncoding(openURLsMethod) ?: "(null)");
+    }
+    fflush(stderr);
+}
+
 static void MacWSInstallPressedMouseButtonsBridge(Class eventClass) {
     MacWSLogNSEventFactorySelectors(eventClass);
     SEL selector = sel_registerName("pressedMouseButtons");
@@ -1988,6 +2537,7 @@ static NSUInteger MacWSNSEventType(MacWSInputKind kind) {
         case MacWSInputKindMagnify:
         case MacWSInputKindRotate:
         case MacWSInputKindPerformPaste:
+        case MacWSInputKindOpenDocuments:
         case MacWSInputKindConfigureWindow:
         case MacWSInputKindCloseWindow:
         case MacWSInputKindCreateInitialWindow:
@@ -2403,7 +2953,7 @@ static BOOL MacWSCancelActiveMenuForEscape(id application,
 
 static BOOL MacWSInputRecordIsValid(const MacWSInputRecord *record) {
     if (record->magic != MACWS_INPUT_MAGIC ||
-        record->version != MACWS_INPUT_VERSION ||
+        !MacWSInputVersionSupportsKind(record->version, record->kind) ||
         record->targetPID != getpid() ||
         record->frameWidth == 0 || record->frameHeight == 0 ||
         record->source > MacWSInputSourceVNC ||
@@ -2425,6 +2975,8 @@ static BOOL MacWSInputRecordIsValid(const MacWSInputRecord *record) {
     }
     if (record->kind == MacWSInputKindCreateInitialWindow) return YES;
     if (record->kind == MacWSInputKindReopenApplication) return YES;
+    if (record->kind == MacWSInputKindOpenDocuments)
+        return record->sceneID != 0;
     if (record->kind == MacWSInputKindDesktopCommand) {
         return record->contactID >= MacWSDesktopCommandSpaceLeft &&
             record->contactID <= MacWSDesktopCommandSpaceRight;
@@ -2465,9 +3017,8 @@ static BOOL MacWSInputRecordIsValid(const MacWSInputRecord *record) {
              phase != MacWSInputFlagGestureCancelled)) return NO;
     }
     return
-        record->version == MACWS_INPUT_VERSION &&
         record->kind >= MacWSInputKindTouchDown &&
-        record->kind <= MacWSInputKindPerformPaste &&
+        record->kind <= MacWSInputKindOpenDocuments &&
         record->x >= 0.0f && record->y >= 0.0f &&
         record->x < record->frameWidth &&
         record->y < record->frameHeight;
@@ -2486,7 +3037,8 @@ static id MacWSCreateAppScrollEvent(Class eventClass,
                                     id window,
                                     CGPoint windowPoint,
                                     CGRect screenFrame,
-                                    NSInteger windowNumber) {
+                                    NSInteger windowNumber,
+                                    BOOL encodeGesturePhases) {
     static MacWSCreateScrollWheelCGEvent createScroll;
     static MacWSCreateScrollWheelCGEvent2 createScroll2;
     static MacWSSetCGEventLocation setLocation;
@@ -2565,7 +3117,20 @@ static id MacWSCreateAppScrollEvent(Class eventClass,
             momentumPhase = 3; // kCGMomentumScrollPhaseEnd
         }
         setInteger(cgEvent, 88 /* kCGScrollWheelEventIsContinuous */, 1);
-        if (record.flags & MacWSInputFlagScrollMomentum) {
+        if (!encodeGesturePhases) {
+            // Runtime-confirmed via
+            // Finder-2026-09-08-113319.ips: a process-local phased event
+            // enters NSScrollingBehaviorConcurrentVBL, whose
+            // __NSScrollingConcurrentVBLMonitorGetWorkIntervalHandle block
+            // aborts in this chroot before the collection view can scroll.
+            // A covered native AppKit window cannot use the global system
+            // route, so retain pixel deltas but present them as ordinary
+            // continuous wheel samples. The Host still supplies the complete
+            // finger and momentum delta stream; only AppKit's unavailable
+            // concurrent-VBL session is omitted.
+            setInteger(cgEvent, 99 /* kCGScrollWheelEventScrollPhase */, 0);
+            setInteger(cgEvent, 123 /* ...MomentumPhase */, 0);
+        } else if (record.flags & MacWSInputFlagScrollMomentum) {
             setInteger(cgEvent, 99 /* kCGScrollWheelEventScrollPhase */, 0);
             setInteger(cgEvent, 123 /* ...MomentumPhase */, momentumPhase);
         } else {
@@ -2932,6 +3497,106 @@ static MacWSPostLegacyMouseEvent MacWSLegacySystemMousePoster(void) {
     return postMouse;
 }
 
+// Catalyst and Electron own process-local scrolling implementations and accept
+// the precise pixel NSEvent built below. Native AppKit must use its connected
+// WindowServer route when possible: Finder-2026-09-08-113319.ips records the
+// alternative phased local event entering NSScrollingBehaviorConcurrentVBL
+// and aborting while creating its unavailable work-interval handle. SwiftUI
+// has an additional compatibility requirement: a System Settings runtime A/B
+// reached NSWindow.sendEvent: without moving the hosted content, whereas the
+// WindowServer route moved it.
+static BOOL MacWSClassUsesSwiftUI(Class cls, const char **matchedClass,
+                                  const char **matchedImage) {
+    for (unsigned depth = 0; cls && depth < 32;
+         cls = class_getSuperclass(cls), depth++) {
+        const char *name = class_getName(cls);
+        const char *image = class_getImageName(cls);
+        BOOL swiftUI =
+            (image && strstr(image, "/SwiftUI.framework/") != NULL) ||
+            (name && (strstr(name, "NSHostingView") != NULL ||
+                      strstr(name, "SwiftUI") != NULL));
+        if (!swiftUI) continue;
+        if (matchedClass) *matchedClass = name;
+        if (matchedImage) *matchedImage = image;
+        return YES;
+    }
+    return NO;
+}
+
+static BOOL MacWSWindowPointRequiresSystemScroll(id window,
+                                                  CGPoint windowPoint,
+                                                  BOOL diagnostic,
+                                                  BOOL *usesSwiftUIOut) {
+    if (usesSwiftUIOut) *usesSwiftUIOut = NO;
+    if (!window) return NO;
+    id contentView = ((MacWSMsgID)objc_msgSend)(
+        window, sel_registerName("contentView"));
+    id hitView = nil;
+    if (contentView && ((MacWSMsgBoolSEL)objc_msgSend)(
+            contentView, sel_registerName("respondsToSelector:"),
+            sel_registerName("hitTest:"))) {
+        CGPoint contentPoint = ((MacWSMsgPointPointID)objc_msgSend)(
+            contentView, sel_registerName("convertPoint:fromView:"),
+            windowPoint, nil);
+        hitView = ((MacWSMsgIDPoint)objc_msgSend)(
+            contentView, sel_registerName("hitTest:"), contentPoint);
+    }
+
+    const char *matchedClass = NULL;
+    const char *matchedImage = NULL;
+    id view = hitView ?: contentView;
+    Class nativeViewClass = objc_getClass("NSView");
+    BOOL hasNativeAppKitTarget = view && nativeViewClass &&
+        ((MacWSMsgBoolID)objc_msgSend)(
+            view, sel_registerName("isKindOfClass:"),
+            (id)nativeViewClass);
+    unsigned viewsScanned = 0;
+    BOOL usesSwiftUI = NO;
+    while (view && viewsScanned < 64) {
+        viewsScanned++;
+        if (MacWSClassUsesSwiftUI(object_getClass(view), &matchedClass,
+                                  &matchedImage)) {
+            usesSwiftUI = YES;
+            break;
+        }
+        SEL superviewSelector = sel_registerName("superview");
+        if (!((MacWSMsgBoolSEL)objc_msgSend)(
+                view, sel_registerName("respondsToSelector:"),
+                superviewSelector)) break;
+        view = ((MacWSMsgID)objc_msgSend)(view, superviewSelector);
+    }
+    if (usesSwiftUIOut) *usesSwiftUIOut = usesSwiftUI;
+    if (diagnostic || MacWSRuntimeDiagnosticsEnabled()) {
+        fprintf(stderr,
+            "#### APP-INPUT SCROLL-CAPABILITY pid=%d window=%ld "
+            "window-class=%s hit-class=%s route=%s matched-class=%s "
+            "matched-image=%s boundary=%s ancestry-scanned=%u\n",
+            getpid(),
+            (long)((MacWSMsgInteger)objc_msgSend)(
+                window, sel_registerName("windowNumber")),
+            object_getClassName(window),
+            hitView ? object_getClassName(hitView) : "none",
+            hasNativeAppKitTarget
+                ? "CGPostScrollWheelEvent"
+                : "NSWindow.sendEvent-discrete-fallback",
+            matchedClass ?: "none", matchedImage ?: "none",
+            usesSwiftUI ? "SwiftUI" : "AppKit", viewsScanned);
+        fflush(stderr);
+    }
+    return hasNativeAppKitTarget;
+}
+
+static BOOL MacWSWindowPointUsesProcessLocalPreciseScroll(
+        id window, CGPoint windowPoint) {
+    if (MacWSCatalystWindowUsesProcessLocalInputAtPoint(
+            window, windowPoint)) return YES;
+    Class electronWindowClass = objc_getClass("ElectronNSWindow");
+    return window && electronWindowClass &&
+        ((MacWSMsgBoolID)objc_msgSend)(
+            window, sel_registerName("isKindOfClass:"),
+            (id)electronWindowClass);
+}
+
 // CGEventPost of a pixel-unit event is the ideal route and is exactly what the
 // installed OSXvnc binary uses. Runtime on VSCode PID 64433 nevertheless
 // proved that Electron's target process can construct/post that event while
@@ -2971,19 +3636,17 @@ static BOOL MacWSPostSystemScrollEvent(
     // VSCode. The existing generic Catalyst policy identifies only the client
     // area, so title bars and every native AppKit window retain the proven
     // WindowServer route while Catalyst receives the precise pixel NSEvent.
-    if (MacWSCatalystWindowUsesProcessLocalInputAtPoint(
+    if (MacWSWindowPointUsesProcessLocalPreciseScroll(
             window, windowPoint)) return NO;
-    Class electronWindowClass = objc_getClass("ElectronNSWindow");
-    if (window && electronWindowClass &&
-        ((MacWSMsgBoolID)objc_msgSend)(
-            window, sel_registerName("isKindOfClass:"),
-            (id)electronWindowClass)) return NO;
     if (!window) return NO;
     static MacWSPostLegacyScrollEvent postScroll;
     static dispatch_once_t onceToken;
     static NSInteger activeWindowNumber;
     static double horizontalPixelResidual;
     static double verticalPixelResidual;
+    static NSInteger capabilityWindowNumber;
+    static BOOL capabilityUsesSystemRoute;
+    static BOOL capabilityUsesSwiftUIBoundary;
     dispatch_once(&onceToken, ^{
         postScroll = (MacWSPostLegacyScrollEvent)dlsym(
             RTLD_DEFAULT, "CGPostScrollWheelEvent");
@@ -3001,6 +3664,17 @@ static BOOL MacWSPostSystemScrollEvent(
     BOOL began = (record.flags & MacWSInputFlagScrollBegan) != 0;
     BOOL terminal = (record.flags & (MacWSInputFlagScrollEnded |
                                       MacWSInputFlagScrollCancelled)) != 0;
+    if (began || capabilityWindowNumber != windowNumber) {
+        capabilityWindowNumber = windowNumber;
+        capabilityUsesSystemRoute = MacWSWindowPointRequiresSystemScroll(
+            window, windowPoint,
+            record.contactID == MACWS_INPUT_CONTACT_DIAGNOSTIC,
+            &capabilityUsesSwiftUIBoundary);
+    }
+    if (!capabilityUsesSystemRoute) {
+        if (terminal) capabilityWindowNumber = 0;
+        return NO;
+    }
     if (began) {
         activeWindowNumber = 0;
         horizontalPixelResidual = 0.0;
@@ -3022,10 +3696,16 @@ static BOOL MacWSPostSystemScrollEvent(
 
     float horizontalFloat = 0.0f;
     memcpy(&horizontalFloat, &record.contactID, sizeof(horizontalFloat));
-    // Runtime Chromium calibration on this Ventura/iPadOS pair: one legacy
-    // wheel unit becomes 40 CSS/logical pixels. Divide by that observed unit,
-    // not OSXvnc's 10-pixel *CGEvent* step (a different API contract).
-    const double pixelsPerWheelUnit = 40.0;
+    // This variadic legacy API reports line-like units, and the receiving
+    // framework chooses their pixel extent. Runtime screen A/B on the exact
+    // Ventura build measured one unit as roughly 7-10 visible pixels in
+    // Finder's TIconCollectionView, while System Settings' SwiftUI sidebar
+    // retains the separately measured 40-logical-pixel unit. Keeping those
+    // framework calibrations distinct restores roughly 1:1 finger travel in
+    // native AppKit without making the SwiftUI sidebar jump several rows per
+    // sample. Catalyst/Electron never enter this quantized route.
+    const double pixelsPerWheelUnit = capabilityUsesSwiftUIBoundary
+        ? 40.0 : 10.0;
     horizontalPixelResidual += horizontalFloat;
     verticalPixelResidual += record.pressure;
     int32_t horizontal = (int32_t)trunc(
@@ -3049,14 +3729,18 @@ static BOOL MacWSPostSystemScrollEvent(
         fprintf(stderr,
             "#### APP-INPUT SYSTEM-SCROLL pid=%d window=%ld "
             "pixel=(%.3f,%.3f) wheel=(%d,%d) residual=(%.3f,%.3f) "
-            "phase=%#x result=%d route=CGPostScrollWheelEvent\n",
+            "phase=%#x unit-pixels=%.1f boundary=%s result=%d "
+            "route=CGPostScrollWheelEvent\n",
             getpid(), (long)windowNumber, horizontalFloat, record.pressure,
             horizontal, vertical, horizontalPixelResidual,
-            verticalPixelResidual, record.flags, result);
+            verticalPixelResidual, record.flags, pixelsPerWheelUnit,
+            capabilityUsesSwiftUIBoundary ? "SwiftUI" : "AppKit", result);
         fflush(stderr);
     }
     if (terminal) {
         activeWindowNumber = 0;
+        capabilityWindowNumber = 0;
+        capabilityUsesSwiftUIBoundary = NO;
         horizontalPixelResidual = 0.0;
         verticalPixelResidual = 0.0;
     }
@@ -3666,9 +4350,6 @@ static BOOL MacWSPostDockModalPointerEvent(MacWSInputRecord record,
             setInteger(event, 1 /* click state */,
                 (record.flags & MacWSInputFlagDoubleClick) ? 2 : 1);
             setInteger(event, 3 /* button number */, button);
-            // All window, connection and local-location fields remain the
-            // byte-for-byte values WindowServer supplied on the pre-hover at
-            // this same quartz point. Only event phase/button/timestamp change.
             if (setTimestamp && record.timestamp > 0.0)
                 setTimestamp(event,
                     (uint64_t)llround(record.timestamp * 1.0e9));
@@ -3771,15 +4452,28 @@ static BOOL MacWSPostDockSystemInput(MacWSInputRecord record) {
     BOOL latencyMarker = MacWSWriteSystemInputLatencyMarker(
         record, latencyWindowNumber);
 
-    BOOL hoverRecord = record.kind == MacWSInputKindHover ||
+    BOOL nativePointerTransaction =
+        record.kind == MacWSInputKindTouchDown ||
+        record.kind == MacWSInputKindTouchMove ||
+        record.kind == MacWSInputKindTouchUp ||
+        record.kind == MacWSInputKindTouchCancel ||
+        record.kind == MacWSInputKindHover ||
         record.kind == MacWSInputKindMenuHover;
-    if (hoverRecord) {
+    if (nativePointerTransaction) {
         // Do not replay Dock's last modal event for pointer motion. A physical
         // Magic Keyboard mouse first moves WindowServer's global cursor; Dock's
         // normal ECModalEventController entry then resolves the current card
         // and records its exact WALayerKit tuple in the witness above. Replaying
         // the prior tuple here was self-sealing: it returned success, suppressed
         // this native move, and left hover permanently on the old card.
+        //
+        // The same invariant applies to a sustained button transaction.
+        // Runtime A/B on iPad13,6 (2026-09-08) delivered an identical
+        // down/drag/up through the direct modal replay and through OSXvnc's
+        // CGPostMouseEvent path. The former only selected the Mission Control
+        // card; the latter visibly moved Steam from Desktop 1 to Desktop 2.
+        // Keep the complete transaction on the proven WindowServer route so
+        // Dock receives its ordinary capture and cross-Space drag lifecycle.
         BOOL posted = MacWSPostLegacySystemPointerEvent(
             record, appKitPoint, frame, frame, windowNumber, YES);
         if (!posted && latencyMarker)
@@ -4751,6 +5445,111 @@ static CGSize MacWSEffectiveMinimumFrameSize(id window, CGRect frame,
     return (CGSize){width, height};
 }
 
+// Apply the same public NSWindow constraints that participate in an ordinary
+// user resize before committing a Host-requested Scene geometry.  A style-mask
+// Resizable bit is only the coarse capability: Settings uses dimensional
+// limits, and Steam's short-lived sign-in/loading windows publish sizes that
+// do not share the iPad Scene's aspect ratio.  setFrame: is a programmatic
+// setter and does not provide the interactive windowWillResize:toSize:
+// delegate boundary on our behalf, so preserve that application policy here.
+static CGSize MacWSConstrainedWindowFrameSize(id window, CGRect frame,
+                                               CGSize proposed,
+                                               CGSize minimum,
+                                               CGSize *maximumOut,
+                                               CGSize *aspectOut,
+                                               CGSize *incrementsOut) {
+    CGSize maximum = {
+        MACWS_STREAM_MAX_DIMENSION, MACWS_STREAM_MAX_DIMENSION,
+    };
+    CGSize aspect = CGSizeZero;
+    CGSize increments = CGSizeZero;
+    SEL maxSizeSelector = sel_registerName("maxSize");
+    SEL aspectSelector = sel_registerName("aspectRatio");
+    SEL incrementsSelector = sel_registerName("resizeIncrements");
+    if (((MacWSMsgBoolSEL)objc_msgSend)(window,
+            sel_registerName("respondsToSelector:"), maxSizeSelector)) {
+        CGSize value = ((MacWSMsgSize)objc_msgSend)(window, maxSizeSelector);
+        if (isfinite(value.width) && value.width > 0.0)
+            maximum.width = fmin(value.width, MACWS_STREAM_MAX_DIMENSION);
+        if (isfinite(value.height) && value.height > 0.0)
+            maximum.height = fmin(value.height, MACWS_STREAM_MAX_DIMENSION);
+    }
+    if (((MacWSMsgBoolSEL)objc_msgSend)(window,
+            sel_registerName("respondsToSelector:"), aspectSelector)) {
+        CGSize value = ((MacWSMsgSize)objc_msgSend)(window, aspectSelector);
+        if (isfinite(value.width) && isfinite(value.height) &&
+            value.width > 0.0 && value.height > 0.0)
+            aspect = value;
+    }
+    if (((MacWSMsgBoolSEL)objc_msgSend)(window,
+            sel_registerName("respondsToSelector:"), incrementsSelector)) {
+        CGSize value = ((MacWSMsgSize)objc_msgSend)(window,
+                                                     incrementsSelector);
+        if (isfinite(value.width) && value.width > 1.0)
+            increments.width = value.width;
+        if (isfinite(value.height) && value.height > 1.0)
+            increments.height = value.height;
+    }
+
+    maximum.width = fmax(maximum.width, minimum.width);
+    maximum.height = fmax(maximum.height, minimum.height);
+    proposed.width = fmin(fmax(proposed.width, minimum.width), maximum.width);
+    proposed.height = fmin(fmax(proposed.height, minimum.height), maximum.height);
+    if (aspect.width > 0.0 && aspect.height > 0.0) {
+        CGFloat ratio = aspect.width / aspect.height;
+        CGFloat fittedWidth = proposed.height * ratio;
+        CGFloat fittedHeight = proposed.width / ratio;
+        if (fittedWidth <= proposed.width)
+            proposed.width = fittedWidth;
+        else
+            proposed.height = fittedHeight;
+        if (proposed.width < minimum.width) {
+            proposed.width = minimum.width;
+            proposed.height = proposed.width / ratio;
+        }
+        if (proposed.height < minimum.height) {
+            proposed.height = minimum.height;
+            proposed.width = proposed.height * ratio;
+        }
+        proposed.width = fmin(proposed.width, maximum.width);
+        proposed.height = fmin(proposed.height, maximum.height);
+    }
+    if (increments.width > 0.0) {
+        proposed.width = minimum.width + round(
+            (proposed.width - minimum.width) / increments.width) *
+                increments.width;
+    }
+    if (increments.height > 0.0) {
+        proposed.height = minimum.height + round(
+            (proposed.height - minimum.height) / increments.height) *
+                increments.height;
+    }
+    proposed.width = fmin(fmax(proposed.width, minimum.width), maximum.width);
+    proposed.height = fmin(fmax(proposed.height, minimum.height), maximum.height);
+
+    id delegate = ((MacWSMsgID)objc_msgSend)(window,
+        sel_registerName("delegate"));
+    SEL willResize = sel_registerName("windowWillResize:toSize:");
+    if (delegate && ((MacWSMsgBoolSEL)objc_msgSend)(delegate,
+            sel_registerName("respondsToSelector:"), willResize)) {
+        CGSize delegated = ((MacWSMsgSizeIDSize)objc_msgSend)(
+            delegate, willResize, window, proposed);
+        if (isfinite(delegated.width) && isfinite(delegated.height) &&
+            delegated.width > 0.0 && delegated.height > 0.0)
+            proposed = delegated;
+    }
+    proposed.width = fmin(fmax(proposed.width, minimum.width), maximum.width);
+    proposed.height = fmin(fmax(proposed.height, minimum.height), maximum.height);
+    if (!isfinite(proposed.width) || proposed.width <= 0.0)
+        proposed.width = frame.size.width;
+    if (!isfinite(proposed.height) || proposed.height <= 0.0)
+        proposed.height = frame.size.height;
+    if (maximumOut) *maximumOut = maximum;
+    if (aspectOut) *aspectOut = aspect;
+    if (incrementsOut) *incrementsOut = increments;
+    return proposed;
+}
+
 // Complete the real AppKit lifecycle when CGS deactivation succeeded but the
 // chroot never delivered its corresponding Workspace event.  On-device LLDB
 // disassembly of macOS 13.4 proves this handler does not read x2/the event
@@ -5178,6 +5977,271 @@ static void MacWSCompleteFinderInitialWindow(id application,
     MacWSNotifyDisplayCatalogChanged('n');
 }
 
+static void MacWSOpenDocumentPaths(MacWSInputRecord record,
+                                   char *sidecar, size_t sidecarSize,
+                                   char *ack, size_t ackSize) {
+    snprintf(sidecar, sidecarSize, "%s.%d.%016llx.plist",
+             MACWS_OPEN_DOCUMENT_SIDECAR_PREFIX, getpid(),
+             (unsigned long long)record.sceneID);
+    snprintf(ack, ackSize, "%s_ack.%d.%016llx.bin",
+             MACWS_OPEN_DOCUMENT_SIDECAR_PREFIX, getpid(),
+             (unsigned long long)record.sceneID);
+}
+
+static NSArray<NSString *> *MacWSCopyValidatedOpenDocumentPaths(
+        MacWSInputRecord record) {
+    char sidecar[PATH_MAX] = {0};
+    char ack[PATH_MAX] = {0};
+    MacWSOpenDocumentPaths(record, sidecar, sizeof(sidecar), ack,
+                           sizeof(ack));
+    struct stat status = {0};
+    if (lstat(sidecar, &status) != 0 || !S_ISREG(status.st_mode) ||
+        status.st_nlink != 1 || status.st_uid != geteuid() ||
+        (status.st_mode & 077) != 0 || status.st_size <= 0 ||
+        status.st_size > 1024 * 1024) {
+        fprintf(stderr,
+            "#### APP-INPUT OPEN-DOCUMENTS pid=%d nonce=%016llx "
+            "result=invalid-sidecar errno=%d mode=%#o size=%lld\n",
+            getpid(), (unsigned long long)record.sceneID, errno,
+            status.st_mode, (long long)status.st_size);
+        fflush(stderr);
+        return nil;
+    }
+    NSData *data = [NSData dataWithContentsOfFile:
+        MacWSRuntimeString(sidecar)];
+    (void)unlink(sidecar);
+    if (!data) return nil;
+    NSError *error = nil;
+    id payload = [NSPropertyListSerialization
+        propertyListWithData:data
+                     options:NSPropertyListImmutable
+                      format:NULL
+                       error:&error];
+    if (![payload isKindOfClass:objc_getClass("NSDictionary")]) {
+        fprintf(stderr,
+            "#### APP-INPUT OPEN-DOCUMENTS pid=%d nonce=%016llx "
+            "result=invalid-payload error=%s\n",
+            getpid(), (unsigned long long)record.sceneID,
+            error.localizedDescription.UTF8String ?: "none");
+        fflush(stderr);
+        return nil;
+    }
+    id version = [payload objectForKey:MacWSRuntimeString("version")];
+    id nonce = [payload objectForKey:MacWSRuntimeString("nonce")];
+    id targetPID = [payload objectForKey:MacWSRuntimeString("target_pid")];
+    id candidatePaths = [payload objectForKey:MacWSRuntimeString("paths")];
+    if ([version unsignedIntegerValue] != 1 ||
+        [nonce unsignedLongLongValue] != record.sceneID ||
+        [targetPID intValue] != getpid() ||
+        ![candidatePaths isKindOfClass:objc_getClass("NSArray")]) {
+        fprintf(stderr,
+            "#### APP-INPUT OPEN-DOCUMENTS pid=%d nonce=%016llx "
+            "result=invalid-payload error=%s\n",
+            getpid(), (unsigned long long)record.sceneID,
+            error.localizedDescription.UTF8String ?: "none");
+        fflush(stderr);
+        return nil;
+    }
+    NSArray *candidates = candidatePaths;
+    if (candidates.count == 0 || candidates.count > 128) return nil;
+    NSMutableArray<NSString *> *paths =
+        [NSMutableArray arrayWithCapacity:candidates.count];
+    for (id candidate in candidates) {
+        if (![candidate isKindOfClass:objc_getClass("NSString")]) return nil;
+        NSString *path = [(NSString *)candidate stringByStandardizingPath];
+        struct stat fileStatus = {0};
+        if (!path.isAbsolutePath ||
+            stat(path.fileSystemRepresentation, &fileStatus) != 0 ||
+            !S_ISREG(fileStatus.st_mode)) return nil;
+        [paths addObject:path];
+    }
+    return [paths copy];
+}
+
+static BOOL MacWSWriteOpenDocumentAck(MacWSInputRecord record,
+                                      uint32_t acceptedCount) {
+    char sidecar[PATH_MAX] = {0};
+    char ack[PATH_MAX] = {0};
+    MacWSOpenDocumentPaths(record, sidecar, sizeof(sidecar), ack,
+                           sizeof(ack));
+    char temporary[PATH_MAX] = {0};
+    int length = snprintf(temporary, sizeof(temporary), "%s.new.%d", ack,
+                          getpid());
+    if (length <= 0 || (size_t)length >= sizeof(temporary)) return NO;
+    (void)unlink(temporary);
+    int descriptor = open(temporary,
+        O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
+    if (descriptor < 0) return NO;
+    MacWSOpenDocumentAck value = {
+        .magic = MACWS_OPEN_DOCUMENT_ACK_MAGIC,
+        .version = MACWS_OPEN_DOCUMENT_ACK_VERSION,
+        .size = sizeof(MacWSOpenDocumentAck),
+        .nonce = record.sceneID,
+        .targetPID = getpid(),
+        .acceptedCount = acceptedCount,
+    };
+    const uint8_t *cursor = (const uint8_t *)&value;
+    size_t remaining = sizeof(value);
+    BOOL written = YES;
+    while (remaining != 0) {
+        ssize_t count = write(descriptor, cursor, remaining);
+        if (count < 0 && errno == EINTR) continue;
+        if (count <= 0) {
+            written = NO;
+            break;
+        }
+        cursor += (size_t)count;
+        remaining -= (size_t)count;
+    }
+    if (written && fsync(descriptor) != 0) written = NO;
+    if (close(descriptor) != 0) written = NO;
+    if (written && rename(temporary, ack) != 0) written = NO;
+    if (!written) (void)unlink(temporary);
+    return written;
+}
+
+static void MacWSHandleOpenDocuments(MacWSInputRecord record,
+                                     id application) {
+    NSArray<NSString *> *paths = MacWSCopyValidatedOpenDocumentPaths(record);
+    if (paths.count == 0) return;
+    NSMutableArray<NSURL *> *urls =
+        [NSMutableArray arrayWithCapacity:paths.count];
+    for (NSString *path in paths) {
+        NSURL *url = [NSURL fileURLWithPath:path];
+        if (url) [urls addObject:url];
+    }
+
+    if (MacWSRuntimeDiagnosticsEnabled()) {
+        id delegate = ((MacWSMsgID)objc_msgSend)(
+            application, sel_registerName("delegate"));
+        fprintf(stderr,
+            "#### APP-INPUT OPEN-DOCUMENT-DELEGATE pid=%d class=%s\n",
+            getpid(), delegate ? object_getClassName(delegate) : "(nil)");
+        static const char *const delegateSelectors[] = {
+            "application:openURLs:",
+            "application:openFiles:",
+            "application:openFile:",
+            "application:openFileWithoutUI:",
+            "application:openTempFile:",
+        };
+        for (NSUInteger index = 0;
+             index < sizeof(delegateSelectors) /
+                 sizeof(delegateSelectors[0]); index++) {
+            SEL candidate = sel_registerName(delegateSelectors[index]);
+            Method method = delegate
+                ? class_getInstanceMethod(object_getClass(delegate),
+                                          candidate) : NULL;
+            fprintf(stderr,
+                "#### APP-INPUT OPEN-DOCUMENT-DELEGATE selector=%s "
+                "implemented=%s types=%s imp=%p\n",
+                delegateSelectors[index], method ? "YES" : "NO",
+                method ? method_getTypeEncoding(method) : "(null)",
+                method ? method_getImplementation(method) : NULL);
+        }
+        fflush(stderr);
+    }
+
+    // hostd has already decoded and independently validated the paths that
+    // LaunchServices would normally carry in its AppleEvent. Deliver them to
+    // the target's real NSApplicationDelegate document-open boundary. This is
+    // important for Electron: runtime introspection on the actual VS Code
+    // process (2026-09-07) found that ElectronApplicationDelegate implements
+    // only -application:openFile: (B32@0:8@16@24). Calling AppKit's private
+    // _handleAEOpenDocumentsForURLs: returned noErr without invoking that
+    // delegate and left the Welcome page unchanged.
+    id delegate = ((MacWSMsgID)objc_msgSend)(
+        application, sel_registerName("delegate"));
+    SEL openURLs = sel_registerName("application:openURLs:");
+    SEL openFiles = sel_registerName("application:openFiles:");
+    SEL openFile = sel_registerName("application:openFile:");
+    const char *handlerName = "unavailable";
+    BOOL supported = urls.count == paths.count;
+    BOOL accepted = NO;
+    int status = INT_MIN;
+    if (supported && delegate && [delegate respondsToSelector:openURLs]) {
+        ((MacWSMsgVoidIDID)objc_msgSend)(
+            delegate, openURLs, application, urls);
+        handlerName = "delegate.application:openURLs:";
+        accepted = YES;
+        status = 0;
+    } else if (supported && delegate &&
+               [delegate respondsToSelector:openFiles]) {
+        ((MacWSMsgVoidIDID)objc_msgSend)(
+            delegate, openFiles, application, paths);
+        handlerName = "delegate.application:openFiles:";
+        accepted = YES;
+        status = 0;
+    } else if (supported && delegate &&
+               [delegate respondsToSelector:openFile]) {
+        accepted = YES;
+        for (NSString *path in paths) {
+            if (!((MacWSMsgBoolIDID)objc_msgSend)(
+                    delegate, openFile, application, path))
+                accepted = NO;
+        }
+        handlerName = "delegate.application:openFile:";
+        status = accepted ? 0 : -1;
+    } else {
+        // Runtime-enumerated from the actual Ventura 13.4 AppKit image on the
+        // device (2026-09-07): this method has type s24@0:8@16 and is the
+        // post-AppleEvent URL entry used by document-based applications.
+        SEL handleOpen = sel_registerName(
+            "_handleAEOpenDocumentsForURLs:");
+        supported = supported &&
+            [application respondsToSelector:handleOpen];
+        int16_t appKitStatus = supported
+            ? ((int16_t (*)(id, SEL, id))objc_msgSend)(
+                application, handleOpen, urls)
+            : INT16_MIN;
+        handlerName = supported
+            ? "_handleAEOpenDocumentsForURLs:" : "unavailable";
+        status = appKitStatus;
+        accepted = supported && appKitStatus == 0;
+    }
+    BOOL activationRequested = NO;
+    if (accepted) {
+        // The original Finder LaunchServices transaction is an activating
+        // document open.  Our typed bridge already preserves the target's
+        // real NSApplicationDelegate boundary, but previously omitted that
+        // second half of the transaction.  Runtime witness on 2026-09-07:
+        // Preview pid 39009 accepted the PDF and renamed its live window 277,
+        // while Host received no frontmost-catalog transition and its iPadOS
+        // Scene stayed behind Maps.  Ask the target's real NSApplication to
+        // activate only after its delegate accepted the document; AppKit and
+        // WindowServer still decide which existing/new document window orders
+        // front, and no window is synthesized here.
+        SEL activate = sel_registerName("activateIgnoringOtherApps:");
+        if (((MacWSMsgBoolSEL)objc_msgSend)(
+                application, sel_registerName("respondsToSelector:"),
+                activate)) {
+            ((MacWSMsgVoidBool)objc_msgSend)(
+                application, activate, YES);
+            activationRequested = YES;
+        }
+    }
+    BOOL acknowledged = accepted && MacWSWriteOpenDocumentAck(
+        record, (uint32_t)urls.count);
+    fprintf(stderr,
+        "#### APP-INPUT OPEN-DOCUMENTS pid=%d nonce=%016llx count=%lu "
+        "urls=%lu handler=%s status=%d activation=%s ack=%s\n",
+        getpid(), (unsigned long long)record.sceneID,
+        (unsigned long)paths.count, (unsigned long)urls.count,
+        handlerName, status, activationRequested ? "requested" : "none",
+        acknowledged ? "written" : "failed");
+    fflush(stderr);
+    if (accepted) {
+        for (NSNumber *delay in @[@250, @1000]) {
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                         delay.longLongValue * NSEC_PER_MSEC),
+                           dispatch_get_main_queue(), ^{
+                MacWSPublishWindowMetrics();
+                MacWSNotifyDisplayCatalogChanged('o');
+            });
+        }
+    }
+    [paths release];
+}
+
 static void MacWSPostInputOnMainThread(MacWSInputRecord record) {
     double latencyMainStart =
         (record.flags & MacWSInputFlagLatencyDiagnostic)
@@ -5219,6 +6283,11 @@ static void MacWSPostInputOnMainThread(MacWSInputRecord record) {
         fprintf(stderr,
                 "#### APP-INPUT DROP pid=%d reason=no-application-or-screen\n",
                 getpid());
+        return;
+    }
+
+    if (record.kind == MacWSInputKindOpenDocuments) {
+        MacWSHandleOpenDocuments(record, application);
         return;
     }
 
@@ -5802,7 +6871,7 @@ static void MacWSPostInputOnMainThread(MacWSInputRecord record) {
             window, sel_registerName("screen"));
         CGRect targetScreen = ((MacWSMsgRect)objc_msgSend)(
             windowScreen ?: screen, sel_registerName("frame"));
-        CGSize requested = resizable ? (CGSize){
+        CGSize hostRequested = resizable ? (CGSize){
             fmax(record.x, minimum.width), fmax(record.y, minimum.height),
         } : oldFrame.size;
         if ((anchorTopLeft || anchorTopRight) &&
@@ -5813,9 +6882,19 @@ static void MacWSPostInputOnMainThread(MacWSInputRecord record) {
             // title-bar strip and constraining native dragging. Host-owned
             // anchored windows must remain representable by the desktop; manual
             // macOS resizes and native zoom retain AppKit's normal policy.
-            requested.width = fmin(requested.width, targetScreen.size.width);
-            requested.height = fmin(requested.height, targetScreen.size.height);
+            hostRequested.width = fmin(hostRequested.width,
+                                       targetScreen.size.width);
+            hostRequested.height = fmin(hostRequested.height,
+                                        targetScreen.size.height);
         }
+        CGSize maximum = oldFrame.size;
+        CGSize aspect = CGSizeZero;
+        CGSize increments = CGSizeZero;
+        CGSize requested = resizable
+            ? MacWSConstrainedWindowFrameSize(
+                window, oldFrame, hostRequested, minimum, &maximum, &aspect,
+                &increments)
+            : oldFrame.size;
         CGRect newFrame = oldFrame;
         newFrame.size = requested;
         if (anchorTopLeft || anchorTopRight) {
@@ -5840,23 +6919,42 @@ static void MacWSPostInputOnMainThread(MacWSInputRecord record) {
             fabs(appliedFrame.origin.y - oldFrame.origin.y) > 0.25 ||
             fabs(appliedFrame.size.width - oldFrame.size.width) > 0.25 ||
             fabs(appliedFrame.size.height - oldFrame.size.height) > 0.25;
+        BOOL applicationConstrained =
+            fabs(appliedFrame.size.width - record.x) > 0.75 ||
+            fabs(appliedFrame.size.height - record.y) > 0.75;
         // setFrame:display:animate: is synchronous with AppKit's accepted
         // geometry. Publish that committed size now instead of making Host
         // wait for the 500-ms recovery timer or issue a blind catalog poll.
         MacWSPublishWindowMetrics();
-        if (geometryChanged) MacWSNotifyDisplayGeometryChanged(
-            windowNumber, window, appliedFrame);
-        if (MacWSRuntimeDiagnosticsEnabled()) {
+        if (geometryChanged) {
+            MacWSNotifyDisplayGeometryChanged(
+                windowNumber, window, appliedFrame);
+        } else if (applicationConstrained) {
+            // A fixed or max-sized AppKit window has no new IOSurface
+            // geometry to publish. Still emit one catalog edge so Host can
+            // observe the unchanged real frame as the application's resize
+            // result and fit the native Scene back to it.
+            MacWSNotifyDisplayCatalogChanged('s');
+        }
+        if (MacWSRuntimeDiagnosticsEnabled() || applicationConstrained) {
             fprintf(stderr,
                 "#### APP-INPUT CONFIGURE pid=%d window=%u "
-                "old=%.1fx%.1f requested=%.1fx%.1f minimum=%.1fx%.1f "
-                "applied=(%.1f,%.1f %.1fx%.1f) changed=%s density=%.2f anchor=%s\n",
+                "old=%.1fx%.1f host=%.1fx%.1f constrained=%.1fx%.1f "
+                "minimum=%.1fx%.1f maximum=%.1fx%.1f "
+                "aspect=%.1fx%.1f increments=%.1fx%.1f "
+                "applied=(%.1f,%.1f %.1fx%.1f) changed=%s "
+                "application-constrained=%s density=%.2f anchor=%s\n",
                 getpid(), windowNumber,
                 oldFrame.size.width, oldFrame.size.height,
-                record.x, record.y, minimum.width, minimum.height,
+                record.x, record.y, requested.width, requested.height,
+                minimum.width, minimum.height,
+                maximum.width, maximum.height,
+                aspect.width, aspect.height,
+                increments.width, increments.height,
                 appliedFrame.origin.x, appliedFrame.origin.y,
                 appliedFrame.size.width, appliedFrame.size.height,
-                geometryChanged ? "YES" : "NO", record.pressure,
+                geometryChanged ? "YES" : "NO",
+                applicationConstrained ? "YES" : "NO", record.pressure,
                 anchorTopRight ? "top-right" :
                     (anchorTopLeft ? "top-left" : "preserve"));
             fflush(stderr);
@@ -6138,13 +7236,16 @@ static void MacWSPostInputOnMainThread(MacWSInputRecord record) {
             };
         }
 
-        // A menu, sheet, tooltip, or popover is a real higher-level NSWindow
-        // owned by the same application. Exact-window streaming still uses
-        // the base window as its coordinate space, but AppKit must receive the
-        // event in whichever of its own stacked windows is actually under the
-        // mapped screen point. Restrict this to a visible window above the
-        // requested base level so another ordinary same-process document
-        // window cannot steal input from its Scene.
+        // A menu, sheet, tooltip, popover, or application-modal alert is a
+        // real NSWindow owned by the same application. Exact-window streaming
+        // still uses the base window as its coordinate space, but AppKit must
+        // receive the event in whichever of its own stacked windows is under
+        // the mapped screen point. Ventura application-modal NSAlertPanel
+        // windows are level 0, exactly like their presenter, so level alone is
+        // not an ownership test. Accept a same-level hit only when AppKit's
+        // real sheetParent / parentWindow / modalWindow relation resolves it
+        // back to this Scene's requested base window. This preserves Scene
+        // isolation between unrelated same-process document windows.
         if (!reusedGestureRoute) {
             id hitWindow = MacWSWindowForScreenPoint(application, screenPoint);
             if (hitWindow && hitWindow != requestedBaseWindow) {
@@ -6154,7 +7255,12 @@ static void MacWSPostInputOnMainThread(MacWSInputRecord record) {
                     hitWindow, sel_registerName("level"));
                 BOOL hitVisible = ((MacWSMsgBool)objc_msgSend)(
                     hitWindow, sel_registerName("isVisible"));
-                if (hitVisible && hitLevel > baseLevel) {
+                id hitRoot = MacWSRootPresentingWindow(
+                    hitWindow, application);
+                BOOL presentedByRequestedBase =
+                    hitRoot == requestedBaseWindow;
+                if (hitVisible &&
+                    (hitLevel > baseLevel || presentedByRequestedBase)) {
                     window = hitWindow;
                     routedToTransientWindow = YES;
                 }
@@ -6408,6 +7514,75 @@ static void MacWSPostInputOnMainThread(MacWSInputRecord record) {
     BOOL exactGlobalSystemStart = requestedWindowNumber != 0 &&
         exactPointerStart && globalWindowNumber == windowNumber &&
         !catalystContentInput;
+    // A tagged second tap must retain AppKit's clickCount=2 semantic. The
+    // legacy CGPostMouseEvent route accepts only button states, so arm a narrow
+    // native-event repair before posting its ordinary down/up pair. The
+    // NSApplication boundary matches the resulting WindowServer events and
+    // restores only their click-state field. This is limited to the content
+    // view of the exact globally-frontmost Host-selected window; title bars,
+    // traffic lights, menus and covered or stale surfaces keep their
+    // established routes.
+    BOOL nativeContentDoubleClick = NO;
+    CGPoint nativeContentPoint = {0.0, 0.0};
+    CGRect nativeContentBounds = {{0.0, 0.0}, {0.0, 0.0}};
+    if (record.kind == MacWSInputKindTap &&
+        (record.flags & MacWSInputFlagDoubleClick) != 0 && window) {
+        id contentView = ((MacWSMsgID)objc_msgSend)(
+            window, sel_registerName("contentView"));
+        if (contentView) {
+            nativeContentPoint = ((MacWSMsgPointPointID)objc_msgSend)(
+                contentView, sel_registerName("convertPoint:fromView:"),
+                windowPoint, nil);
+            nativeContentBounds = ((MacWSMsgRect)objc_msgSend)(
+                contentView, sel_registerName("bounds"));
+            nativeContentDoubleClick = requestedWindowNumber != 0 &&
+                globalWindowNumber == windowNumber &&
+                CGRectContainsPoint(nativeContentBounds,
+                                    nativeContentPoint);
+        }
+        if (MacWSRuntimeDiagnosticsEnabled() ||
+            record.contactID == MACWS_INPUT_CONTACT_DIAGNOSTIC) {
+            fprintf(stderr,
+                "#### APP-INPUT DOUBLE-CANDIDATE pid=%d window=%ld "
+                "flags=%#x local=(%.2f,%.2f) content=(%.2f,%.2f) "
+                "bounds=(%.2f,%.2f %.2fx%.2f) inside=%s\n",
+                getpid(), (long)windowNumber, record.flags,
+                windowPoint.x, windowPoint.y,
+                nativeContentPoint.x, nativeContentPoint.y,
+                nativeContentBounds.origin.x,
+                nativeContentBounds.origin.y,
+                nativeContentBounds.size.width,
+                nativeContentBounds.size.height,
+                nativeContentDoubleClick ? "YES" : "NO");
+            fflush(stderr);
+        }
+    }
+    if (nativeContentDoubleClick) {
+        MacWSArmSystemDoubleClick(windowNumber, screenPoint);
+        if (MacWSPostLegacySystemPointerEvent(
+                record, screenPoint, screenFrame, inputMappingFrame,
+                windowNumber, YES)) {
+            if (MacWSRuntimeDiagnosticsEnabled() ||
+                record.contactID == MACWS_INPUT_CONTACT_DIAGNOSTIC) {
+                fprintf(stderr,
+                    "#### APP-INPUT DOUBLE-ROUTE pid=%d window=%ld "
+                    "flags=%#x local=(%.2f,%.2f) "
+                    "route=native-system-with-click-restore\n",
+                    getpid(), (long)windowNumber, record.flags,
+                    windowPoint.x, windowPoint.y);
+                fflush(stderr);
+            }
+            MacWSNotifyDisplayCatalogChanged('t');
+            MacWSSetAppInputGestureWindow(nil);
+            MacWSClearDeferredRFBMoveEvents();
+            return;
+        }
+        MacWSCancelSystemDoubleClick();
+        // Do not post the same partially-failed native transition twice. The
+        // exact process-local path below remains a bounded fallback if the
+        // legacy system API itself is unavailable.
+        exactGlobalSystemStart = NO;
+    }
     if (MacWSPostLegacySystemPointerEvent(
             record, screenPoint, screenFrame, inputMappingFrame, windowNumber,
             exactSystemMenu || exactGlobalSystemStart)) {
@@ -6439,9 +7614,12 @@ static void MacWSPostInputOnMainThread(MacWSInputRecord record) {
         return;
     }
     if (record.kind == MacWSInputKindScroll) {
+        BOOL processLocalPreciseScroll =
+            MacWSWindowPointUsesProcessLocalPreciseScroll(
+                window, windowPoint);
         id scrollEvent = MacWSCreateAppScrollEvent(
             eventClass, record, window, windowPoint, screenFrame,
-            windowNumber);
+            windowNumber, processLocalPreciseScroll);
         if (!scrollEvent) {
             fprintf(stderr,
                 "#### APP-INPUT DROP pid=%d reason=scroll-event-create "
@@ -6463,8 +7641,9 @@ static void MacWSPostInputOnMainThread(MacWSInputRecord record) {
         // sidebar. The generic hit/responder path retains AppKit hit testing
         // and invokes
         // no application-specific view or action.
-        if (record.flags & (MacWSInputFlagScrollBegan |
-                            MacWSInputFlagScrollChanged)) {
+        if (processLocalPreciseScroll &&
+            (record.flags & (MacWSInputFlagScrollBegan |
+                             MacWSInputFlagScrollChanged))) {
             // Runtime enumeration of the actual Ventura NSWindow exposes the
             // window-level scroll-session primitive with ABI v24@0:8@16.
             // InputLab proved process-local -sendEvent: never invokes it: all
@@ -6496,7 +7675,7 @@ static void MacWSPostInputOnMainThread(MacWSInputRecord record) {
         BOOL scrollTerminal = (record.flags &
             (MacWSInputFlagScrollEnded |
              MacWSInputFlagScrollCancelled)) != 0;
-        if (scrollTerminal) {
+        if (processLocalPreciseScroll && scrollTerminal) {
             if (record.flags & MacWSInputFlagScrollMomentum) {
                 MacWSEndAppInputScrollSession();
             } else if (record.flags & MacWSInputFlagScrollWillMomentum) {
@@ -6515,13 +7694,16 @@ static void MacWSPostInputOnMainThread(MacWSInputRecord record) {
             fprintf(stderr,
                 "#### APP-INPUT SCROLL-DISPATCH pid=%d target-window=%ld "
                 "event-window=%ld local=(%.2f,%.2f) delta=(%.2f,%.2f) "
-                "route=NSWindow.sendEvent\n",
+                "route=%s\n",
                 getpid(), (long)windowNumber, (long)eventWindow,
                 eventPoint.x, eventPoint.y,
                 ((double (*)(id, SEL))objc_msgSend)(
                     scrollEvent, sel_registerName("scrollingDeltaX")),
                 ((double (*)(id, SEL))objc_msgSend)(
-                    scrollEvent, sel_registerName("scrollingDeltaY")));
+                    scrollEvent, sel_registerName("scrollingDeltaY")),
+                processLocalPreciseScroll
+                    ? "NSWindow.sendEvent-precise"
+                    : "NSWindow.sendEvent-discrete-fallback");
             fflush(stderr);
         }
         return;
@@ -6808,9 +7990,10 @@ static void MacWSPostInputOnMainThread(MacWSInputRecord record) {
             record.contactID == MACWS_INPUT_CONTACT_DIAGNOSTIC) {
             fprintf(stderr,
                 "#### APP-INPUT TAP-COMPLETE pid=%d button=%s gesture=%u window=%ld "
-                "screen=(%.2f,%.2f) local=(%.2f,%.2f)\n",
+                "clicks=%ld flags=%#x screen=(%.2f,%.2f) local=(%.2f,%.2f)\n",
                 getpid(), secondary ? "secondary" : "primary",
                 record.contactID, (long)windowNumber,
+                (long)clickCount, record.flags,
                 screenPoint.x, screenPoint.y, windowPoint.x, windowPoint.y);
             fflush(stderr);
         }
@@ -7106,12 +8289,45 @@ static void MacWSScheduleAppInputDrain(void) {
 }
 
 static void MacWSDrainOneAppInputOnMainThread(void) {
-    NSData *data = nil;
+    NSMutableArray<NSData *> *batch = [NSMutableArray arrayWithCapacity:16];
     BOOL scheduleNext = NO;
     @synchronized(MacWSAppInputPending) {
         if ([MacWSAppInputPending count] != 0) {
-            data = [[MacWSAppInputPending objectAtIndex:0] retain];
+            NSData *first = [MacWSAppInputPending objectAtIndex:0];
+            [batch addObject:first];
             [MacWSAppInputPending removeObjectAtIndex:0];
+            MacWSInputRecord firstRecord = {0};
+            if ([first length] == sizeof(firstRecord))
+                [first getBytes:&firstRecord length:sizeof(firstRecord)];
+            BOOL plainKeyBatch =
+                (firstRecord.kind == MacWSInputKindKeyDown ||
+                 firstRecord.kind == MacWSInputKindKeyUp) &&
+                (MacWSInputModifiersForScene(firstRecord.sceneID) &
+                    ((1u << 18) | (1u << 19) | (1u << 20))) == 0;
+            // A fast text burst previously required one distinct
+            // CFRunLoopPerformBlock turn per key-down and key-up. Sublime's
+            // main loop can legitimately spend several milliseconds between
+            // those turns, so later glyphs arrived in visible clumps. Drain a
+            // bounded run of ordinary text-key records in the same main-loop
+            // turn while preserving their exact FIFO order. Command/control
+            // shortcuts and every pointer/tracking transition keep the
+            // existing one-record scheduling semantics.
+            while (plainKeyBatch && batch.count < 32 &&
+                   [MacWSAppInputPending count] != 0) {
+                NSData *candidate = [MacWSAppInputPending objectAtIndex:0];
+                MacWSInputRecord candidateRecord = {0};
+                if ([candidate length] != sizeof(candidateRecord)) break;
+                [candidate getBytes:&candidateRecord
+                              length:sizeof(candidateRecord)];
+                BOOL candidatePlainKey =
+                    (candidateRecord.kind == MacWSInputKindKeyDown ||
+                     candidateRecord.kind == MacWSInputKindKeyUp) &&
+                    (MacWSInputModifiersForScene(candidateRecord.sceneID) &
+                        ((1u << 18) | (1u << 19) | (1u << 20))) == 0;
+                if (!candidatePlainKey) break;
+                [batch addObject:candidate];
+                [MacWSAppInputPending removeObjectAtIndex:0];
+            }
             if ([MacWSAppInputPending count] != 0) {
                 // Keep the scheduled token and enqueue the next block before
                 // dispatching this event. sendEvent(mouseDown) can enter a
@@ -7127,14 +8343,14 @@ static void MacWSDrainOneAppInputOnMainThread(void) {
         }
     }
     if (scheduleNext) MacWSScheduleAppInputDrain();
-    if ([data length] == sizeof(MacWSInputRecord)) {
+    for (NSData *data in batch) {
+        if ([data length] != sizeof(MacWSInputRecord)) continue;
         MacWSInputRecord record = {0};
         [data getBytes:&record length:sizeof(record)];
         @autoreleasepool {
             MacWSPostInputOnMainThread(record);
         }
     }
-    [data release];
 }
 
 static void MacWSEnqueueAppInputRecord(MacWSInputRecord record) {
@@ -7689,6 +8905,7 @@ static NSData *MacWSMenuActionOnMainThread(
                 // user intent before arriving here.  Reordering from inside
                 // a menu transaction can re-enter AppKit's tab controller,
                 // which is the exact failure the snapshot path used to cause.
+                MacWSInstallWorkspaceOpenWitness();
                 id target = ((MacWSMsgID)objc_msgSend)(
                     current, sel_registerName("target"));
                 status = ((MacWSMsgBoolSELIDID)objc_msgSend)(application,
@@ -7828,7 +9045,7 @@ static void *MacWSAppInputThread(void *unused) {
             if (errno == EINTR) continue;
             break;
         }
-        // Dock deliberately has no AppKit objects.  Its only accepted payload
+        // Dock deliberately has no AppKit objects. Its only accepted payload
         // is a broker-revalidated system-surface input record; probes and menu
         // requests remain owned by the ordinary AppKit endpoints.
         if (MacWSAppInputIsDockEndpoint()) {
@@ -7836,7 +9053,8 @@ static void *MacWSAppInputThread(void *unused) {
             BOOL valid = count == sizeof(record) &&
                 MacWSInputRecordIsValid(&record);
             BOOL posted = valid && MacWSPostDockSystemInput(record);
-            if (MacWSRuntimeDiagnosticsEnabled() &&
+            if ((MacWSRuntimeDiagnosticsEnabled() ||
+                 record.contactID == MACWS_INPUT_CONTACT_DIAGNOSTIC) &&
                 record.kind != MacWSInputKindTouchMove &&
                 record.kind != MacWSInputKindHover &&
                 record.kind != MacWSInputKindMenuHover &&
@@ -7874,8 +9092,10 @@ static void *MacWSAppInputThread(void *unused) {
             record.kind != MacWSInputKindHover &&
             record.kind != MacWSInputKindMenuHover) {
             fprintf(stderr,
-                    "#### APP-INPUT RX pid=%d bytes=%zd kind=%u target=%d\n",
-                    getpid(), count, record.kind, record.targetPID);
+                    "#### APP-INPUT RX pid=%d bytes=%zd kind=%u target=%d "
+                    "flags=%#x contact=%u\n",
+                    getpid(), count, record.kind, record.targetPID,
+                    record.flags, record.contactID);
             fflush(stderr);
         }
         if (count != sizeof(record) || !MacWSInputRecordIsValid(&record)) {
@@ -8299,6 +9519,15 @@ static void MacWSInstallWindowGeometryObservers(void) {
 
 static void MacWSInstallAppInputBridgeNow(void) {
     if (!MacWSAppInputSupportedProcess()) return;
+    if (MacWSRuntimeDiagnosticsEnabled()) {
+        fprintf(stderr,
+                "#### APP-INPUT PROCESS-IDENTITY pid=%d program=%s "
+                "preview-adapter=%p\n",
+                getpid(), MacWSAppInputProgramName(),
+                MacWSInstallPreviewCoreImageRendererAdapter);
+        fflush(stderr);
+    }
+    MacWSInstallPreviewCoreImageRendererAdapter();
     int expected = 0;
     if (!atomic_compare_exchange_strong_explicit(
             &MacWSAppInputInstallState, &expected, 1,
@@ -8313,9 +9542,11 @@ static void MacWSInstallAppInputBridgeNow(void) {
         return;
     }
     if (!dockEndpoint) {
+        MacWSInstallWorkspaceOpenWitness();
         MacWSInstallApplicationKeyWitness();
         MacWSInstallMenuEventLoopWitness();
         MacWSInstallOrderedWindowRegistry();
+        MacWSInstallTransientFrameConstraint();
         MacWSInstallFullscreenTransitionPrerequisite();
         if (!MacWSOriginalApplicationSendEvent ||
             !MacWSOriginalHandleActivatedEvent)
@@ -8357,8 +9588,9 @@ static void MacWSInstallAppInputBridgeNow(void) {
         atomic_store_explicit(&MacWSAppInputInstallState, 2,
                               memory_order_release);
         if (MacWSRuntimeDiagnosticsEnabled()) {
-            fprintf(stderr, "#### APP-INPUT READY pid=%d socket=%s abi=%u record=%zu\n",
-                    getpid(), MacWSAppInputPath, MACWS_INPUT_VERSION,
+            fprintf(stderr, "#### APP-INPUT READY pid=%d socket=%s abi=%u-%u record=%zu\n",
+                    getpid(), MacWSAppInputPath,
+                    MACWS_INPUT_LEGACY_VERSION, MACWS_INPUT_VERSION,
                     sizeof(MacWSInputRecord));
             fflush(stderr);
         }

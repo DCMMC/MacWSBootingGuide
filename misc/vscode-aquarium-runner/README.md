@@ -20,9 +20,9 @@ only duplicate benchmark webviews before deciding whether a new one is needed.
 This prevents repeated benchmark launches from accumulating independent
 Chromium renderers and native-AGX resource graphs.
 
-The dedicated `targetfix13` benchmark profile also uses
+The dedicated `agx-native-production1` benchmark profile also uses
 `../vscode-production-settings.json`. Copy it to
-`/tmp/macws-vscode-profile-agx-native-targetfix13/User/settings.json` inside
+`/tmp/macws-vscode-profile-agx-native-production1/User/settings.json` inside
 the macOS root before loading `com.macwsguide.vscode`. It disables VS Code
 1.130's optional AgentHost (Copilot/Claude background providers) and terminal
 process persistence for this disposable graphics benchmark profile. Neither

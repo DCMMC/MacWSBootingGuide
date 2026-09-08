@@ -12,15 +12,11 @@
         <string>0</string>
         <string>/var/mnt/rootfs</string>
         <string>/Applications/Visual Studio Code.app/Contents/MacOS/Electron</string>
-		<!-- Runtime-confirmed on 2026-08-22: the native-Metal profile published
-		     a real visible NSWindow, but both the WindowServer and macPad captures
-		     showed black client pixels while the GPU helper repeatedly reported
-		     Completed MTLCommandBuffer failed / Internal Error 00000102/103.
-		     Use Chromium's supported software-compositing mode for this 2D editor
-		     instead of declaring a geometrically valid black window ready. Keep
-		     the profile isolated; never delete or rewrite the user's normal VS
-		     Code profile. -->
-		<string>--user-data-dir=/tmp/macws-vscode-profile-software-composite1</string>
+		<!-- Keep this native-AGX profile isolated from the user's normal VS Code
+		     profile.  The packaged settings disable the stale AgentHost generation
+		     that runtime tracing tied to Chrome_IOThread's full-queue MOJO retry;
+		     graphics caches and restored webviews remain disposable. -->
+		<string>--user-data-dir=/tmp/macws-vscode-profile-agx-native-production1</string>
         <string>--extensions-dir=/tmp/macws-vscode-extensions</string>
         <string>--disable-updates</string>
         <!-- launchdchrootexec already supplies the complete chroot HOME, USER,
@@ -32,11 +28,14 @@
              starting a second full Chromium instance. -->
         <string>--force-disable-user-env</string>
         <string>--no-sandbox</string>
+        <string>--disable-gpu-sandbox</string>
         <string>--remote-debugging-port=9222</string>
         <string>--remote-allow-origins=*</string>
-        <string>--disable-gpu</string>
-        <!-- Keep Graphite off as part of the explicit software compositor
-             contract; Skia's ordinary CPU raster path remains enabled. -->
+        <string>--use-angle=metal</string>
+        <string>--ignore-gpu-blocklist</string>
+        <!-- Graphite is independent of WebGL/ANGLE. Keep it off because its
+             generated MSL is not accepted by the Ventura/iOS 16 Metal stack;
+             ANGLE's tracked macabi library remains the WebGL backend. -->
         <string>--disable-features=SkiaGraphite</string>
         <!-- Keep Chromium's production JIT scheduling.  The W^X adapter now
              reports successful RX transitions without late retries, while a
@@ -49,6 +48,12 @@
         <key>CA_VSYNC_OFF</key>
         <string>1</string>
         <key>CA_DISABLE_SWAP_ICC</key>
+        <string>1</string>
+        <key>MACWS_AGX_NATIVE</key>
+        <string>1</string>
+        <key>MACWS_AGX_REGISTER_CLASSES</key>
+        <string>1</string>
+        <key>MACWS_PIN_FALLBACK</key>
         <string>1</string>
         <key>MACWS_JIT_MPROTECT_COMPAT</key>
         <string>1</string>
@@ -69,6 +74,8 @@
              underlying statfs/fsgetpath adapters are dyld interposes and are
              therefore safe across Electron's early fork. -->
         <key>MACWS_APP_MOUNT_COMPAT</key>
+        <string>1</string>
+        <key>MACWS_CHROMIUM_COMPOSITE_OVERLAYS</key>
         <string>1</string>
     </dict>
     <key>RunAtLoad</key>

@@ -29,7 +29,7 @@ env	MACWS_ABORT_TRACE	off	diagnostic	Abort/backtrace flight recorder.
 env	MACWS_APP_EXTENSION	auto	Settings ExtensionKit child	Marks the exact ViewBridgeChrootProxy app-extension target for its identity and bounded JIT/ExtensionKit startup compatibility.
 env	MACWS_CATALOG_REGISTRATION	off	macwsworkspacectl register-settings-extensions	Production launch plists keep this unset; the catalog transaction sets it to 1 only for the short-lived stock registration of all standalone System Settings extensions.
 env	MACWS_APP_LIFECYCLE_TRACE	off	diagnostic	System Settings/Maps AppKit lifecycle boundary trace; never enable in production.
-env	MACWS_APP_MOUNT_COMPAT	auto	custom-path apps, generic Catalyst children and UIKitSystem	Launcher/job-owned scoped root-volume/statfs/fsgetpath compatibility; UIKitSystem needs the same logical-root contract while its CoreServices repository resolves Catalyst bundles.
+env	MACWS_APP_MOUNT_COMPAT	auto	Finder, custom-path apps, generic Catalyst children and UIKitSystem	Launcher/job-owned scoped root-volume/statfs/fsgetpath compatibility; Finder needs it while resolving document handlers, and UIKitSystem needs the same logical-root contract while its CoreServices repository resolves Catalyst bundles.
 env	MACWS_APP_MOUNT_COMPAT_DIAGNOSTIC	off	diagnostic	Temporarily applies the chroot mount-namespace model to one otherwise-unlisted process; never set by a production plist.
 env	MACWS_APP_MOUNT_TRACE	off	diagnostic	Logs scoped statfs, fsgetpath and CFURL volume-namespace translations.
 env	MACWS_APP_INPUT_DIAGNOSTICS	off	AppInput diagnostic	Logs AppKit hit-window and event routing without enabling AGX/JIT recorders.
@@ -50,6 +50,9 @@ env	MACWS_AGX_NATIVE	on	WindowServer,VS Code,Chrome,GlassDemo	Select the real iO
 env	MACWS_AGX_NATIVE_NON2D	off	A/B control	Broad non-2D native texture allocation experiment.
 env	MACWS_AGX_NATIVE_PLAIN	off	inverse A/B control	Variable is absent in production; absence enables the validated native-plain policy.
 env	MACWS_AGX_REGISTER_CLASSES	on	WindowServer,VS Code,Chrome,GlassDemo	Realize cross-image AGX Objective-C classes.
+env	MACWS_ANE_PROTOCOL_DIAGNOSTICS	off	AppleNeuralEngine compatibility diagnostic	Logs the real Ventura-to-iOS compile/load wire translation, replies and interface construction without changing their results.
+env	MACWS_ANE_PROTOCOL_PAUSE_SECONDS	off	standalone ANE protocol probe	Pauses the bounded probe after its runtime protocol inventory so a debugger can attach.
+env	MACWS_ANE_REPLY_PAUSE_SECONDS	off	AppleNeuralEngine compatibility diagnostic	Pauses a real translated compile/load reply by at most 30 seconds for debugger inspection; never enabled in production.
 env	MACWS_AGX_RENAMER_PATCH	off	legacy diagnostic	Superseded AIR renamer patch.
 env	MACWS_AGX_STRIP_OPEN_OPTIONS	off	A/B control	IOServiceOpen option mutation.
 env	MACWS_AGX_TEX_BYPASS_GATE	off	diagnostic scaffold	Texture gate bypass.
@@ -60,12 +63,15 @@ env	MACWS_APP_DISPLAY_SETTLE_MS	on	Terminal=750	Bounded Terminal redraw settleme
 env	MACWS_BLUR_TRACE	off	diagnostic	Blur pipeline trace.
 env	MACWS_BLUR_XPC	off	diagnostic experiment	Blur texture XPC experiment.
 env	MACWS_CHROMIUM_COMPOSITE_OVERLAYS	on	VS Code,Chrome	Mark Chromium's real AggregatedRenderPass video_capture_enabled field before native CALayer processing so its normal primary-plane fallback remains in the AGX scanout captured by MacWS/VNC.
+env	MACWS_BUFFER_SUBALLOC_DIAG	off	IOGPU buffer diagnostic	Installs the exact IOGPUMetalBuffer primary-buffer initializer observer and records real suballocation metadata without changing the returned buffer.
 env	MACWS_CHROOT_HOST_ROOT	auto	launchdchrootexec descendants	Canonical host path captured before chroot and used to translate kernel file-ID paths into the process-visible root namespace.
 env	MACWS_COEXIST_PACE_US	off	environment override	Production uses the documented /tmp/macws_coexist_pace_us file instead.
 env	MACWS_DESKTOPSERVICES_DIAG	off	diagnostic	Exact-UUID Finder volume-map lookup and SamePhysicalDevice boundary recorder; observation only.
 env	MACWS_DISPLAY_DIAGNOSTICS	off	macwsdisplayd diagnostic	Enables per-frame throughput and final-composite receive logging; production keeps it unset to avoid synchronous stderr overhead.
 env	MACWS_FINAL_COMPOSITE_DIRECT	off	final-composite A/B rollback	Bypasses the production four-slot same-queue snapshot ring and republishes WindowServer's mutable display target directly; diagnostic only because producer and Host can race on the same IOSurface.
 env	MACWS_DIAG_SKIP_BIND_UPDATE	off	diagnostic	Reproduces historical texture bind failure.
+env	MACWS_DISABLE_ANE_PROTOCOL_COMPAT	off	AppleNeuralEngine A/B control	Disables the Ventura-to-iOS ANE XPC interface and model-wire adapters so the stock failure can be compared.
+env	MACWS_DISABLE_METALFX_ANE_BUFFER_COMPAT	off	MetalFX ANE A/B control	Disables only the MetalFX MPSGraph IOSurface-backed tensor-buffer translation and preserves the original initializer.
 env	MACWS_DISP_COPY	off	diagnostic experiment	Legacy display CPU-copy bridge.
 env	MACWS_DISP_FILL_LOOP	off	diagnostic experiment	Legacy continuous gray-fill probe.
 env	MACWS_DUMP_BACKING	off	diagnostic	Texture backing dump.
@@ -76,6 +82,8 @@ env	MACWS_NATIVE_PANEL_HOLD	off	standalone native-panel probe	Stops the diagnost
 env	MACWS_NATIVE_PANEL_INPROCESS	off	standalone native-panel probe	Sets NSUseRemoteSavePanel=NO and exercises the public NSOpenPanel factory.
 env	MACWS_NATIVE_PANEL_INVENTORY	off	standalone native-panel probe	Prints the realized AppKit OpenPanel/SavePanel runtime classes and methods.
 env	MACWS_NATIVE_PANEL_LOCAL	off	standalone native-panel probe	Diagnostic-only direct NSLocalOpenPanel construction for comparing the public factory path.
+env	MACWS_NATIVE_IOCONNECT_DIAG	off	standalone MetalFX temporal probe	Dumps the unmodified native IOGPU queue-submit input entries at the exact IOConnect boundary.
+env	MACWS_NATIVE_KCMD_DIAG	off	standalone MetalFX temporal probe	Observes the real native command-buffer commit selector and command bytes without changing submission.
 env	MACWS_GLASS_BLUR_AB	off	diagnostic	GlassDemo blur A/B hook.
 env	MACWS_GOT_RAW_AUTH	off	diagnostic	Raw authenticated GOT inspection.
 env	MACWS_GOT_SKIP_AUTH	off	diagnostic	Skips authenticated GOT repair entries.
@@ -126,7 +134,7 @@ env	MACWS_STEAM_SHM_DIAGNOSTICS	off	Steam diagnostic	Logs bounded Steam shared-m
 env	MACWS_STEAM_THREAD_DIAGNOSTICS	off	Steam diagnostic	Logs Steam Helper pthread creation results and caller chains.
 env	MACWS_STEAM_UE4_DIAGNOSTICS	off	Stray diagnostic	Installs UUID-bound, read-only UE4 fatal/config snapshots only for an explicitly diagnosed Stray runtime process.
 env	MACWS_STRAY_AGX_COMPAT	off	Stray game	Enables the runtime-confirmed exact Stray subtype-1/subtype-3 producer-version AGX ABI adapters and exact-manifest MetalFX macabi function routing without synchronous per-submit diagnostics; the Steam launcher injects it only into Stray-Mac-Shipping.
-env	MACWS_STRAY_TARGET_FPS	54	Stray launched by Steam	Publishes the calibrated synthetic-completion target in the versioned render-activity record; 54 Hz yields about 50 completed UE frames while preventing pointer movement from switching the full game desktop to 120 Hz.
+env	MACWS_STRAY_TARGET_FPS	on	Stray launched by Steam	Publishes the calibrated synthetic-completion target in the versioned render-activity record; production value 54 Hz yields about 50 completed UE frames while preventing pointer movement from switching the full game desktop to 120 Hz.
 env	MACWS_STRAY_DISABLE_DISPLAY_SYNC	on	Stray launched by Steam	Exact-process presentation policy: sets the public CAMetalLayer displaySyncEnabled property to NO before calling the original nextDrawable; selected by thermally-valid actual-gameplay A/B, never fabricates a drawable or bypasses validation.
 env	MACWS_CFPREFERENCES_CLIENT	transient	macos_gui defaults probe	Selects the narrow headless CFPreferences client path: installs only the private XPC name mapping and skips GUI/Metal/input hook initialization for the bounded defaults persistence probe.
 env	MACWS_STEAM_VA_DIAGNOSTICS	off	Steam diagnostic	Records only Steam's GiB-scale virtual-memory reservations.
@@ -136,17 +144,39 @@ env	SDL_JOYSTICK_IOKIT	off	Steam client UI	Disables SDL's incompatible direct IO
 env	SDL_JOYSTICK_MFI	off	Steam client UI	Disables SDL MFi joystick discovery in the chroot.
 env	MACWS_MACH_MSG_TRACE	off	diagnostic	Mach-message trace.
 env	MACWS_MACOS_SYSTEM_POLICY_COMPAT	on	VS Code,Chrome	Narrow Chromium system-policy compatibility.
+env	MACWS_METALFX_DUMP_BUFFER_IOSURFACE	off	standalone MetalFX temporal probe	Compares the real iosurface behavior of ordinary and IOSurface-backed MTLBuffers.
+env	MACWS_METALFX_DUMP_MPSGRAPH_METHODS	off	standalone MetalFX temporal probe	Prints the realized MPSGraphTensorData initializer and IOSurface-related method inventory.
+env	MACWS_METALFX_ENCODER_DIAG	off	standalone MetalFX temporal probe	Enables the exact-process MetalFX encoder observer only when the executable is metalfx_temporal_probe.
+env	MACWS_METALFX_MPSGRAPH_DIAG	off	standalone MetalFX temporal probe	Prints MPSGraph run methods and records real graph execution calls without changing their results.
+env	MACWS_METALFX_PROBE_ENCODE	off	standalone MetalFX temporal probe	Continues scaler construction through one or more real temporal-scaler encode and completion cycles.
+env	MACWS_METALFX_PROBE_FRAMES	off	standalone MetalFX temporal probe	Sets the bounded temporal encode count, clamped to 1 through 256 frames.
+env	MACWS_METALFX_PROBE_NEW_QUEUE_EACH_FRAME	off	standalone MetalFX temporal probe	Creates a real command queue per probe frame instead of reusing one queue for a queue-lifetime A/B.
+env	MACWS_METALFX_PROBE_PAUSE_SECONDS	off	standalone MetalFX temporal probe	Pauses immediately before real temporal-scaler construction for debugger attachment.
+env	MACWS_METALFX_PROBE_RESET	off	standalone MetalFX temporal probe	Overrides the real MTLFXTemporalScaler reset property for a bounded encode.
+env	MACWS_METALFX_PROBE_RESET_INTERVAL	off	standalone MetalFX temporal probe	Resets the temporal scaler at a bounded frame interval up to 256 during a multi-frame replay.
+env	MACWS_METALFX_STRAY_PROFILE	off	standalone MetalFX temporal probe	Selects the captured Stray formats, texture usage, storage and depth-reversal inputs in the standalone replay.
+env	MACWS_METALFX_SYNC_DIAG	off	standalone MetalFX temporal probe	Observes the real AGX command-buffer synchronization notification callback without fabricating completion.
 env	MACWS_METAL_PROBE_DUMP_EVENT_IMP	off	standalone probe	Dumps the Metal event implementation pointer.
 env	MACWS_METAL_PROBE_DUMP_FUNCTIONS	off	standalone probe	Prints the exact function inventory exposed by a probe Metal library; never enabled in production.
+env	MACWS_METAL_PROBE_DUMP_FUNCTION_REQUIREMENTS	off	standalone probe	Prints the private requirements metadata of each real function in the selected Metal library.
 env	MACWS_METAL_PROBE_DUMP_FUNCTION_METHODS	off	standalone probe	Prints specialization/library-related Objective-C methods on probe MTLFunction objects.
+env	MACWS_METAL_PROBE_DUMP_LIBRARY_ALL_METHODS	off	standalone probe	Prints the complete Objective-C metaclass method inventory for the selected real MTLLibrary.
 env	MACWS_METAL_PROBE_DUMP_LIBRARY_METHODS	off	standalone probe	Prints function-related Objective-C methods on a loaded probe MTLLibrary object.
 env	MACWS_METAL_PROBE_COLOR0_FORMAT	off	standalone probe	Overrides color attachment 0's pixel format in the bounded render-pipeline replay.
+env	MACWS_METAL_PROBE_COLOR_FORMATS	off	standalone probe	Supplies the comma-separated color attachment format list for the bounded render-pipeline replay.
+env	MACWS_METAL_PROBE_COMPUTE_FUNCTION	off	standalone probe	Selects a named compute function and creates its real compute pipeline without retrying or substituting it.
 env	MACWS_METAL_PROBE_DEPTH_FORMAT	off	standalone probe	Overrides the depth attachment pixel format in the bounded render-pipeline replay.
+env	MACWS_METAL_PROBE_EVENT_QUEUES	off	standalone probe	Selects the bounded shared-event multi-queue sequence used to distinguish queue translation from application workload.
 env	MACWS_METAL_PROBE_FRAGMENT_FUNCTION	off	standalone probe	Selects the exact fragment function for the bounded render-pipeline replay.
 env	MACWS_METAL_PROBE_FRAGMENT_LIBRARY_PATH	off	standalone probe	Loads the fragment function from an explicit second metallib during a bounded replay.
+env	MACWS_METAL_PROBE_HALF_SATURATION_DISPATCH	off	standalone probe	Dispatches the selected compute pipeline against the bounded half-float saturation witness buffers.
+env	MACWS_METAL_PROBE_LIBRARY_DATA	off	standalone probe	Loads the selected metallib through newLibraryWithData:error: instead of its URL API for an exact loader A/B.
 env	MACWS_METAL_PROBE_PIPELINE_PAUSE_SECONDS	off	standalone probe	Pauses immediately before pipeline construction for debugger attachment.
 env	MACWS_METAL_PROBE_PIPELINE_REPEAT	off	standalone probe	Repeats bounded render-pipeline creation the requested number of times.
 env	MACWS_METAL_PROBE_SAMPLE_COUNT	off	standalone probe	Overrides render-pipeline raster sample count.
+env	MACWS_METAL_PROBE_SERIALIZE_LIBRARY_PATH	off	standalone probe	Serializes the real loaded MTLLibrary to the explicitly requested diagnostic path and reports the stock error.
+env	MACWS_METAL_PROBE_SHADOW_FORMAT	off	standalone probe	Selects rg16float or rg32float output for the bounded captured Stray shadow compute witness.
+env	MACWS_METAL_PROBE_STRAY_SHADOW_DISPATCH	off	standalone probe	Dispatches only the exact captured Stray shadow compute function through its bounded input/output witness.
 env	MACWS_METAL_PROBE_STENCIL_FORMAT	off	standalone probe	Overrides the stencil attachment pixel format in the bounded render-pipeline replay.
 env	MACWS_METAL_PROBE_VERTEX_ATTRIBUTES	off	standalone probe	Supplies the explicit vertex-attribute descriptor list for a captured pipeline replay.
 env	MACWS_METAL_PROBE_VERTEX_FUNCTION	off	standalone probe	Selects the exact vertex function and enables bounded render-pipeline replay.
@@ -181,6 +211,7 @@ env	MACWS_PROBE_REGISTER_DETAIL	off	standalone ExtensionRecord probe	Records the
 env	MACWS_PROBE_REGISTER_ORIGINAL	off	standalone ExtensionRecord probe	Calls the stock private plugin registration entry point for an explicit A/B.
 env	MACWS_PROBE_STOP_BEFORE_REGISTER	off	standalone ExtensionRecord probe	Stops immediately before the explicit private registration call for LLDB.
 env	MACWS_PROBE_SUBMIT	off	standalone OSLaunchdJob probe	Submits the bounded private RunningBoard launchd-job diagnostic workload.
+env	MACWS_PREVIEW_CI_DIAGNOSTICS	off	Preview diagnostic	Logs the exact ImageKit CIImage extent, source-image cache decision and render duration without changing the render result.
 env	MACWS_RESTORE_OUTBUMP	off	A/B control	Restores historical selector output-count mutation.
 env	MACWS_RUNTIME_DIAGNOSTICS	off	diagnostic master	Enables high-overhead flight recorders.
 env	MACWS_SUBMIT_FAST_RING	off	diagnostic	Fixed-memory AGX submit recorder.
@@ -220,20 +251,22 @@ cli	--no-watchdog	off	safety invariant	Removed option; iPad thermal, memory-pres
 setting	chat.agentHost.enabled	off	dedicated VS Code benchmark profile	Avoid optional Copilot/Claude AgentHost processes unrelated to native-AGX WebGL measurement.
 setting	terminal.integrated.enablePersistentSessions	off	dedicated VS Code benchmark profile	Avoid reviving stale benchmark-profile PTYs across isolated runs.
 artifact	/var/jb/usr/macOS/gui-launchd/com.macwsguide.vscode.plist	on	VS Code production launcher	Packaged outside auto-scanned LaunchDaemons; loaded explicitly only after the GUI is ready.
-artifact	/var/jb/usr/macOS/share/vscode	on	VS Code production assets	Authoritative targetfix13 settings and Aquarium extension copied into the isolated benchmark profile.
+artifact	/var/jb/usr/macOS/share/vscode	on	VS Code production assets	Authoritative agx-native-production1 settings and Aquarium extension copied into the exact profile selected by the launch plist.
 artifact	/usr/local/share/macws/angle/angle-default-1ba8ec3-macabi.metallib	on	VS Code ANGLE Metal compatibility	Exact Chromium 148.0.7778.280 ANGLE 1ba8ec3 default shader source compiled by the real iOS MTLCompilerService through the macabi target adapter; selected only for the byte-exact embedded macOS library.
 artifact	/usr/local/share/macws/angle/angle-default-5d4df51-macabi.metallib	on	Steam ANGLE Metal compatibility	Exact Steam Chromium 126 ANGLE 5d4df51 default shader source compiled by the real iOS MTLCompilerService for macabi; selected only for the 368459-byte embedded container with FNV-1a d3e757cc4a31c3c0.
-state	/tmp/macws-vscode-profile-agx-native-targetfix13	on	dedicated VS Code benchmark profile	Project-owned profile; normal user profile is untouched and Chromium caches persist across warm starts.
+state	/tmp/macws-vscode-profile-agx-native-production1	on	dedicated VS Code benchmark profile	Project-owned native-AGX launch profile; production preflight verifies its settings and Metal flags, forbids the exact --disable-gpu argument, leaves the normal user profile untouched, and preserves Chromium caches across warm starts.
 state	/var/folders/zz/zyxvpxvq6csfxvn_n0000000000000/C/com.microsoft.VSCode.helper/com.apple.metal/.macws-source-target-schema	on	VS Code Metal library cache	Cold-start schema witness value macws-macabi-source-v1; a missing/mismatched value removes only compiler-31001 libraries.list/data so pure-iOS MTLBs cannot survive the macabi source-target migration.
 flag	/private/tmp/macws_agx_dump_methods	off	diagnostic	AGX Objective-C method dump.
 flag	/private/tmp/macws_agx_trace_reserve	off	diagnostic	AGX reserve trace.
-flag	/private/tmp/macws_mtl_data_diag	off	diagnostic	Narrow read-only newLibraryWithData:error observer; dumps the first eight precompiled Metal library blobs with exact caller image+offset and never enables the private cache hooks.
+flag	/private/tmp/macws_mtl_data_diag	off	diagnostic	Narrow read-only newLibraryWithData:error: and newLibraryWithURL:error: observers; dumps only the first eight Data blobs, records URL results/errors and exact caller image+offset, and never enables the private cache hooks.
+flag	/tmp/macws_preview_ci_diagnostics	off	Preview diagnostic	Logs the exact ImageKit CIImage extent, source-image cache decision and render duration without changing the render result.
 flag	/private/tmp/macws_mtl_library_diag	off	diagnostic	Metal source/options/result trace plus exact-UUID read-only cache-hit and pre-validation compiled-blob capture; dumps /private/tmp/macws_cached_library_*.bin and macws_compiled_library_*.bin and never changes compiler/loader results.
 flag	/private/tmp/macws_pipeline_ab_diag	off	diagnostic	Runs the exact Stray depth16 pipeline-options A/B and logs both native results; production preflight removes it.
 flag	/private/tmp/macws_tile_descriptor_diag	off	diagnostic	Tile descriptor and completion observer.
 flag	/private/tmp/macws_texture_stride_diag	off	diagnostic	Logs the exact native texture descriptor, IOSurface and selected stride at the allocator boundary without mutating them.
 flag	/tmp/macws_allow_unsafe_pf550_capture	off	unsafe diagnostic	Cross-queue compressed-scanout capture.
 flag	/tmp/macws_cancel_completion	on	WindowServer	Required virtual-display cancelled-swap completion adapter.
+flag	/tmp/macws_catalyst_direct_drawable_active	transient	Stray performance harness	Activates direct drawable publication only after the harness runtime-confirms real gameplay; the renderer latches the marker for that process.
 flag	/tmp/macws_capture_final	transient	VNC startup	One-shot validated post-client frame request; removed after acknowledgement.
 flag	/tmp/macws_command_error_diag	off	diagnostic	Metal command-buffer error introspection.
 flag	/tmp/macws_cvdl_trace	off	diagnostic	CVDisplayLink callback trace.
@@ -262,6 +295,7 @@ flag	/tmp/macws_stray_disable_display_sync	off	Stray A/B diagnostic	Marker-only 
 flag	/tmp/macws_stray_drawable_timing	off	Stray diagnostic	Times original nextDrawable, drawable presentation and command-buffer completion; installs completion handlers and is excluded from production FPS evidence.
 flag	/tmp/macws_stray_no_overlay_injection	off	Stray A/B diagnostic	Omits only Valve's requested gameoverlayrenderer from the verified Stray child environment to measure overlay cost; intentionally invalidates the required Steam FPS HUD.
 flag	/tmp/macws_stray_present_trace	transient	Stray benchmark	Low-overhead exact-process presentation counter; one atomic increment per frame and one log record per 120 frames, removed after the bounded run.
+flag	/tmp/macws_stray_forward_nil_texture	off	Stray A/B diagnostic	Forwards a captured nil texture binding to the stock encoder for comparison instead of retaining the normal nil-binding guard.
 flag	/tmp/macws_stray_wait_trace_capture	off	Stray diagnostic	Temporarily captures bounded native callers around the original waitUntilCompleted/surface-lock path without changing results.
 flag	/tmp/macws_stray_wait_trace_install	off	Stray diagnostic	Installs exact-process preserving Metal wait/surface-lock instrumentation for a bounded diagnosis; capture remains separately gated.
 flag	/tmp/macws_probe_small_pf550	off	diagnostic	Small compressed-texture probe.
@@ -285,6 +319,7 @@ flag	/tmp/macws_stray_render_trace	off	Stray diagnostic	Installs bounded encoder
 flag	/tmp/macws_stray_rt_capture_now	transient	Stray diagnostic	Requests one bounded GPU-blit capture of dynamically discovered intermediate render targets and buffers after a verified scene; the pipeline removes it after acknowledgement or cleanup.
 flag	/tmp/macws_submit_diag	off	diagnostic	Submit translation trace and raw dumps.
 flag	/tmp/macws_submit_fast_ring	off	diagnostic	Fixed-memory submit flight recorder.
+flag	/tmp/macws_submit_forward_progress_bridge	off	Stray A/B diagnostic	Enables the exact no-output AGX submit forward-progress bridge during the bounded performance harness; never enabled by production startup.
 flag	/tmp/macws_submit_ring	off	diagnostic	Heap/mutex submit flight recorder.
 flag	/tmp/macws_trace_small_pf550_bind	off	diagnostic	Small compressed bind trace.
 flag	/tmp/macws_vnc_native_all	off	redundant override	Production owns this setting through OSXvnc environment.

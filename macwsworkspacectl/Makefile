@@ -12,7 +12,7 @@ TOOL_NAME = macwsworkspacectl
 
 macwsworkspacectl_FILES = main.m
 macwsworkspacectl_CFLAGS = -fobjc-arc -Wall -Wextra
-macwsworkspacectl_FRAMEWORKS = AppKit ApplicationServices Foundation
+macwsworkspacectl_FRAMEWORKS = AppKit ApplicationServices Foundation QuickLookThumbnailing
 macwsworkspacectl_CODESIGN_FLAGS = -S../layout/usr/macOS/bin/entitlements.plist
 macwsworkspacectl_INSTALL_PATH = /usr/macOS/bin
 

@@ -1,10 +1,13 @@
 @import CoreServices;
 @import CoreGraphics;
+@import CoreImage;
 @import CydiaSubstrate;
 @import Darwin;
 @import Foundation;
 @import MachO;
+#import <ImageIO/ImageIO.h>
 #import <IOKit/IOKitLib.h>
+#import <CommonCrypto/CommonDigest.h>
 #import <dispatch/dispatch.h>
 #import <dlfcn.h>
 #import <xpc/xpc.h>
@@ -38,11 +41,18 @@
 // their declarations. Keep the declarations local instead of building this
 // iOS-targeted interposer against macOS Security headers.
 typedef struct __SecRequirement *SecRequirementRef;
+typedef struct __SecStaticCode *SecStaticCodeRef;
 typedef uint32_t SecCSFlags;
 extern OSStatus SecRequirementCreateWithString(
     CFStringRef text, SecCSFlags flags, SecRequirementRef *requirement);
 extern OSStatus SecRequirementCreateWithData(
     CFDataRef data, SecCSFlags flags, SecRequirementRef *requirement);
+extern OSStatus SecStaticCodeCreateWithPath(
+    CFURLRef path, SecCSFlags flags, SecStaticCodeRef *staticCode);
+extern OSStatus SecCodeCopySigningInformation(
+    SecStaticCodeRef code, SecCSFlags flags, CFDictionaryRef *information);
+extern const CFStringRef kSecCodeInfoEntitlementsDict;
+extern const CFStringRef kSecCodeInfoCMS;
 extern int proc_pidpath(int pid, void *buffer, uint32_t buffersize);
 extern CFTypeID CGImageGetTypeID(void);
 
@@ -51,8 +61,11 @@ static void macws_install_lsd_session_store_isolation(void);
 static const char *macws_private_bootstrap_service_name(const char *name);
 static BOOL macws_macho_uuid_matches(const struct mach_header_64 *header,
                                      const uint8_t expected[16]);
+static void macws_install_pkd_signed_entitlements_adapter(void);
 static void macws_schedule_maps_location_capability_adapter(void);
 static void macws_schedule_settings_symbol_raster_compatibility(void);
+static BOOL macws_install_preview_coreimage_renderer_adapter(void);
+static void macws_schedule_preview_coreimage_renderer_adapter(void);
 
 // Steam's arm64 updater asks NSURL for
 // NSURLVolumeSupportsCaseSensitiveNamesKey and deliberately refuses to start
@@ -799,14 +812,28 @@ static void macws_jit_ensure_exec_barrier_handler(void) {
 static void macws_jit_set_all_permissions(int protection) {
     unsigned count = atomic_load_explicit(&g_macws_jit_range_count,
                                            memory_order_acquire);
+    vm_prot_t vmProtection = VM_PROT_NONE;
+    if (protection & PROT_READ) vmProtection |= VM_PROT_READ;
+    if (protection & PROT_WRITE) vmProtection |= VM_PROT_WRITE;
+    if (protection & PROT_EXEC) vmProtection |= VM_PROT_EXECUTE;
     for (unsigned i = 0; i < count; i++) {
         void *base = (void *)g_macws_jit_ranges[i].base;
         size_t size = g_macws_jit_ranges[i].size;
-        if (mprotect(base, size, protection) != 0) {
+        // Runtime-confirmed by `/tmp/vscode-exthost-timeout.sample`: the
+        // extension host entered this helper while holding
+        // g_macws_jit_state_lock, the dylib-local mprotect call rebound to
+        // mprotect_new, and its overlap lookup tried to acquire that same
+        // mutex forever. vm_protect is the kernel operation already used by
+        // the page-granular restore path and cannot recurse through the POSIX
+        // interposer.
+        kern_return_t kr = vm_protect(
+            mach_task_self(), (vm_address_t)(uintptr_t)base,
+            (vm_size_t)size, false, vmProtection);
+        if (kr != KERN_SUCCESS) {
             fprintf(stderr,
                 "#### JIT-MPROTECT flip FAIL range=%u base=%p size=%#zx "
-                "prot=%#x errno=%d\n",
-                i, base, size, protection, errno);
+                "prot=%#x kr=%#x\n",
+                i, base, size, protection, kr);
         }
     }
     if (macws_jit_trace_enabled()) {
@@ -1261,8 +1288,10 @@ static IOReturn MacwsIOMobileFramebufferSwapEnd_new(void *framebuffer);
 #ifndef CGBASE_H_
 typedef id IOSurfaceRef;
 #endif
-extern IOSurfaceRef IOSurfaceCreate(NSDictionary* properties);
+extern IOSurfaceRef IOSurfaceCreate(CFDictionaryRef properties);
 extern IOSurfaceRef IOSurfaceLookup(uint32_t surface_id);
+extern const CFStringRef kIOSurfaceWidth;
+extern const CFStringRef kIOSurfaceHeight;
 extern CFDictionaryRef IOSurfaceCopyAllValues(IOSurfaceRef surface);
 extern uint32_t IOSurfaceGetID(IOSurfaceRef surface);
 extern size_t IOSurfaceGetWidth(IOSurfaceRef surface);
@@ -1733,8 +1762,9 @@ static void macws_repair_got_via_symtab(const struct mach_header_64 *header,
     }
     BOOL diagnostics = macws_runtime_diagnostics_enabled();
     const char *program = getprogname();
-    BOOL hiservicesMain = program &&
-        strcmp(program, "com.apple.hiservices-xpcservice") == 0 &&
+    BOOL serviceMainNeedsXPCAdapter = program &&
+        (strcmp(program, "com.apple.hiservices-xpcservice") == 0 ||
+         strcmp(program, "QuickLookSatellite") == 0) &&
         header == (const struct mach_header_64 *)_dyld_get_image_header(0);
     int64_t linkedit_runtime_base = (int64_t)linkedit_vmaddr + slide - (int64_t)linkedit_fileoff;
     const struct nlist_64 *symtab    = (const struct nlist_64 *)(linkedit_runtime_base + st->symoff);
@@ -1835,7 +1865,8 @@ static void macws_repair_got_via_symtab(const struct mach_header_64 *header,
                 // symbolically identified main-image slot to the same real
                 // listener adapter; the generic auth-GOT signer below uses
                 // the exact slot-address discriminator expected by braa.
-                if (hiservicesMain && !strcmp(lookup, "xpc_main")) {
+                if (serviceMainNeedsXPCAdapter &&
+                    !strcmp(lookup, "xpc_main")) {
                     resolved = (void *)macws_xpc_main;
                     force_override = 1;
                 }
@@ -3579,6 +3610,343 @@ static void macws_schedule_settings_symbol_raster_compatibility(void) {
     });
 }
 
+// Preview's ImageKit renderer normally serializes `_resetScaledCIImage` with
+// `updateContentForLayer:` by synchronizing on the current scaled CIImage.
+// That ownership is intentional and must not be bypassed. On this mixed
+// Ventura/iPadOS runtime, however, the context selected by ImageKit is the
+// legacy software OpenGL renderer. Runtime sample
+// `/tmp/preview-image-after-small-zoom.sample` captured one complete 3-second
+// interval with the main thread waiting in `_resetScaledCIImage ->
+// objc_sync_enter`, while the owner spent the same 2298/2298 samples in
+// `CIContext render:toIOSurface: -> CI::GLContext::render_root_node ->
+// glDrawArrays -> glvmInterpretFPTransformFourInner`. Even a one-percent zoom
+// therefore makes the window appear hung for minutes.
+//
+// Keep ImageKit's real CIImage extent, destination IOSurface and lock lifecycle
+// intact. For this one ImageKit call site, decode Preview's current image with
+// ImageIO and draw the requested tile directly with CoreGraphics. Runtime A/B
+// on IMG_0120.png measured 1.2--87.6 ms per initial tile and 3.5--42.8 ms per
+// zoomed tile; the same zoom-then-pan sequence remained responsive. The source
+// decode is bounded to 4096 pixels so arbitrary zoom levels cannot make the
+// compatibility cache grow without limit. Unsupported surfaces and non-image
+// documents continue through ImageKit's original renderer.
+typedef void (*MacWSCIContextRenderToSurfaceFn)(
+    id, SEL, id, IOSurfaceRef, CGRect, CGColorSpaceRef);
+static MacWSCIContextRenderToSurfaceFn
+    g_macws_preview_original_ci_render_to_surface;
+static pthread_mutex_t g_macws_preview_source_image_lock =
+    PTHREAD_MUTEX_INITIALIZER;
+static NSString *g_macws_preview_source_image_path;
+static CGImageRef g_macws_preview_source_image;
+static size_t g_macws_preview_source_image_max_pixel;
+
+static BOOL macws_process_is_preview(void) {
+    const char *program = getprogname();
+    if (program && strcmp(program, "Preview") == 0) return YES;
+    char executable[PATH_MAX] = {0};
+    if (proc_pidpath(getpid(), executable, sizeof(executable)) <= 0)
+        return NO;
+    return strcmp(executable,
+                  "/System/Applications/Preview.app/Contents/MacOS/Preview")
+        == 0;
+}
+
+static BOOL macws_preview_ci_diagnostics_enabled(void) {
+    return getenv("MACWS_PREVIEW_CI_DIAGNOSTICS") != NULL ||
+        access("/tmp/macws_preview_ci_diagnostics", F_OK) == 0;
+}
+
+static NSURL *macws_preview_current_document_url(void) {
+    Class controllerClass = objc_getClass("NSDocumentController");
+    SEL sharedSelector = sel_registerName("sharedDocumentController");
+    SEL currentSelector = sel_registerName("currentDocument");
+    SEL documentsSelector = sel_registerName("documents");
+    SEL fileURLSelector = sel_registerName("fileURL");
+    if (!controllerClass ||
+        ![controllerClass respondsToSelector:sharedSelector]) return nil;
+    id controller = ((id (*)(id, SEL))objc_msgSend)(
+        (id)controllerClass, sharedSelector);
+    id document = controller && [controller respondsToSelector:currentSelector]
+        ? ((id (*)(id, SEL))objc_msgSend)(controller, currentSelector) : nil;
+    // Preview can schedule its first ImageKit tile just before it promotes the
+    // opening document to `currentDocument`. `documents` is already populated
+    // at that boundary. Use its sole/last document so that first tile does not
+    // fall back to the minutes-long legacy OpenGL renderer.
+    if (!document && controller &&
+        [controller respondsToSelector:documentsSelector]) {
+        id documents = ((id (*)(id, SEL))objc_msgSend)(
+            controller, documentsSelector);
+        if ([documents respondsToSelector:@selector(lastObject)])
+            document = [documents lastObject];
+    }
+    id url = document && [document respondsToSelector:fileURLSelector]
+        ? ((id (*)(id, SEL))objc_msgSend)(document, fileURLSelector) : nil;
+    return [url isKindOfClass:[NSURL class]] && [url isFileURL] ? url : nil;
+}
+
+static CGImageRef macws_preview_copy_current_source_image(
+        size_t requestedMaxPixel) {
+    NSURL *url = macws_preview_current_document_url();
+    NSString *path = url.path.stringByStandardizingPath;
+    if (!path.length) return NULL;
+    if (requestedMaxPixel < 1) requestedMaxPixel = 1;
+    // Keep one decoded source bounded even when Preview is zoomed far beyond
+    // the source resolution. ImageKit continues to tile the destination, and
+    // a 4096-pixel source is at most 64 MiB for an ordinary four-channel
+    // decode instead of scaling memory with an arbitrary zoom factor.
+    if (requestedMaxPixel > 4096) requestedMaxPixel = 4096;
+
+    pthread_mutex_lock(&g_macws_preview_source_image_lock);
+    if (!g_macws_preview_source_image ||
+        ![g_macws_preview_source_image_path isEqualToString:path] ||
+        g_macws_preview_source_image_max_pixel < requestedMaxPixel) {
+        CGImageSourceRef source = CGImageSourceCreateWithURL(
+            (CFURLRef)url, NULL);
+        NSDictionary *properties = source
+            ? (NSDictionary *)CGImageSourceCopyPropertiesAtIndex(
+                source, 0, NULL) : nil;
+        size_t sourceWidth = [properties[(id)kCGImagePropertyPixelWidth]
+            unsignedLongLongValue];
+        size_t sourceHeight = [properties[(id)kCGImagePropertyPixelHeight]
+            unsignedLongLongValue];
+        size_t sourceMaxPixel = MAX(sourceWidth, sourceHeight);
+        CGImageRef decoded = NULL;
+        if (source && sourceMaxPixel > 0 && sourceMaxPixel <= 4096) {
+            NSDictionary *options = @{
+                (id)kCGImageSourceShouldCacheImmediately: @YES
+            };
+            decoded = CGImageSourceCreateImageAtIndex(
+                source, 0, (CFDictionaryRef)options);
+        } else if (source) {
+            NSDictionary *options = @{
+                (id)kCGImageSourceCreateThumbnailFromImageAlways: @YES,
+                (id)kCGImageSourceCreateThumbnailWithTransform: @YES,
+                (id)kCGImageSourceThumbnailMaxPixelSize: @4096,
+                (id)kCGImageSourceShouldCacheImmediately: @YES
+            };
+            decoded = CGImageSourceCreateThumbnailAtIndex(
+                source, 0, (CFDictionaryRef)options);
+        }
+        [properties release];
+        if (source) CFRelease(source);
+        if (decoded) {
+            if (g_macws_preview_source_image)
+                CGImageRelease(g_macws_preview_source_image);
+            [g_macws_preview_source_image_path release];
+            g_macws_preview_source_image_path = [path copy];
+            g_macws_preview_source_image = decoded;
+            // Either the complete source is at most 4096 pixels or the cached
+            // thumbnail is exactly bounded there. No later zoom below the cap
+            // needs to decode the document again.
+            g_macws_preview_source_image_max_pixel = 4096;
+        }
+    }
+    CGImageRef result = g_macws_preview_source_image
+        ? CGImageRetain(g_macws_preview_source_image) : NULL;
+    pthread_mutex_unlock(&g_macws_preview_source_image_lock);
+    return result;
+}
+
+static BOOL macws_preview_render_coregraphics_bitmap(
+        IOSurfaceRef surface, CGRect imageExtent) {
+    if (!surface || CGRectIsEmpty(imageExtent) ||
+        !isfinite(imageExtent.origin.x) ||
+        !isfinite(imageExtent.origin.y) ||
+        !isfinite(imageExtent.size.width) ||
+        !isfinite(imageExtent.size.height) ||
+        IOSurfaceGetPixelFormat(surface) != UINT32_C(0x52476841) ||
+        IOSurfaceGetBytesPerElement(surface) != 8)
+        return NO;
+
+    size_t requestedMaxPixel = (size_t)ceil(fmax(
+        imageExtent.size.width, imageExtent.size.height));
+    CGImageRef sourceImage = macws_preview_copy_current_source_image(
+        requestedMaxPixel);
+    if (!sourceImage) return NO;
+    size_t width = IOSurfaceGetWidth(surface);
+    size_t height = IOSurfaceGetHeight(surface);
+    size_t rowBytes = IOSurfaceGetBytesPerRow(surface);
+    uint32_t seed = 0;
+    int lockResult = IOSurfaceLock(surface, 0, &seed);
+    void *base = lockResult == 0
+        ? IOSurfaceGetBaseAddress(surface) : NULL;
+    CGColorSpaceRef colorSpace = CGColorSpaceCreateWithName(
+        kCGColorSpaceExtendedLinearSRGB);
+    CGBitmapInfo bitmapInfo = kCGBitmapByteOrder16Little |
+        kCGImageAlphaPremultipliedLast | kCGBitmapFloatComponents;
+    CGContextRef bitmap = base && width && height && rowBytes && colorSpace
+        ? CGBitmapContextCreate(base, width, height, 16, rowBytes,
+                                colorSpace, bitmapInfo)
+        : NULL;
+    if (bitmap) {
+        CGContextSetBlendMode(bitmap, kCGBlendModeCopy);
+        CGContextSetInterpolationQuality(bitmap, kCGInterpolationHigh);
+        CGContextClearRect(bitmap, CGRectMake(0, 0, width, height));
+        CGContextDrawImage(bitmap, imageExtent, sourceImage);
+        CGContextFlush(bitmap);
+        CGContextRelease(bitmap);
+    }
+    if (colorSpace) CGColorSpaceRelease(colorSpace);
+    if (lockResult == 0) IOSurfaceUnlock(surface, 0, &seed);
+    CGImageRelease(sourceImage);
+    return bitmap != NULL;
+}
+
+static void macws_preview_ci_render_to_surface(
+        id context, SEL command, id image, IOSurfaceRef surface,
+        CGRect bounds, CGColorSpaceRef colorSpace) {
+    MacWSCIContextRenderToSurfaceFn original =
+        g_macws_preview_original_ci_render_to_surface;
+    if (!original) return;
+
+    Dl_info caller = {0};
+    void *returnAddress = __builtin_return_address(0);
+    BOOL imageKitCaller = dladdr(returnAddress, &caller) &&
+        caller.dli_fname &&
+        strstr(caller.dli_fname, "/ImageKit.framework/") != NULL;
+    CIImage *ciImage = [image isKindOfClass:[CIImage class]]
+        ? (CIImage *)image : nil;
+    CGRect extent = ciImage ? ciImage.extent : CGRectNull;
+
+    BOOL diagnostics = imageKitCaller &&
+        macws_preview_ci_diagnostics_enabled();
+    struct timespec started = {0};
+    if (diagnostics) {
+        static _Atomic unsigned imageDescriptionCount = 0;
+        unsigned descriptionSequence =
+            atomic_fetch_add(&imageDescriptionCount, 1) + 1;
+        CGImageRef backingImage = ciImage.CGImage;
+        clock_gettime(CLOCK_MONOTONIC, &started);
+        fprintf(stderr,
+                "#### MACWS PREVIEW-CI begin renderer=%s original-class=%s "
+                "render-class=%s image=%p extent=(%.1f,%.1f %.1fx%.1f) "
+                "url=%s cgimage=%p cgsize=%zux%zu sequence=%u\n",
+                imageKitCaller ? "CoreGraphics-Bitmap" : "original",
+                context ? class_getName(object_getClass(context)) : "<nil>",
+                context ? class_getName(object_getClass(context)) : "<nil>",
+                image, extent.origin.x, extent.origin.y,
+                extent.size.width, extent.size.height,
+                ciImage.url.path.UTF8String ?: "(nil)", backingImage,
+                backingImage ? CGImageGetWidth(backingImage) : 0,
+                backingImage ? CGImageGetHeight(backingImage) : 0,
+                descriptionSequence);
+        if (descriptionSequence <= 4) {
+            fprintf(stderr, "#### MACWS PREVIEW-CI image-description=%s\n",
+                    ciImage.description.UTF8String ?: "(nil)");
+        }
+        fflush(stderr);
+    }
+    if (imageKitCaller &&
+        macws_preview_render_coregraphics_bitmap(surface, extent)) {
+        if (diagnostics) {
+            struct timespec finished = {0};
+            clock_gettime(CLOCK_MONOTONIC, &finished);
+            double elapsed =
+                (double)(finished.tv_sec - started.tv_sec) +
+                (double)(finished.tv_nsec - started.tv_nsec) / 1.0e9;
+            fprintf(stderr,
+                "#### MACWS PREVIEW-CI renderer=CoreGraphics-Bitmap "
+                "elapsed=%.6f bounds=(%.1f,%.1f %.1fx%.1f) "
+                "extent=(%.1f,%.1f %.1fx%.1f) surface=%zux%zu "
+                "rowBytes=%zu image=%p\n",
+                elapsed, bounds.origin.x, bounds.origin.y,
+                bounds.size.width, bounds.size.height,
+                extent.origin.x, extent.origin.y,
+                extent.size.width, extent.size.height,
+                IOSurfaceGetWidth(surface), IOSurfaceGetHeight(surface),
+                IOSurfaceGetBytesPerRow(surface), image);
+            fflush(stderr);
+        }
+        return;
+    }
+    original(context, command, image, surface, bounds, colorSpace);
+    if (diagnostics) {
+        struct timespec finished = {0};
+        clock_gettime(CLOCK_MONOTONIC, &finished);
+        double elapsed =
+            (double)(finished.tv_sec - started.tv_sec) +
+            (double)(finished.tv_nsec - started.tv_nsec) / 1.0e9;
+        fprintf(stderr,
+                "#### MACWS PREVIEW-CI renderer=%s elapsed=%.6f "
+                "bounds=(%.1f,%.1f %.1fx%.1f) surface=%zux%zu "
+                "alloc=%zu pixel-format=%#x image=%p context=%p\n",
+                "original-fallback",
+                elapsed, bounds.origin.x, bounds.origin.y,
+                bounds.size.width, bounds.size.height,
+                IOSurfaceGetWidth(surface), IOSurfaceGetHeight(surface),
+                IOSurfaceGetAllocSize(surface),
+                (unsigned)IOSurfaceGetPixelFormat(surface), image,
+                context);
+        fflush(stderr);
+    }
+}
+
+static BOOL macws_install_preview_coreimage_renderer_adapter(void) {
+    if (g_macws_preview_original_ci_render_to_surface) return YES;
+    if (!macws_process_is_preview()) return YES;
+    Class contextClass = objc_getClass("CIContext");
+    SEL selector = sel_registerName(
+        "render:toIOSurface:bounds:colorSpace:");
+    Method method = contextClass
+        ? class_getInstanceMethod(contextClass, selector) : NULL;
+    if (!method) return NO;
+    IMP current = method_getImplementation(method);
+    if (current != (IMP)macws_preview_ci_render_to_surface) {
+        g_macws_preview_original_ci_render_to_surface =
+            (MacWSCIContextRenderToSurfaceFn)current;
+        method_setImplementation(
+            method, (IMP)macws_preview_ci_render_to_surface);
+    }
+    if (macws_preview_ci_diagnostics_enabled()) {
+        fprintf(stderr,
+                "#### MACWS PREVIEW-CI adapter installed original=%p "
+                "renderer=CoreGraphics-Bitmap\n",
+                g_macws_preview_original_ci_render_to_surface);
+        fflush(stderr);
+    }
+    return YES;
+}
+
+static void macws_try_preview_coreimage_renderer_adapter(unsigned attempt) {
+    if (macws_install_preview_coreimage_renderer_adapter()) return;
+    if (attempt >= 40) {
+        if (macws_preview_ci_diagnostics_enabled()) {
+            fprintf(stderr,
+                    "#### MACWS PREVIEW-CI adapter unavailable after "
+                    "%u class-readiness attempts\n", attempt);
+            fflush(stderr);
+        }
+        return;
+    }
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 50 * NSEC_PER_MSEC),
+                   dispatch_get_main_queue(), ^{
+        macws_try_preview_coreimage_renderer_adapter(attempt + 1);
+    });
+}
+
+static void macws_schedule_preview_coreimage_renderer_adapter(void) {
+    if (!macws_process_is_preview()) return;
+    if (macws_preview_ci_diagnostics_enabled()) {
+        fprintf(stderr,
+                "#### MACWS PREVIEW-CI image-loaded; scheduling adapter\n");
+        fflush(stderr);
+    }
+    dispatch_async(dispatch_get_main_queue(), ^{
+        macws_try_preview_coreimage_renderer_adapter(0);
+    });
+}
+
+// AppInputBridge calls this again at its runtime-confirmed NSApplication-ready
+// boundary. Some Preview launches map both CoreImage and ImageKit before the
+// mac_hooks add-image observer exists, while their Objective-C classes are too
+// early for the injected-image constructor. The idempotent installer keeps
+// both startup orders equivalent.
+void MacWSInstallPreviewCoreImageRendererAdapter(void) {
+    if (!macws_process_is_preview()) return;
+    if (macws_install_preview_coreimage_renderer_adapter()) return;
+    macws_schedule_preview_coreimage_renderer_adapter();
+}
+
 // Ventura Maps opts the shared MKLocationManager into Mac CoreWLAN monitoring
 // immediately before creating the singleton:
 //
@@ -4250,6 +4618,16 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
     if (info.dli_fname &&
         strstr(info.dli_fname, "/IconServices.framework/") != NULL) {
         macws_schedule_settings_symbol_raster_compatibility();
+    }
+    if (info.dli_fname &&
+        (strstr(info.dli_fname, "/CoreImage.framework/") != NULL ||
+         strstr(info.dli_fname, "/ImageKit.framework/") != NULL)) {
+        // The first ImageKit document render can be submitted before a block
+        // posted to the main queue runs. Install synchronously when dyld has
+        // registered CIContext; retain the bounded retry for the earlier
+        // image-load ordering where Objective-C registration is not complete.
+        if (!macws_install_preview_coreimage_renderer_adapter())
+            macws_schedule_preview_coreimage_renderer_adapter();
     }
     if (info.dli_fname &&
         strstr(info.dli_fname, "/MapKit.framework/") != NULL) {
@@ -7087,6 +7465,10 @@ static size_t macws_new_CGDisplayPixelsHigh(uint32_t display) {
 // the input path for the native iPad host.
 typedef void (*MacWSVNCHandleMouse)(id, SEL, unsigned int, CGPoint, id);
 static MacWSVNCHandleMouse macws_orig_vnc_handle_mouse = NULL;
+typedef void (*MacWSVNCRFBStartup)(id, SEL, id);
+static MacWSVNCRFBStartup macws_orig_vnc_rfb_startup = NULL;
+typedef int32_t (*MacWSVNCPostLegacyMouseEvent)(CGPoint, int32_t, uint32_t,
+                                                int32_t, ...);
 typedef void (*MacWSVNCHandleKeyboard)(id, SEL, BOOL, unsigned int, id);
 static MacWSVNCHandleKeyboard macws_orig_vnc_handle_keyboard = NULL;
 typedef void (*MacWSVNCSendKeyEvent)(id, SEL, unsigned short, BOOL, uint64_t);
@@ -7143,9 +7525,261 @@ static CGPoint macws_vnc_secondary_down_point;
 // the bounded interval in which that real down opened a system menu so
 // button-free motion can also enter a Carbon menu tracker when required.
 static double macws_vnc_menu_hover_until = 0.0;
+static _Atomic BOOL macws_vnc_pointer_proxy_started = NO;
 
 static BOOL macws_vnc_forward_key(unsigned short keyCode, BOOL down,
                                   uint64_t modifiers, unsigned int keySym);
+static void macws_vnc_note_interaction(void);
+static BOOL macws_vnc_coordinate_activation(CGPoint point);
+
+// Fullscreen Mission Control cards are WindowServer presentation transforms,
+// not ordinary NSWindows. Runtime A/B on iPad13,6 (2026-09-08) sent the same
+// down/drag/up coordinates through Dock, a foreground AppKit process, a fresh
+// CGSNewConnection probe, and the installed OSXvnc RFB path. The first three
+// selected/reopened the card; only the real OSXvnc process moved Steam between
+// Desktop 1 and Desktop 2. RE-confirmed in the installed arm64 binary at
+// __TEXT+0x9dd0..0x9f24: its non-wheel handler records the client point, maps
+// the three RFB button bits, and calls CGPostMouseEvent(point, true, 3, ...).
+//
+// Accept the Host's already-validated zero-window global pointer records over
+// a root-only local socket and make that exact final call from OSXvnc's proven
+// WindowServer session. We intentionally do not fabricate an rfbClientRec or
+// invoke the private method with a zero-filled client: those fields are RFB
+// bookkeeping, while WindowServer/Dock remain the sole hit-test and drag-state
+// owners for this input transaction.
+static BOOL macws_vnc_pointer_proxy_record_valid(
+        const MacWSInputRecord *record) {
+    if (!record || record->magic != MACWS_INPUT_MAGIC ||
+        !MacWSInputVersionSupportsKind(record->version, record->kind) ||
+        (record->flags & MacWSInputFlagGlobalSystemSurface) == 0 ||
+        MacWSInputWindowIDForScene(record->sceneID) != 0 ||
+        record->source == MacWSInputSourceVNC ||
+        record->source > MacWSInputSourceVNC ||
+        record->frameWidth == 0 || record->frameHeight == 0 ||
+        !isfinite(record->x) || !isfinite(record->y) ||
+        record->x < 0.0f || record->y < 0.0f ||
+        record->x >= record->frameWidth ||
+        record->y >= record->frameHeight) return NO;
+    switch ((MacWSInputKind)record->kind) {
+        case MacWSInputKindTouchDown:
+        case MacWSInputKindTouchMove:
+        case MacWSInputKindTouchUp:
+        case MacWSInputKindTouchCancel:
+        case MacWSInputKindHover:
+        case MacWSInputKindMenuHover:
+        case MacWSInputKindTap:
+        case MacWSInputKindSecondaryTap:
+            return YES;
+        default:
+            return NO;
+    }
+}
+
+static CGPoint macws_vnc_pointer_proxy_quartz_point(
+        const MacWSInputRecord *record) {
+    typedef uint32_t (*MacWSVNCMainDisplayID)(void);
+    typedef CGRect (*MacWSVNCDisplayBounds)(uint32_t);
+    static MacWSVNCMainDisplayID mainDisplayID;
+    static MacWSVNCDisplayBounds displayBounds;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        mainDisplayID = (MacWSVNCMainDisplayID)dlsym(
+            RTLD_DEFAULT, "CGMainDisplayID");
+        displayBounds = (MacWSVNCDisplayBounds)dlsym(
+            RTLD_DEFAULT, "CGDisplayBounds");
+    });
+    if (!mainDisplayID || !displayBounds)
+        return (CGPoint){NAN, NAN};
+    CGRect bounds = displayBounds(mainDisplayID());
+    double normalizedX = record->x / (double)record->frameWidth;
+    double normalizedY = record->y / (double)record->frameHeight;
+    normalizedX = fmin(fmax(normalizedX, 0.0), 1.0);
+    normalizedY = fmin(fmax(normalizedY, 0.0), 1.0);
+    return (CGPoint){
+        bounds.origin.x + normalizedX * bounds.size.width,
+        bounds.origin.y + normalizedY * bounds.size.height,
+    };
+}
+
+static void *macws_vnc_pointer_proxy_listener(void *unused) {
+    (void)unused;
+    int socketFD = socket(AF_UNIX, SOCK_DGRAM, 0);
+    if (socketFD < 0) {
+        fprintf(stderr,
+            "#### OSXVNC POINTER-PROXY failed stage=socket errno=%d\n",
+            errno);
+        return NULL;
+    }
+    (void)fcntl(socketFD, F_SETFD, FD_CLOEXEC);
+    struct sockaddr_un address = {0};
+    address.sun_family = AF_UNIX;
+    address.sun_len = sizeof(address);
+    strlcpy(address.sun_path, MACWS_VNC_POINTER_PROXY_SOCKET_PATH,
+            sizeof(address.sun_path));
+    (void)unlink(MACWS_VNC_POINTER_PROXY_SOCKET_PATH);
+    if (bind(socketFD, (const struct sockaddr *)&address, sizeof(address)) !=
+            0) {
+        int savedError = errno;
+        fprintf(stderr,
+            "#### OSXVNC POINTER-PROXY failed stage=bind errno=%d path=%s\n",
+            savedError, MACWS_VNC_POINTER_PROXY_SOCKET_PATH);
+        close(socketFD);
+        return NULL;
+    }
+    (void)chmod(MACWS_VNC_POINTER_PROXY_SOCKET_PATH, 0600);
+    MacWSVNCPostLegacyMouseEvent postMouse =
+        (MacWSVNCPostLegacyMouseEvent)dlsym(
+            RTLD_DEFAULT, "CGPostMouseEvent");
+    if (!postMouse) {
+        fprintf(stderr,
+            "#### OSXVNC POINTER-PROXY failed stage=resolve-post\n");
+        close(socketFD);
+        (void)unlink(MACWS_VNC_POINTER_PROXY_SOCKET_PATH);
+        return NULL;
+    }
+    fprintf(stderr,
+        "#### OSXVNC POINTER-PROXY ready pid=%d path=%s\n",
+        getpid(), MACWS_VNC_POINTER_PROXY_SOCKET_PATH);
+    fflush(stderr);
+
+    BOOL leftDown = NO;
+    uint32_t activeContact = 0;
+    CGPoint lastPoint = CGPointZero;
+    for (;;) {
+        MacWSInputRecord record = {0};
+        ssize_t received = recv(socketFD, &record, sizeof(record), 0);
+        if (received < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+        if (received != sizeof(record) ||
+            !macws_vnc_pointer_proxy_record_valid(&record)) {
+            fprintf(stderr,
+                "#### OSXVNC POINTER-PROXY reject bytes=%zd magic=%#x "
+                "version=%u kind=%u source=%u flags=%#x\n",
+                received, record.magic, record.version, record.kind,
+                record.source, record.flags);
+            fflush(stderr);
+            continue;
+        }
+
+        CGPoint point = macws_vnc_pointer_proxy_quartz_point(&record);
+        if (!isfinite(point.x) || !isfinite(point.y)) {
+            fprintf(stderr,
+                "#### OSXVNC POINTER-PROXY reject reason=no-display\n");
+            fflush(stderr);
+            continue;
+        }
+        int32_t firstResult = 0;
+        int32_t secondResult = 0;
+        switch ((MacWSInputKind)record.kind) {
+            case MacWSInputKindTouchDown:
+                // A replacement contact is a real device-boundary recovery:
+                // release the prior button before starting the new stream.
+                if (leftDown && activeContact != record.contactID) {
+                    (void)postMouse(lastPoint, true, 3,
+                                    false, false, false);
+                }
+                // Match the runtime-recorded RFB transaction boundary. Its
+                // first packet moved the global cursor with every button up;
+                // the following button packet then completed OSXvnc's normal
+                // bounded target-activation handoff before posting the down.
+                // Dock uses that pre-hover to publish the current Mission
+                // Control card/layer context; beginning with the down at a
+                // new point only selected and reopened the card.
+                (void)postMouse(point, true, 3,
+                                false, false, false);
+                (void)macws_vnc_coordinate_activation(point);
+                activeContact = record.contactID;
+                leftDown = YES;
+                firstResult = postMouse(point, true, 3,
+                                        true, false, false);
+                break;
+            case MacWSInputKindTouchMove:
+                if (leftDown && activeContact != record.contactID) continue;
+                firstResult = postMouse(point, true, 3,
+                                        leftDown, false, false);
+                break;
+            case MacWSInputKindTouchUp:
+            case MacWSInputKindTouchCancel:
+                if (leftDown && activeContact != record.contactID) continue;
+                firstResult = postMouse(point, true, 3,
+                                        false, false, false);
+                leftDown = NO;
+                activeContact = 0;
+                break;
+            case MacWSInputKindHover:
+            case MacWSInputKindMenuHover:
+                firstResult = postMouse(point, true, 3,
+                                        leftDown, false, false);
+                break;
+            case MacWSInputKindTap:
+                firstResult = postMouse(point, true, 3,
+                                        true, false, false);
+                usleep(2000);
+                secondResult = postMouse(point, true, 3,
+                                         false, false, false);
+                break;
+            case MacWSInputKindSecondaryTap:
+                firstResult = postMouse(point, true, 3,
+                                        false, true, false);
+                usleep(2000);
+                secondResult = postMouse(point, true, 3,
+                                         false, false, false);
+                break;
+            default:
+                continue;
+        }
+        lastPoint = point;
+        macws_vnc_note_interaction();
+        if (record.kind != MacWSInputKindTouchMove &&
+            record.kind != MacWSInputKindHover &&
+            record.kind != MacWSInputKindMenuHover) {
+            fprintf(stderr,
+                "#### OSXVNC POINTER-PROXY post kind=%u contact=%u "
+                "pixel=(%.1f,%.1f)/%ux%u quartz=(%.1f,%.1f) "
+                "left=%s result=%d/%d\n",
+                record.kind, record.contactID, record.x, record.y,
+                record.frameWidth, record.frameHeight, point.x, point.y,
+                leftDown ? "YES" : "NO", firstResult, secondResult);
+            fflush(stderr);
+        }
+    }
+    if (leftDown) {
+        (void)postMouse(lastPoint, true, 3, false, false, false);
+    }
+    close(socketFD);
+    (void)unlink(MACWS_VNC_POINTER_PROXY_SOCKET_PATH);
+    return NULL;
+}
+
+static void macws_vnc_start_pointer_proxy_once(void) {
+    BOOL expected = NO;
+    if (!atomic_compare_exchange_strong_explicit(
+            &macws_vnc_pointer_proxy_started, &expected, YES,
+            memory_order_acq_rel, memory_order_acquire)) return;
+    pthread_t listener;
+    int error = pthread_create(
+        &listener, NULL, macws_vnc_pointer_proxy_listener, NULL);
+    if (error == 0) {
+        pthread_detach(listener);
+    } else {
+        atomic_store_explicit(&macws_vnc_pointer_proxy_started, NO,
+                              memory_order_release);
+        fprintf(stderr,
+            "#### OSXVNC POINTER-PROXY failed stage=pthread error=%d\n",
+            error);
+    }
+}
+
+static void macws_new_vnc_rfb_startup(id self, SEL command, id server) {
+    // rfbStartup: is entered after OSXvnc's main path has created its real CGS
+    // connection. Publish readiness here, not from libmachook's constructor,
+    // so a waiting Host can never inject into a half-initialized session.
+    macws_vnc_start_pointer_proxy_once();
+    if (macws_orig_vnc_rfb_startup)
+        macws_orig_vnc_rfb_startup(self, command, server);
+}
 
 // RE-confirmed via the installed arm64 OSXvnc-server (2026-07-27):
 //
@@ -9281,6 +9915,14 @@ static void macws_install_osxvnc_hooks(void) {
         (void *)macws_new_rfb_send_framebuffer_update,
         (void **)&macws_orig_rfb_send_framebuffer_update);
     Class serverClass = objc_getClass("VNCServer");
+    Method startupMethod = serverClass ? class_getInstanceMethod(serverClass,
+        sel_registerName("rfbStartup:")) : NULL;
+    if (startupMethod) {
+        macws_orig_vnc_rfb_startup =
+            (MacWSVNCRFBStartup)method_getImplementation(startupMethod);
+        method_setImplementation(startupMethod,
+                                 (IMP)macws_new_vnc_rfb_startup);
+    }
     Method mouseMethod = serverClass ? class_getInstanceMethod(serverClass,
         sel_registerName("handleMouseButtons:atPoint:forClient:")) : NULL;
     if (mouseMethod && macws_vnc_input_mode != MacWSVNCInputModeStock) {
@@ -9337,10 +9979,11 @@ static void macws_install_osxvnc_hooks(void) {
     const char *inputModeName = macws_vnc_input_mode == MacWSVNCInputModeStock
         ? "stock" : (macws_vnc_input_mode == MacWSVNCInputModeScaleOnly
             ? "scale-only" : "hybrid");
-    fprintf(stderr, "#### OSXVNC delivery hooks installed (test=%d share=%d input-mode=%s native-all=%d client-trace=%d input=%s keyboard=%s key-map=%s key-modifiers=%s modifiers-offset=%td) base=%p rfbScreen=%p\n",
+    fprintf(stderr, "#### OSXVNC delivery hooks installed (test=%d share=%d input-mode=%s native-all=%d client-trace=%d proxy-startup=%s input=%s keyboard=%s key-map=%s key-modifiers=%s modifiers-offset=%td) base=%p rfbScreen=%p\n",
             macws_vnc_test_on, macws_vnc_share_on, inputModeName,
             macws_vnc_native_all,
             traceClientMessages,
+            startupMethod ? "YES" : "NO",
             mouseMethod && macws_vnc_input_mode != MacWSVNCInputModeStock
                 ? "YES" : "NO",
             keyboardMethod && macws_vnc_input_mode == MacWSVNCInputModeHybrid
@@ -9402,6 +10045,7 @@ static void macws_install_target_feature_flag_compatibility(void) {
 __attribute__((constructor)) void InitStuff() {
     atomic_store_explicit(&g_macws_libsystem_runtime_ready, true,
                           memory_order_release);
+    macws_install_pkd_signed_entitlements_adapter();
     // Package provisioning occasionally needs a macOS command-line utility
     // (currently Ventura's native codesign) inside the chroot.  It consumes
     // the syscall/dyld interposes exported by this library, but has no GUI,
@@ -9441,6 +10085,19 @@ __attribute__((constructor)) void InitStuff() {
     }
     EnableJIT();
     macws_install_target_feature_flag_compatibility();
+    // CoreImage and ImageKit can already be mapped before our dyld add-image
+    // observer is registered. The Preview-only scheduler has its own bounded
+    // class-readiness retry, so arm it from the injected library constructor
+    // as well as from later framework notifications.
+    if (access("/tmp/macws_preview_ci_diagnostics", F_OK) == 0) {
+        char executable[PATH_MAX] = {0};
+        (void)proc_pidpath(getpid(), executable, sizeof(executable));
+        fprintf(stderr,
+                "#### MACWS PREVIEW-CI constructor program=%s executable=%s\n",
+                getprogname() ?: "<nil>", executable[0] ? executable : "<nil>");
+        fflush(stderr);
+    }
+    macws_schedule_preview_coreimage_renderer_adapter();
     macws_install_steam_volume_compatibility();
     // Settings extensions carry libmachook through a bundle-local load command.
     // Retry their ExtensionFoundation/LaunchServices boundary only after the
@@ -10458,10 +11115,18 @@ void pthread_jit_write_protect_np_new(int enabled) {
         macws_jit_ensure_exec_barrier_handler();
     }
 
+    // The first access to a Mach-O TLV may allocate/protect its backing page.
+    // Runtime-confirmed by `/tmp/vscode-exthost-after-vmprotect.sample`: when
+    // this bool was first resolved only after taking g_macws_jit_state_lock,
+    // dyld's tlv_get_addr re-entered mprotect_new and the overlap lookup waited
+    // on the lock owned by this same thread. Resolve the per-thread slot before
+    // the mutex; all later reads/writes below then use initialized storage.
+    bool thread_writable = g_macws_jit_thread_writable;
+
     if (macws_jit_fault_write_compat_enabled()) {
         pthread_mutex_lock(&g_macws_jit_state_lock);
         if (!enabled) {
-            if (!g_macws_jit_thread_writable) {
+            if (!thread_writable) {
                 // The fallback mmap can initially be RW because iOS strips X
                 // from a requested RWX mapping.  Establish RX exactly once
                 // before the first scoped write so that touched pages fault
@@ -10477,7 +11142,7 @@ void pthread_jit_write_protect_np_new(int enabled) {
                                       writers + 1, memory_order_release);
                 g_macws_jit_thread_writable = true;
             }
-        } else if (g_macws_jit_thread_writable) {
+        } else if (thread_writable) {
             g_macws_jit_thread_writable = false;
             unsigned writers = atomic_load_explicit(
                 &g_macws_jit_active_writers, memory_order_relaxed);
@@ -10516,7 +11181,7 @@ void pthread_jit_write_protect_np_new(int enabled) {
 
     pthread_mutex_lock(&g_macws_jit_state_lock);
     if (!enabled) {
-        if (!g_macws_jit_thread_writable) {
+        if (!thread_writable) {
             unsigned writers = atomic_load_explicit(
                 &g_macws_jit_active_writers, memory_order_relaxed);
             if (writers == 0) {
@@ -10533,7 +11198,7 @@ void pthread_jit_write_protect_np_new(int enabled) {
             g_macws_jit_thread_writable = true;
         }
     } else {
-        if (g_macws_jit_thread_writable) {
+        if (thread_writable) {
             g_macws_jit_thread_writable = false;
             unsigned writers = atomic_load_explicit(
                 &g_macws_jit_active_writers, memory_order_relaxed);
@@ -10602,7 +11267,7 @@ IOSurfaceRef IOSurfaceCreate_new(NSMutableDictionary *properties) {
         } ];
         useProps = np;
     }
-    IOSurfaceRef result = IOSurfaceCreate((NSDictionary *)useProps);
+    IOSurfaceRef result = IOSurfaceCreate((CFDictionaryRef)useProps);
     // Log EVERY surface (size + format + compression) to map the full topology — the per-window
     // content source surface (e.g. 500x350) vs the 1920x1080 display/composite surfaces.
     unsigned int pf = [[properties objectForKey:@"IOSurfacePixelFormat"] unsignedIntValue];
@@ -11237,7 +11902,9 @@ static BOOL macws_process_is_dock(void) {
 static OSStatus macws_LSOpenFromURLSpec(
         const MacWSLSLaunchURLSpec *launchSpec,
         CFURLRef *outLaunchedURL) {
-    if (macws_process_is_dock()) {
+    BOOL dockRequest = macws_process_is_dock();
+    BOOL traceRequest = dockRequest || macws_runtime_diagnostics_enabled();
+    if (traceRequest) {
         UInt8 appPath[PATH_MAX] = {0};
         CFIndex itemCount = -1;
         if (launchSpec && launchSpec->appURL &&
@@ -11249,8 +11916,9 @@ static OSStatus macws_LSOpenFromURLSpec(
             CFGetTypeID(launchSpec->itemURLs) == CFArrayGetTypeID())
             itemCount = CFArrayGetCount(launchSpec->itemURLs);
         fprintf(stderr,
-                "#### MACWS LS-APP-REQUEST owner=Dock app=%s items=%ld "
+                "#### MACWS LS-APP-REQUEST owner=%s app=%s items=%ld "
                 "flags=%#x passthru=%p async=%p\n",
+                dockRequest ? "Dock" : (getprogname() ?: "unknown"),
                 appPath[0] ? (const char *)appPath : "(none)",
                 (long)itemCount, launchSpec ? launchSpec->launchFlags : 0,
                 launchSpec ? launchSpec->passThruParams : NULL,
@@ -11265,8 +11933,10 @@ static OSStatus macws_LSOpenFromURLSpec(
                     (void)CFURLGetFileSystemRepresentation(
                         (CFURLRef)item, true, itemPath, sizeof(itemPath));
                 fprintf(stderr,
-                        "#### MACWS LS-APP-REQUEST-ITEM owner=Dock index=%ld "
-                        "type=%lu path=%s\n", (long)index,
+                        "#### MACWS LS-APP-REQUEST-ITEM owner=%s index=%ld "
+                        "type=%lu path=%s\n",
+                        dockRequest ? "Dock" : (getprogname() ?: "unknown"),
+                        (long)index,
                         (unsigned long)(item ? CFGetTypeID(item) : 0),
                         itemPath[0] ? (const char *)itemPath : "(non-file-url)");
             }
@@ -11274,11 +11944,18 @@ static OSStatus macws_LSOpenFromURLSpec(
         fflush(stderr);
     }
     OSStatus status = LSOpenFromURLSpec(launchSpec, outLaunchedURL);
+    if (traceRequest) {
+        fprintf(stderr,
+                "#### MACWS LS-APP-RESULT owner=%s status=%d launched=%p\n",
+                dockRequest ? "Dock" : (getprogname() ?: "unknown"),
+                (int)status,
+                outLaunchedURL ? (const void *)*outLaunchedURL : NULL);
+        fflush(stderr);
+    }
     // -10810 is the exact kLSUnknownErr returned after LaunchServices has
     // resolved the application but its foreign-platform RBS launch failed.
     // Dock additionally needs hostd convergence even when a stale LS running
     // record converts the request to noErr without a visible app window.
-    BOOL dockRequest = macws_process_is_dock();
     if (status != -10810 && !dockRequest) return status;
     CFURLRef applicationURL = macws_failed_application_url(launchSpec);
     if (!applicationURL) return status;
@@ -11297,6 +11974,120 @@ static OSStatus macws_LSOpenFromURLSpec(
     if (outLaunchedURL && !*outLaunchedURL)
         *outLaunchedURL = (CFURLRef)CFRetain(applicationURL);
     return noErr;
+}
+
+// RE-confirmed against the installed Ventura 13.4 Image.qlgenerator
+// (UUID 388DEE66-0DF5-3DDC-85E4-DF8F9C9B8332): GenerateThumbnailForURL at
+// arm64e file offset 0x3b30 calls QLThumbnailRequestSetImageAtURL at +0x5c
+// after supplying kCGImageSourceTypeIdentifierHint. Runtime-confirmed on the
+// target after making the generator admissible to AMFI: qlmanage returned a
+// successful 256x179 PNG for a real 2388x1668 source, but every output pixel
+// was black. The PDF generator in the same process produced correct pixels.
+// Decode only this Image.qlgenerator call site through ImageIO and hand its
+// real CGImage to Quick Look's documented equivalent API. This preserves the
+// request object, cancellation/lifecycle, output dimensions and downstream
+// cache; every other Quick Look generator and call site remains stock.
+typedef const void *MacWSQLThumbnailRequestRef;
+typedef void (*MacWSQLThumbnailRequestSetImageFn)(
+    MacWSQLThumbnailRequestRef, CGImageRef, CFDictionaryRef);
+typedef OSStatus (*MacWSImageGeneratorThumbnailFn)(
+    void *generator, MacWSQLThumbnailRequestRef thumbnail, CFURLRef url,
+    CFStringRef contentType, CFDictionaryRef options, CGSize maximumSize);
+static MacWSImageGeneratorThumbnailFn
+    g_macws_orig_image_generator_thumbnail;
+
+static OSStatus macws_image_generator_thumbnail(
+    void *generator, MacWSQLThumbnailRequestRef thumbnail, CFURLRef url,
+    CFStringRef contentType, CFDictionaryRef requestOptions,
+    CGSize maximumSize) {
+    if (thumbnail && url && CFGetTypeID(url) == CFURLGetTypeID()) {
+        CGFloat maximumDimension = MAX(maximumSize.width, maximumSize.height);
+        if (!isfinite(maximumDimension) || maximumDimension <= 0)
+            maximumDimension = 512.0;
+        size_t maximumPixels = (size_t)ceil(
+            MIN(MAX(maximumDimension, 32.0), 1024.0));
+        NSDictionary *options = @{
+            (__bridge NSString *)kCGImageSourceCreateThumbnailFromImageAlways:
+                @YES,
+            (__bridge NSString *)kCGImageSourceCreateThumbnailWithTransform:
+                @YES,
+            (__bridge NSString *)kCGImageSourceThumbnailMaxPixelSize:
+                @(maximumPixels),
+            (__bridge NSString *)kCGImageSourceShouldCacheImmediately: @YES
+        };
+        CGImageSourceRef source = CGImageSourceCreateWithURL(url, NULL);
+        CGImageRef image = source ? CGImageSourceCreateThumbnailAtIndex(
+            source, 0, (__bridge CFDictionaryRef)options) : NULL;
+        if (source) CFRelease(source);
+        if (image) {
+            MacWSQLThumbnailRequestSetImageFn setImage =
+                (MacWSQLThumbnailRequestSetImageFn)dlsym(
+                    RTLD_DEFAULT, "QLThumbnailRequestSetImage");
+            if (!setImage) {
+                CGImageRelease(image);
+                return g_macws_orig_image_generator_thumbnail
+                    ? g_macws_orig_image_generator_thumbnail(
+                          generator, thumbnail, url, contentType,
+                          requestOptions, maximumSize)
+                    : (OSStatus)-50;
+            }
+            setImage(thumbnail, image, NULL);
+            CGImageRelease(image);
+            static _Atomic unsigned repairedCount = 0;
+            unsigned count = atomic_fetch_add_explicit(
+                &repairedCount, 1, memory_order_relaxed);
+            if (count < 8) {
+                fprintf(stderr,
+                    "[macws] Image.qlgenerator: supplied ImageIO CGImage "
+                    "for %.0fx%.0f Quick Look request\n",
+                    maximumSize.width, maximumSize.height);
+            }
+            return noErr;
+        }
+    }
+    return g_macws_orig_image_generator_thumbnail
+        ? g_macws_orig_image_generator_thumbnail(
+              generator, thumbnail, url, contentType, requestOptions,
+              maximumSize)
+        : (OSStatus)-50;
+}
+
+static pthread_mutex_t g_macws_quicklook_thumbnail_hook_lock =
+    PTHREAD_MUTEX_INITIALIZER;
+static void macws_install_quicklook_image_thumbnail_repair(
+    const struct mach_header *header, intptr_t slide) {
+    (void)slide;
+    static const uint8_t imageGeneratorUUID[16] = {
+        0x38, 0x8d, 0xee, 0x66, 0x0d, 0xf5, 0x3d, 0xdc,
+        0x85, 0xe4, 0xdf, 0x8f, 0x9c, 0x9b, 0x83, 0x32
+    };
+    BOOL uuidMatches = header && header->magic == MH_MAGIC_64 &&
+        macws_macho_uuid_matches(
+            (const struct mach_header_64 *)header, imageGeneratorUUID);
+    if (!uuidMatches || g_macws_orig_image_generator_thumbnail) return;
+    fprintf(stderr,
+        "[macws] Quick Look Image.qlgenerator UUID matched at %p\n",
+        header);
+    pthread_mutex_lock(&g_macws_quicklook_thumbnail_hook_lock);
+    if (!g_macws_orig_image_generator_thumbnail) {
+        // __TEXT vmaddr is zero in this bundle; otool -arch arm64e -tvV
+        // identifies 0x3b30 as the exact GenerateThumbnailForURL entry.
+        void *entry = (uint8_t *)header + 0x3b30;
+        MSHookFunction(entry, (void *)macws_image_generator_thumbnail,
+                       (void **)&g_macws_orig_image_generator_thumbnail);
+        fprintf(stderr,
+            "[macws] Quick Look Image.qlgenerator hook entry=%p original=%p\n",
+            entry, g_macws_orig_image_generator_thumbnail);
+    }
+    pthread_mutex_unlock(&g_macws_quicklook_thumbnail_hook_lock);
+}
+
+__attribute__((constructor))
+static void macws_register_quicklook_image_thumbnail_repair(void) {
+    // dyld invokes a newly registered add-image callback for existing images
+    // too, then again when Finder/qlmanage later dlopens Quick Look plugins.
+    _dyld_register_func_for_add_image(
+        macws_install_quicklook_image_thumbnail_repair);
 }
 
 DYLD_INTERPOSE(sysctlbyname_new, sysctlbyname);
@@ -11386,6 +12177,26 @@ DYLD_INTERPOSE(objc_alloc_trace, objc_alloc);
 #define EXTENSIONKIT_SERVICE_NEW  "com.apple.macosbooter.extensionkitservice"
 #define HISERVICES_SERVICE_ORIG "com.apple.hiservices-xpcservice"
 #define HISERVICES_SERVICE_NEW  "com.apple.macosbooter.hiservices-xpcservice"
+#define AUTHD_SERVICE_ORIG "com.apple.authd"
+#define AUTHD_SERVICE_NEW  "com.apple.macosbooter.authd"
+#define QUICKLOOK_THUMBNAILS_ORIG "com.apple.quicklook.ThumbnailsAgent"
+#define QUICKLOOK_THUMBNAILS_NEW \
+    "com.apple.macosbooter.quicklook.ThumbnailsAgent"
+#define QUICKLOOK_THUMBNAILS_CACHE_DELETE_ORIG \
+    "com.apple.quicklook.ThumbnailsAgent.CacheDelete"
+#define QUICKLOOK_THUMBNAILS_CACHE_DELETE_NEW \
+    "com.apple.macosbooter.quicklook.ThumbnailsAgent.CacheDelete"
+#define QUICKLOOK_SERVICE_ORIG "com.apple.quicklook"
+#define QUICKLOOK_SERVICE_NEW "com.apple.macosbooter.quicklook"
+#define QUICKLOOKD_XPC_SERVICE_ORIG "com.apple.quicklookd.xpc"
+#define QUICKLOOKD_XPC_SERVICE_NEW "com.apple.macosbooter.quicklookd.xpc"
+#define QUICKLOOK_SATELLITE_ORIG "com.apple.quicklook.satellite"
+#define QUICKLOOK_SATELLITE_NEW "com.apple.macosbooter.quicklook.satellite"
+#define PLUGINKIT_PKD_SERVICE_ORIG "com.apple.pluginkit.pkd"
+#define PLUGINKIT_PKD_SERVICE_NEW "com.apple.macosbooter.pluginkit.pkd"
+#define DESKTOP_SERVICES_HELPER_ORIG "com.apple.DesktopServicesHelper"
+#define DESKTOP_SERVICES_HELPER_NEW \
+    "com.apple.macosbooter.DesktopServicesHelper"
 #define DOCK_HELPER_SERVICE_ORIG "com.apple.dock.helper"
 #define DOCK_HELPER_SERVICE_NEW  "com.apple.macosbooter.dock.helper"
 #define GEOD_XPC_SERVICE "com.apple.geod"
@@ -11524,6 +12335,37 @@ static const char *macws_private_bootstrap_service_name(const char *name) {
         return "com.apple.macosbooter.iconservices";
     if (!strcmp(name, "com.apple.iconservices.store"))
         return "com.apple.macosbooter.iconservices.store";
+    // Ventura Quick Look discovers both modern preview/thumbnail extensions
+    // through pkd. Runtime oslog on the target showed those requests reaching
+    // the iPadOS pkd (pid 1836), whose LaunchServices store has neither macOS
+    // extension point. Keep PluginKit's protocol intact and isolate only the
+    // colliding bootstrap name so clients and the stock Ventura pkd share the
+    // same macOS LaunchServices database.
+    if (!strcmp(name, PLUGINKIT_PKD_SERVICE_ORIG))
+        return PLUGINKIT_PKD_SERVICE_NEW;
+    // Runtime-confirmed via the target process image UUID and crash report:
+    // Finder's public lookup activated iPadOS's uid-501 thumbnail agent
+    // (BA2DE509-...), not the installed Ventura agent (6FF47A91-...). Keep the
+    // stock QuickLookThumbnailing protocol and isolate only its two bootstrap
+    // names so the Ventura client and listener meet in the same namespace.
+    if (!strcmp(name, QUICKLOOK_THUMBNAILS_ORIG))
+        return QUICKLOOK_THUMBNAILS_NEW;
+    if (!strcmp(name, QUICKLOOK_THUMBNAILS_CACHE_DELETE_ORIG))
+        return QUICKLOOK_THUMBNAILS_CACHE_DELETE_NEW;
+    if (!strcmp(name, QUICKLOOK_SERVICE_ORIG))
+        return QUICKLOOK_SERVICE_NEW;
+    if (!strcmp(name, QUICKLOOKD_XPC_SERVICE_ORIG))
+        return QUICKLOOKD_XPC_SERVICE_NEW;
+    // RE-confirmed in Ventura 13.4 QuickLook UUID represented by the loaded
+    // image at -[QLServerSatellite _connect]+0x68: legacy thumbnails create an
+    // XPC-service connection to this exact bundle identifier. Runtime LLDB on
+    // the iPad showed _connect and _sendSetupMessage... each run once while no
+    // QuickLookSatellite process appeared and neither completion nor failure
+    // handler fired. macos_gui.sh publishes the unchanged satellite protocol
+    // as a root launchd Mach service because the chroot has no per-user XPC
+    // bundle activation domain.
+    if (!strcmp(name, QUICKLOOK_SATELLITE_ORIG))
+        return QUICKLOOK_SATELLITE_NEW;
     if (!strcmp(name, "com.apple.carboncore.csnameddata"))
         return "com.apple.macosbooter.carboncore.csnameddata";
     if (!strcmp(name, DOCK_HELPER_SERVICE_ORIG))
@@ -11585,7 +12427,277 @@ static const char *macws_private_bootstrap_service_name(const char *name) {
         return EXTENSIONKIT_SERVICE_NEW;
     if (!strcmp(name, HISERVICES_SERVICE_ORIG))
         return HISERVICES_SERVICE_NEW;
+    if (!strcmp(name, AUTHD_SERVICE_ORIG))
+        return AUTHD_SERVICE_NEW;
+    // RE-confirmed against Ventura 13.4 DesktopServicesPriv at
+    // TDSHelperContext::LaunchDesktopServicesHelper +0x7c..+0xa8: Finder
+    // resolves this exact launchd Mach service before sending its Handshake.
+    // Runtime-confirmed on iPadOS 16.3.1: the public endpoint returned
+    // _xpc_error_connection_invalid, which the same function maps to -8062 at
+    // +0x248. Keep both the unmodified helper and its clients on a private
+    // endpoint so iPadOS's inactive, platform-incompatible job cannot win the
+    // lookup.
+    if (!strcmp(name, DESKTOP_SERVICES_HELPER_ORIG))
+        return DESKTOP_SERVICES_HELPER_NEW;
     return name;
+}
+
+// Ventura's PluginKit expects LaunchServices' LSPlugInKitProxy to carry the
+// code-signature entitlement dictionary.  On the target, the stock
+// _LSRegisterPluginURL transaction creates the correct platform-1 record and
+// bundle URL but serializes an empty dictionary.  This is not an absent
+// entitlement: runtime diagnostics in pluginkit-pkd.log showed the empty
+// LSPlugInKitProxy value, while SecCodeCopySigningInformation on that exact
+// executable returned its signed `entitlements-DER` component.  Ventura
+// codesign independently decoded the same component to
+// `com.apple.security.app-sandbox = true`.
+//
+// RE-confirmed in Ventura 13.4 pkd UUID 76E60957-... at __TEXT+0x7848:
+// -[PKDPlugIn diagnose] rejects only after -hasEntitlement: returns false.
+// RE-confirmed in the loaded PlugInKit image at +0x1767c: that method reads
+// -entitlements and then objectForKeyedSubscript:.  Repair the missing record
+// payload at its source, LSPlugInKitProxy, by decoding the executable's real
+// signed DER dictionary.  Invalid/missing DER, unsigned code, or a genuinely
+// absent sandbox key remains absent and the stock PluginKit check still fails.
+typedef const void *MacWSCEError;
+typedef const void *MacWSCERuntime;
+typedef void *MacWSCEQueryContext;
+typedef MacWSCEError (*MacWSCEManagedContextFromCFDataFn)(
+    MacWSCERuntime, CFDataRef, MacWSCEQueryContext *);
+typedef MacWSCEError (*MacWSCEQueryContextToCFDictionaryFn)(
+    MacWSCEQueryContext, CFDictionaryRef *);
+typedef MacWSCEError (*MacWSCEReleaseManagedContextFn)(
+    MacWSCEQueryContext *);
+
+static uint32_t macws_read_code_signature_be32(const uint8_t *bytes) {
+    uint32_t encoded = 0;
+    memcpy(&encoded, bytes, sizeof(encoded));
+    return CFSwapInt32BigToHost(encoded);
+}
+
+static BOOL macws_der_entitlements_match_code_directory(
+    NSDictionary *information, NSData *derBlob) {
+    CFStringRef codeDirectoryKey = CFStringCreateWithCString(
+        kCFAllocatorDefault, "CodeDirectory", kCFStringEncodingUTF8);
+    CFTypeRef codeDirectoryValue = codeDirectoryKey
+        ? CFDictionaryGetValue((__bridge CFDictionaryRef)information,
+                               codeDirectoryKey) : NULL;
+    if (codeDirectoryKey) CFRelease(codeDirectoryKey);
+    NSData *codeDirectory = codeDirectoryValue &&
+        CFGetTypeID(codeDirectoryValue) == CFDataGetTypeID()
+        ? (__bridge NSData *)codeDirectoryValue : nil;
+    CFTypeRef cmsValue = CFDictionaryGetValue(
+        (__bridge CFDictionaryRef)information, kSecCodeInfoCMS);
+    NSData *cms = cmsValue && CFGetTypeID(cmsValue) == CFDataGetTypeID()
+        ? (__bridge NSData *)cmsValue : nil;
+    const uint8_t *directory = codeDirectory.bytes;
+    const NSUInteger fixedHeaderSize = 40;
+    if (!directory || codeDirectory.length < fixedHeaderSize || !derBlob ||
+        derBlob.length < 8 || cms.length == 0)
+        return NO;
+
+    // CS_CodeDirectory v=0x20400 stores nSpecialSlots at +24, hashOffset at
+    // +16, hashSize at +36 and hashType at +37.  Slot 7 is
+    // CSSLOT_DER_ENTITLEMENTS and hashes the complete CS_GenericBlob,
+    // including its magic and length.  This is the same byte relation
+    // runtime-inspected in the target executable: SHA-256(blob) equals the
+    // 32 bytes at hashOffset - 7 * hashSize.
+    uint32_t magic = macws_read_code_signature_be32(directory);
+    uint32_t directoryLength = macws_read_code_signature_be32(directory + 4);
+    uint32_t hashOffset = macws_read_code_signature_be32(directory + 16);
+    uint32_t specialSlotCount =
+        macws_read_code_signature_be32(directory + 24);
+    uint8_t hashSize = directory[36];
+    uint8_t hashType = directory[37];
+    const uint32_t derEntitlementsSlot = 7;
+    if (magic != 0xfade0c02U || directoryLength > codeDirectory.length ||
+        directoryLength < fixedHeaderSize ||
+        specialSlotCount < derEntitlementsSlot ||
+        hashSize != CC_SHA256_DIGEST_LENGTH ||
+        hashType != 2 || hashOffset > directoryLength ||
+        hashOffset < derEntitlementsSlot * hashSize)
+        return NO;
+
+    uint8_t digest[CC_SHA256_DIGEST_LENGTH];
+    CC_SHA256(derBlob.bytes, (CC_LONG)derBlob.length, digest);
+    const uint8_t *signedDigest = directory + hashOffset -
+        derEntitlementsSlot * hashSize;
+    return memcmp(digest, signedDigest, sizeof(digest)) == 0;
+}
+
+static NSDictionary *macws_signed_entitlements_for_plugin_url(NSURL *url) {
+    if (![url isKindOfClass:NSURL.class] || !url.isFileURL) return nil;
+    NSURL *executableURL = [NSBundle bundleWithURL:url].executableURL;
+    if (!executableURL) return nil;
+
+    SecStaticCodeRef staticCode = NULL;
+    CFDictionaryRef signingInformation = NULL;
+    if (SecStaticCodeCreateWithPath((__bridge CFURLRef)executableURL, 0,
+                                    &staticCode) != 0 || !staticCode)
+        return nil;
+    OSStatus status = SecCodeCopySigningInformation(
+        staticCode, (1U << 0) | (1U << 1) | (1U << 2),
+        &signingInformation);
+    CFRelease(staticCode);
+    if (status != 0 || !signingInformation) return nil;
+
+    NSDictionary *information = (__bridge NSDictionary *)signingInformation;
+    id dictionaryValue = [information objectForKey:
+        (__bridge NSString *)kSecCodeInfoEntitlementsDict];
+    NSDictionary *result = [dictionaryValue isKindOfClass:NSDictionary.class]
+        ? [dictionaryValue copy] : nil;
+
+    if (!result) {
+        static dispatch_once_t ceOnce;
+        static MacWSCERuntime ceRuntime;
+        static MacWSCEError ceNoError;
+        static MacWSCEManagedContextFromCFDataFn contextFromData;
+        static MacWSCEQueryContextToCFDictionaryFn contextToDictionary;
+        static MacWSCEReleaseManagedContextFn releaseContext;
+        dispatch_once(&ceOnce, ^{
+            void *handle = dlopen("/usr/lib/libCoreEntitlements.dylib",
+                                  RTLD_NOW | RTLD_LOCAL);
+            void *runtimeAddress = handle ? dlsym(handle, "CECRuntime")
+                                          : NULL;
+            void *noErrorAddress = handle ? dlsym(handle, "kCENoError")
+                                          : NULL;
+            ceRuntime = runtimeAddress
+                ? *(MacWSCERuntime *)runtimeAddress : NULL;
+            ceNoError = noErrorAddress
+                ? *(MacWSCEError *)noErrorAddress : NULL;
+            contextFromData = handle
+                ? (MacWSCEManagedContextFromCFDataFn)dlsym(
+                      handle, "CEManagedContextFromCFData") : NULL;
+            contextToDictionary = handle
+                ? (MacWSCEQueryContextToCFDictionaryFn)dlsym(
+                      handle, "CEQueryContextToCFDictionary") : NULL;
+            releaseContext = handle
+                ? (MacWSCEReleaseManagedContextFn)dlsym(
+                      handle, "CEReleaseManagedContext") : NULL;
+        });
+
+        void *derKeyAddress = dlsym(RTLD_DEFAULT,
+                                    "kSecCodeInfoEntitlementsDER");
+        CFStringRef derKey = derKeyAddress
+            ? *(CFStringRef *)derKeyAddress : CFSTR("entitlements-DER");
+        id derValue = [information objectForKey:(__bridge NSString *)derKey];
+        NSData *derPayload = nil;
+        if ([derValue isKindOfClass:NSData.class] &&
+            macws_der_entitlements_match_code_directory(information,
+                                                         derValue)) {
+            NSData *signedBlob = derValue;
+            // SecCodeCopySigningInformation returns the complete
+            // CS_GenericBlob: big-endian CSMAGIC_EMBEDDED_DER_ENTITLEMENTS
+            // (0xfade7172), length, then ASN.1.  CEManagedContextFromCFData
+            // expects only the ASN.1 bytes.  Runtime-confirmed on the target:
+            // the 107-byte value starts `fade7172 0000006b 7061...`; handing
+            // it the header produced kCEErrorVerificationFailed, while the
+            // signed payload itself starts at byte 8.
+            if (signedBlob.length >= 8) {
+                uint32_t encodedMagic = 0;
+                uint32_t encodedLength = 0;
+                memcpy(&encodedMagic, signedBlob.bytes,
+                       sizeof(encodedMagic));
+                memcpy(&encodedLength,
+                       (const uint8_t *)signedBlob.bytes + 4,
+                       sizeof(encodedLength));
+                uint32_t magic = CFSwapInt32BigToHost(encodedMagic);
+                uint32_t length = CFSwapInt32BigToHost(encodedLength);
+                if (magic == 0xfade7172U &&
+                    length == signedBlob.length && length > 8) {
+                    derPayload = [signedBlob subdataWithRange:
+                        NSMakeRange(8, length - 8)];
+                }
+            }
+        }
+        if (derPayload && ceRuntime && ceNoError &&
+            contextFromData && contextToDictionary && releaseContext) {
+            MacWSCEQueryContext context = NULL;
+            MacWSCEError contextStatus = contextFromData(
+                ceRuntime, (__bridge CFDataRef)derPayload, &context);
+            if (contextStatus == ceNoError && context) {
+                CFDictionaryRef decoded = NULL;
+                MacWSCEError decodeStatus = contextToDictionary(
+                    context, &decoded);
+                releaseContext(&context);
+                if (decodeStatus == ceNoError && decoded) {
+                    if (CFGetTypeID(decoded) == CFDictionaryGetTypeID())
+                        result = [(__bridge NSDictionary *)decoded copy];
+                    CFRelease(decoded);
+                }
+            }
+        }
+    }
+    CFRelease(signingInformation);
+    return result;
+}
+
+typedef id (*MacWSLSPlugInKitProxyEntitlementsFn)(id, SEL);
+static MacWSLSPlugInKitProxyEntitlementsFn
+    g_macws_ls_plugin_proxy_entitlements;
+static const void *g_macws_ls_plugin_proxy_signed_entitlements_key =
+    &g_macws_ls_plugin_proxy_signed_entitlements_key;
+
+static id macws_ls_plugin_proxy_entitlements(id proxy, SEL command) {
+    id recorded = g_macws_ls_plugin_proxy_entitlements
+        ? g_macws_ls_plugin_proxy_entitlements(proxy, command) : nil;
+    if ([recorded isKindOfClass:NSDictionary.class] &&
+        [(NSDictionary *)recorded count] != 0)
+        return recorded;
+
+    id cached = objc_getAssociatedObject(
+        proxy, g_macws_ls_plugin_proxy_signed_entitlements_key);
+    if (cached) return cached;
+    SEL bundleURLSelector = sel_registerName("bundleURL");
+    NSURL *bundleURL = [proxy respondsToSelector:bundleURLSelector]
+        ? ((id (*)(id, SEL))objc_msgSend)(proxy, bundleURLSelector) : nil;
+    NSDictionary *signedEntitlements =
+        macws_signed_entitlements_for_plugin_url(bundleURL);
+    if (signedEntitlements.count == 0) return recorded;
+    objc_setAssociatedObject(
+        proxy, g_macws_ls_plugin_proxy_signed_entitlements_key,
+        signedEntitlements, OBJC_ASSOCIATION_COPY_NONATOMIC);
+    if (getenv("MACWS_RUNTIME_DIAGNOSTICS")) {
+        SEL identifierSelector = sel_registerName("pluginIdentifier");
+        id identifier = [proxy respondsToSelector:identifierSelector]
+            ? ((id (*)(id, SEL))objc_msgSend)(proxy, identifierSelector)
+            : nil;
+        fprintf(stderr,
+                "#### MACWS-PKD restored signed entitlements plugin=%s "
+                "URL=%s keys=%lu\n",
+                [[identifier description] UTF8String] ?: "<nil>",
+                [[bundleURL description] UTF8String] ?: "<nil>",
+                (unsigned long)signedEntitlements.count);
+    }
+    return signedEntitlements;
+}
+
+static void macws_try_install_pkd_signed_entitlements_adapter(
+    const struct mach_header *header, intptr_t slide) {
+    (void)header;
+    (void)slide;
+    if (g_macws_ls_plugin_proxy_entitlements) return;
+    Class proxyClass = objc_getClass("LSPlugInKitProxy");
+    SEL selector = sel_registerName("entitlements");
+    Method method = proxyClass
+        ? class_getInstanceMethod(proxyClass, selector) : NULL;
+    if (!method) return;
+    MSHookMessageEx(proxyClass, selector,
+                    (IMP)macws_ls_plugin_proxy_entitlements,
+                    (IMP *)&g_macws_ls_plugin_proxy_entitlements);
+    if (getenv("MACWS_RUNTIME_DIAGNOSTICS")) {
+        fprintf(stderr,
+                "#### MACWS-PKD installed signed-entitlements adapter "
+                "class=%p orig=%p\n",
+                proxyClass, g_macws_ls_plugin_proxy_entitlements);
+    }
+}
+
+static void macws_install_pkd_signed_entitlements_adapter(void) {
+    const char *program = getprogname();
+    if (!program || strcmp(program, "pkd") != 0) return;
+    _dyld_register_func_for_add_image(
+        macws_try_install_pkd_signed_entitlements_adapter);
 }
 
 // Ventura cfprefsd selects its daemon/agent role from the launchd session when
@@ -12008,6 +13120,36 @@ kern_return_t bootstrap_check_in3_new(mach_port_t bp, const char *name,
 extern xpc_connection_t macws_xpc_connection_create_mach_service_raw(
     const char *, dispatch_queue_t, uint64_t)
     __asm("_xpc_connection_create_mach_service");
+
+#define MACWS_QUICKLOOK_SATELLITE_CONNECTION_SLOTS 32
+static _Atomic(uintptr_t) g_macws_quicklook_satellite_connections[
+    MACWS_QUICKLOOK_SATELLITE_CONNECTION_SLOTS];
+static atomic_uint g_macws_quicklook_satellite_connection_cursor;
+
+static void macws_track_quicklook_satellite_connection(
+        xpc_connection_t connection) {
+    if (!connection) return;
+    unsigned slot = atomic_fetch_add_explicit(
+        &g_macws_quicklook_satellite_connection_cursor, 1,
+        memory_order_relaxed) % MACWS_QUICKLOOK_SATELLITE_CONNECTION_SLOTS;
+    atomic_store_explicit(&g_macws_quicklook_satellite_connections[slot],
+                          (uintptr_t)connection, memory_order_release);
+}
+
+static bool macws_take_quicklook_satellite_connection(
+        xpc_connection_t connection) {
+    uintptr_t expected = (uintptr_t)connection;
+    if (!expected) return false;
+    for (unsigned slot = 0;
+         slot < MACWS_QUICKLOOK_SATELLITE_CONNECTION_SLOTS; slot++) {
+        uintptr_t candidate = expected;
+        if (atomic_compare_exchange_strong_explicit(
+                &g_macws_quicklook_satellite_connections[slot], &candidate,
+                0, memory_order_acq_rel, memory_order_acquire)) return true;
+    }
+    return false;
+}
+
 xpc_connection_t macws_xpc_connection_create_mach_service_early(
     const char *name, dispatch_queue_t targetq, uint64_t flags) {
     const char *originalName = name;
@@ -12054,6 +13196,13 @@ xpc_connection_t macws_xpc_connection_create_listener_early(
 xpc_connection_t macws_xpc_connection_create_early(
     const char *name, dispatch_queue_t targetq) {
     macws_trace_xpc_name("xpc_service", name);
+    if (name && !strcmp(name, QUICKLOOK_SATELLITE_ORIG)) {
+        xpc_connection_t connection =
+            macws_xpc_connection_create_mach_service_raw(
+            QUICKLOOK_SATELLITE_NEW, targetq, 0);
+        macws_track_quicklook_satellite_connection(connection);
+        return connection;
+    }
     if (name && !strcmp(name, FRONTBOARD_SYSTEM_ORIG)) {
         return macws_xpc_connection_create_mach_service_raw(
             FRONTBOARD_SYSTEM_NEW, targetq, 0);
@@ -12089,6 +13238,17 @@ xpc_connection_t macws_xpc_connection_create_early(
     if (name && !strcmp(name, HISERVICES_SERVICE_ORIG)) {
         return macws_xpc_connection_create_mach_service_raw(
             HISERVICES_SERVICE_NEW, targetq, 0);
+    }
+    // RE-confirmed by Ventura 13.4 authd.xpc's Info.plist and its actual
+    // executable strings: Authorization clients connect to com.apple.authd.
+    // Runtime-confirmed on iPadOS 16.3.1: a minimal AuthorizationCreate call
+    // selected that exact XPC name and returned errAuthorizationInternal when
+    // it reached iPadOS's incompatible service. Route the stock Ventura client
+    // to the stock Ventura authd listener published by MacWS under a private
+    // Mach name. No rights, credentials, or reply values are synthesized.
+    if (name && !strcmp(name, AUTHD_SERVICE_ORIG)) {
+        return macws_xpc_connection_create_mach_service_raw(
+            AUTHD_SERVICE_NEW, targetq, 0);
     }
     // CarbonCore resolves its named-data helper with xpc_connection_create,
     // not the Mach-service constructor used by lsd/IconServices. Route this
@@ -12127,14 +13287,35 @@ xpc_connection_t macws_xpc_connection_create_early(
     return xpc_connection_create(name, targetq);
 }
 
+extern void macws_xpc_connection_set_instance_raw(
+    xpc_connection_t connection, const unsigned char instance[16])
+    __asm("_xpc_connection_set_instance");
+
+void macws_xpc_connection_set_instance_early(
+        xpc_connection_t connection, const unsigned char instance[16]) {
+    if (macws_take_quicklook_satellite_connection(connection)) {
+        // Ventura declares QuickLookSatellite as _MultipleInstances and the
+        // thumbnail agent assigns a fresh XPC-service instance UUID before it
+        // resumes the connection. MacWS deliberately translates that launch
+        // request to one already-published private Mach listener because iOS
+        // launchd cannot activate the macOS XPC bundle. Forwarding the UUID to
+        // a named singleton asks libxpc for a non-existent instance and was
+        // runtime-confirmed to deliver "Connection invalid" before the
+        // listener saw a peer. Consume only this activation metadata; the
+        // stock setup/request dictionaries and reply protocol remain intact.
+        return;
+    }
+    macws_xpc_connection_set_instance_raw(connection, instance);
+}
+
 extern void macws_xpc_main_raw(xpc_connection_handler_t handler)
     __asm("_xpc_main") __attribute__((noreturn));
 
-// xpc_main only accepts a process born as an XPCService.  The root ViewBridge
-// and ExtensionKit jobs are deliberately launchd Mach services so their
+// xpc_main only accepts a process born as an XPCService.  These root MacWS
+// jobs are deliberately launchd Mach services so their
 // freestanding proxies can chroot without a setuid transition; runtime oslog
 // showed stock xpc_main otherwise exits with XPC_EXIT_REASON_UNMANAGED.  Adapt
-// only those two launch contexts to libxpc's supported Mach-listener API and
+// only those selected launch contexts to libxpc's supported Mach-listener API and
 // pass each connection to the original service handler.  Listener-name
 // requests, anonymous sublisteners, replies and protocol delegates remain the
 // unmodified Ventura implementations.
@@ -12158,6 +13339,13 @@ void macws_xpc_main(xpc_connection_handler_t handler) {
                strcmp(service, "com.macwsguide.csnameddatad") == 0) {
         privateMachService =
             "com.apple.macosbooter.carboncore.csnameddata";
+    } else if (program && strcmp(program, "authd") == 0 && service &&
+               strcmp(service, "com.macwsguide.authd") == 0) {
+        privateMachService = AUTHD_SERVICE_NEW;
+    } else if (program && strcmp(program, "QuickLookSatellite") == 0 &&
+               service && strcmp(service,
+                    "com.macwsguide.quicklook-satellite") == 0) {
+        privateMachService = QUICKLOOK_SATELLITE_NEW;
     }
     if (privateMachService && getuid() == 0 && geteuid() == 0) {
         xpc_connection_t listener =
@@ -12177,23 +13365,30 @@ void macws_xpc_main(xpc_connection_handler_t handler) {
 }
 
 __attribute__((constructor))
-static void macws_install_hiservices_xpc_main_import(void) {
+static void macws_install_service_xpc_main_import(void) {
     const char *program = getprogname();
     if (!program ||
-        strcmp(program, "com.apple.hiservices-xpcservice") != 0) return;
+        (strcmp(program, "com.apple.hiservices-xpcservice") != 0 &&
+         strcmp(program, "QuickLookSatellite") != 0)) return;
 
     const struct mach_header *mainHeader = _dyld_get_image_header(0);
     if (!mainHeader || mainHeader->magic != MH_MAGIC_64) return;
     // Do not hook libxpc or suspend any threads here. Repair only the target
     // executable's symbol-table-identified authenticated import before main
-    // reaches its single xpc_main call. This preserves the stock HIServices
-    // request handler and wire protocol while changing only the launch-context
-    // adapter required by the chroot proxy.
+    // reaches its single xpc_main call. This preserves each stock request
+    // handler and wire protocol while changing only the launch-context adapter
+    // required by the chroot proxy. Runtime LLDB on Ventura's actual
+    // QuickLookSatellite confirmed main+0x14 branches through the xpc_main
+    // stub, and a run without this forced main-image repair exits verbatim with
+    // "An XPC Service cannot be run directly."
     macws_repair_got_via_symtab(
         (const struct mach_header_64 *)mainHeader,
         _dyld_get_image_vmaddr_slide(0),
-        "com.apple.hiservices-xpcservice(main)");
+        strcmp(program, "QuickLookSatellite") == 0
+            ? "QuickLookSatellite(main)"
+            : "com.apple.hiservices-xpcservice(main)");
 }
+
 DYLD_INTERPOSE(bootstrap_look_up_new, bootstrap_look_up);
 DYLD_INTERPOSE(bootstrap_check_in_new, bootstrap_check_in);
 DYLD_INTERPOSE(bootstrap_look_up2_new, bootstrap_look_up2);
@@ -12202,6 +13397,8 @@ DYLD_INTERPOSE(bootstrap_check_in2_new, bootstrap_check_in2);
 DYLD_INTERPOSE(bootstrap_check_in3_new, bootstrap_check_in3);
 DYLD_INTERPOSE(macws_xpc_connection_create_mach_service_early,
                macws_xpc_connection_create_mach_service_raw);
+DYLD_INTERPOSE(macws_xpc_connection_set_instance_early,
+               macws_xpc_connection_set_instance_raw);
 DYLD_INTERPOSE(macws_xpc_connection_create_listener_early,
                macws_xpc_connection_create_listener_raw);
 DYLD_INTERPOSE(macws_xpc_connection_create_early, xpc_connection_create);
@@ -12922,11 +14119,12 @@ DYLD_INTERPOSE(macws_IOSurfaceGetAddressFormatOfPlane,
 // IOSurfaceName key being EXACTLY "CA Framebuffer" plus the FourCC's high byte
 // being 0x26 (Apple compression marker), which excludes every other surface.
 IOSurfaceRef IOSurfaceCreate_safe(CFDictionaryRef properties_cf) {
-    if (getenv("MACWS_IOSURF_TRACE") != NULL) {
+    bool traceIOSurfaceCreate = getenv("MACWS_IOSURF_TRACE") != NULL;
+    if (traceIOSurfaceCreate) {
         fprintf(stderr, "#### IOSURF_HOOK call cf=%p\n", (void *)properties_cf);
     }
     if (!properties_cf) {
-        return IOSurfaceCreate((NSDictionary *)properties_cf);
+        return IOSurfaceCreate(properties_cf);
     }
     // This interposer's dictionary inspection is a WindowServer-only ABI
     // translation.  Keep the process gate ahead of *every* dictionary access,
@@ -12940,7 +14138,91 @@ IOSurfaceRef IOSurfaceCreate_safe(CFDictionaryRef properties_cf) {
             s_is_ws = (prog && strstr(prog, "WindowServer")) ? 1 : 0;
         }
         if (!s_is_ws) {
-            return IOSurfaceCreate((NSDictionary *)properties_cf);
+            IOSurfaceRef result = NULL;
+            BOOL normalizedImageKitDimensions = NO;
+            Dl_info caller = {0};
+            void *returnAddress = __builtin_return_address(0);
+            BOOL imageKitCaller =
+                dladdr(returnAddress, &caller) && caller.dli_fname &&
+                strstr(caller.dli_fname, "/ImageKit.framework/");
+            if (imageKitCaller &&
+                CFGetTypeID(properties_cf) == CFDictionaryGetTypeID()) {
+                CFNumberRef width = (CFNumberRef)CFDictionaryGetValue(
+                    properties_cf, kIOSurfaceWidth);
+                CFNumberRef height = (CFNumberRef)CFDictionaryGetValue(
+                    properties_cf, kIOSurfaceHeight);
+                BOOL floatingWidth = width &&
+                    CFGetTypeID(width) == CFNumberGetTypeID() &&
+                    CFNumberIsFloatType(width);
+                BOOL floatingHeight = height &&
+                    CFGetTypeID(height) == CFNumberGetTypeID() &&
+                    CFNumberIsFloatType(height);
+                if (floatingWidth || floatingHeight) {
+                    double widthValue = 0.0;
+                    double heightValue = 0.0;
+                    BOOL validWidth = !floatingWidth ||
+                        (CFNumberGetValue(width, kCFNumberDoubleType,
+                                          &widthValue) &&
+                         isfinite(widthValue) && widthValue > 0.0 &&
+                         widthValue <= (double)UINT32_MAX &&
+                         floor(widthValue) == widthValue);
+                    BOOL validHeight = !floatingHeight ||
+                        (CFNumberGetValue(height, kCFNumberDoubleType,
+                                          &heightValue) &&
+                         isfinite(heightValue) && heightValue > 0.0 &&
+                         heightValue <= (double)UINT32_MAX &&
+                         floor(heightValue) == heightValue);
+                    if (validWidth && validHeight) {
+                        CFMutableDictionaryRef normalized =
+                            CFDictionaryCreateMutableCopy(
+                                kCFAllocatorDefault, 0, properties_cf);
+                        CFNumberRef integerWidth = NULL;
+                        CFNumberRef integerHeight = NULL;
+                        if (normalized && floatingWidth) {
+                            int64_t integerValue = (int64_t)widthValue;
+                            integerWidth = CFNumberCreate(
+                                kCFAllocatorDefault, kCFNumberSInt64Type,
+                                &integerValue);
+                            if (integerWidth) {
+                                CFDictionarySetValue(
+                                    normalized, kIOSurfaceWidth,
+                                    integerWidth);
+                            }
+                        }
+                        if (normalized && floatingHeight) {
+                            int64_t integerValue = (int64_t)heightValue;
+                            integerHeight = CFNumberCreate(
+                                kCFAllocatorDefault, kCFNumberSInt64Type,
+                                &integerValue);
+                            if (integerHeight) {
+                                CFDictionarySetValue(
+                                    normalized, kIOSurfaceHeight,
+                                    integerHeight);
+                            }
+                        }
+                        normalizedImageKitDimensions = normalized &&
+                            (!floatingWidth || integerWidth) &&
+                            (!floatingHeight || integerHeight);
+                        if (normalizedImageKitDimensions) {
+                            result = IOSurfaceCreate(normalized);
+                        }
+                        if (integerWidth) CFRelease(integerWidth);
+                        if (integerHeight) CFRelease(integerHeight);
+                        if (normalized) CFRelease(normalized);
+                    }
+                }
+            }
+            if (!normalizedImageKitDimensions) {
+                result = IOSurfaceCreate(properties_cf);
+            }
+            if (traceIOSurfaceCreate) {
+                fprintf(stderr,
+                    "#### IOSURF_HOOK return cf=%p surface=%p "
+                    "imagekit-dimensions-normalized=%d\n",
+                    (void *)properties_cf, (void *)result,
+                    normalizedImageKitDimensions);
+            }
+            return result;
         }
     }
     // OOM leak diagnostic (2026-06-20): count creates + per-caller bytes.
@@ -12977,7 +14259,7 @@ IOSurfaceRef IOSurfaceCreate_safe(CFDictionaryRef properties_cf) {
     // CoreImage sometimes passes a CFDictionary whose -objectForKey: is not a
     // real NSDictionary bridge — fall back to the raw CFDictionaryGetValue.
     if (CFGetTypeID(properties_cf) != CFDictionaryGetTypeID()) {
-        return IOSurfaceCreate((NSDictionary *)properties_cf);
+        return IOSurfaceCreate(properties_cf);
     }
     CFNumberRef pfNum = (CFNumberRef)CFDictionaryGetValue(properties_cf,
         (const void *)CFSTR("IOSurfacePixelFormat"));
@@ -12993,7 +14275,7 @@ IOSurfaceRef IOSurfaceCreate_safe(CFDictionaryRef properties_cf) {
         is_ca_fb = (CFStringCompare(name, CFSTR("CA Framebuffer"), 0) == kCFCompareEqualTo);
     }
     if (!(is_apple_compressed && is_ca_fb)) {
-        return IOSurfaceCreate((NSDictionary *)properties_cf);
+        return IOSurfaceCreate(properties_cf);
     }
     // Rebuild as plain BGRA8 — drop the compression-metadata plane and the
     // private FourCC so MTLSimDriverHost can wrap it as MTLPixelFormatBGRA8Unorm.
@@ -13003,7 +14285,7 @@ IOSurfaceRef IOSurfaceCreate_safe(CFDictionaryRef properties_cf) {
     if (wNum && CFGetTypeID(wNum) == CFNumberGetTypeID()) CFNumberGetValue(wNum, kCFNumberSInt32Type, &w);
     if (hNum && CFGetTypeID(hNum) == CFNumberGetTypeID()) CFNumberGetValue(hNum, kCFNumberSInt32Type, &h);
     if (w <= 0 || h <= 0) {
-        return IOSurfaceCreate((NSDictionary *)properties_cf);
+        return IOSurfaceCreate(properties_cf);
     }
     const int bpe = 4;                         // BGRA8 = 4 bytes/pixel
     size_t bytesPerRow = (size_t)w * (size_t)bpe;
@@ -13035,7 +14317,7 @@ IOSurfaceRef IOSurfaceCreate_safe(CFDictionaryRef properties_cf) {
         @"IOSurfacePlaneSize": @(planeSize),
         @"IOSurfaceAddressFormat": @0,
     } ];
-    IOSurfaceRef result = IOSurfaceCreate(np);
+    IOSurfaceRef result = IOSurfaceCreate((CFDictionaryRef)np);
     fprintf(stderr, "#### IOSURF/CA_FB rewrote %dx%d pf=0x%x->BGRA8 result=%p\n",
         w, h, pf, (void *)result);
     return result;
