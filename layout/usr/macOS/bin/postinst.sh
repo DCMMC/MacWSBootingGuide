@@ -1129,6 +1129,7 @@ for workspace_binary in \
     '/var/mnt/rootfs/System/Library/CoreServices/Dock.app/Contents/MacOS/Dock' \
     '/var/mnt/rootfs/System/Library/CoreServices/Dock.app/Contents/XPCServices/DockHelper.xpc/Contents/MacOS/DockHelper' \
     '/var/mnt/rootfs/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/CarbonCore.framework/Versions/A/XPCServices/csnameddatad.xpc/Contents/MacOS/csnameddatad' \
+    '/var/mnt/rootfs/System/Library/CoreServices/coreservicesd' \
     '/var/mnt/rootfs/System/Library/Frameworks/Security.framework/Versions/A/XPCServices/authd.xpc/Contents/MacOS/authd' \
     '/var/mnt/rootfs/System/Library/PrivateFrameworks/DesktopServicesPriv.framework/Versions/A/Resources/DesktopServicesHelper' \
     '/var/mnt/rootfs/System/Library/CoreServices/SystemUIServer.app/Contents/MacOS/SystemUIServer' \

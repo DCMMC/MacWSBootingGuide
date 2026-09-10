@@ -2143,6 +2143,16 @@ static BOOL macws_needs_application_mount_namespace_compatibility(void) {
          strcmp(program, "Finder") == 0 ||
          strcmp(program, "iconservicesagent") == 0 ||
          strcmp(program, "iconservicesd") == 0 ||
+         // Runtime-confirmed in quicklookd-2026-09-09-142033.ips: the
+         // Ventura preview daemon overflowed its stack in the identical
+         // CoreServicesInternal FileCache/CFURL finalization cycle after its
+         // file URLs inherited the host `/private/var` mount identity.  The
+         // thumbnail agent and satellite are the other two stock Ventura
+         // members of that same Quick Look file-metadata pipeline, so keep
+         // all three on one logical-root volume contract.
+         strcmp(program, "quicklookd") == 0 ||
+         strcmp(program, "com.apple.quicklook.ThumbnailsAgent") == 0 ||
+         strcmp(program, "QuickLookSatellite") == 0 ||
          // Runtime-confirmed in sharedfilelistd-2026-08-13-073755.ips:
          // Ventura's SharedFileList worker hit the same four-node
          // CoreServicesInternal FileCache/CFURL finalization recursion as
@@ -21643,6 +21653,8 @@ static const char *macws_private_chroot_service_name(const char *name) {
         return "com.apple.macosbooter.quicklook.satellite";
     if (!strcmp(name, "com.apple.carboncore.csnameddata"))
         return "com.apple.macosbooter.carboncore.csnameddata";
+    if (!strcmp(name, "com.apple.CoreServices.coreservicesd"))
+        return "com.apple.macosbooter.CoreServices.coreservicesd";
     if (!strcmp(name, "com.apple.dock.helper"))
         return "com.apple.macosbooter.dock.helper";
     if (!strcmp(name, "com.apple.FileCoordination"))

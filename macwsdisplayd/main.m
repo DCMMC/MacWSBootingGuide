@@ -2065,10 +2065,20 @@ static void ApplyWorkspaceGeometryDescriptions(
         if (windowID.unsignedIntValue) byWindow[windowID] = info;
     }
     CGRect desktopBounds = CGDisplayBounds(CGMainDisplayID());
-    if (CGRectIsEmpty(desktopBounds)) return;
     for (MacWSDisplayClient *client in [Clients copy]) {
-        if (!client.subscriptionActive || client.deliveryPaused ||
-            client.mode != MacWSStreamModeFullscreen) continue;
+        if (!client.subscriptionActive || client.deliveryPaused) continue;
+        BOOL fullscreen = client.mode == MacWSStreamModeFullscreen;
+        BOOL windowed = client.mode == MacWSStreamModeWindow &&
+            client.windowID != 0;
+        if ((!fullscreen && !windowed) ||
+            (fullscreen && CGRectIsEmpty(desktopBounds))) continue;
+        CGRect baseBounds = CGRectZero;
+        if (windowed) {
+            NSDictionary *baseInfo = byWindow[@(client.windowID)];
+            if (!baseInfo || !CGRectMakeWithDictionaryRepresentation(
+                    (__bridge CFDictionaryRef)baseInfo[(id)kCGWindowBounds],
+                    &baseBounds) || CGRectIsEmpty(baseBounds)) continue;
+        }
         CGFloat scale = client.windowBackingScale > 0.0
             ? client.windowBackingScale : MainDisplayBackingScale();
         if (!isfinite(scale) || scale < 0.5 || scale > 8.0) continue;
@@ -2103,9 +2113,19 @@ static void ApplyWorkspaceGeometryDescriptions(
                            IOSurfaceGetHeight(layer.latestSurface), scale,
                            presentationScale);
             }
-            CGRect destination = MacWSWorkspaceLayerDestination(
-                client, layer, bounds, desktopBounds, presentationScale,
-                usedSurfaceMeasurement);
+            CGRect destination = fullscreen
+                ? MacWSWorkspaceLayerDestination(
+                    client, layer, bounds, desktopBounds, presentationScale,
+                    usedSurfaceMeasurement)
+                : CGRectMake(
+                    (bounds.origin.x - baseBounds.origin.x) * scale,
+                    (bounds.origin.y - baseBounds.origin.y) * scale,
+                    usedSurfaceMeasurement
+                        ? IOSurfaceGetWidth(layer.latestSurface)
+                        : bounds.size.width * scale,
+                    usedSurfaceMeasurement
+                        ? IOSurfaceGetHeight(layer.latestSurface)
+                        : bounds.size.height * scale);
             if (CGRectEqualToRect(layer.destinationBounds, destination))
                 continue;
             layer.destinationBounds = destination;
@@ -2135,8 +2155,11 @@ static void RequestWorkspaceGeometrySample(void) {
     NSMutableOrderedSet<NSNumber *> *identifiers = [NSMutableOrderedSet
         orderedSet];
     for (MacWSDisplayClient *client in [Clients copy]) {
-        if (!client.subscriptionActive || client.deliveryPaused ||
-            client.mode != MacWSStreamModeFullscreen) continue;
+        if (!client.subscriptionActive || client.deliveryPaused) continue;
+        if (client.mode == MacWSStreamModeWindow && client.windowID != 0)
+            [identifiers addObject:@(client.windowID)];
+        else if (client.mode != MacWSStreamModeFullscreen)
+            continue;
         for (NSNumber *key in client.transientLayers) {
             MacWSTransientLayer *layer = client.transientLayers[key];
             if (layer.latestSurface && !layer.retiring)
@@ -2325,6 +2348,35 @@ static void StartTransientLayer(MacWSTransientLayer *layer) {
             if (!strongLayer || !strongClient ||
                 strongLayer.streamID != generation) return;
             if (status == kCGDisplayStreamFrameStatusFrameComplete) {
+                if (strongClient.mode == MacWSStreamModeWindow) {
+                    // A window Scene is expressed in the base capture's pixel
+                    // coordinate space. The exact transient IOSurface is the
+                    // authoritative size in that same space; using
+                    // CGWindow-point bounds multiplied by the base scale can
+                    // stretch utility panels whose presentation scale differs
+                    // from their presenter during creation. Commit the real
+                    // surface size before publishing its first frame so Host
+                    // never displays one distorted generation.
+                    size_t surfaceWidth = IOSurfaceGetWidth(frameSurface);
+                    size_t surfaceHeight = IOSurfaceGetHeight(frameSurface);
+                    CGRect destination = strongLayer.destinationBounds;
+                    BOOL corrected = surfaceWidth && surfaceHeight &&
+                        (fabs(destination.size.width - surfaceWidth) > 0.5 ||
+                         fabs(destination.size.height - surfaceHeight) > 0.5);
+                    if (corrected) {
+                        DisplayLog(@"runtime-confirmed window-layer-size "
+                                   "base=%u layer=%u catalog=%.0fx%.0f "
+                                   "surface=%zux%zu route=surface-authority",
+                                   strongClient.windowID,
+                                   strongLayer.windowID,
+                                   destination.size.width,
+                                   destination.size.height,
+                                   surfaceWidth, surfaceHeight);
+                        destination.size = CGSizeMake(surfaceWidth,
+                                                      surfaceHeight);
+                        strongLayer.destinationBounds = destination;
+                    }
+                }
                 // Runtime-confirmed during Stray: treating every exact-window
                 // frame as a mutation of the desktop-material base expired
                 // final-composite after one second, restarted the full Dock /
@@ -3371,12 +3423,20 @@ static void ReconcileTransientStreams(void) {
             NSNumber *key = @(candidateWindowID);
             [seen addObject:key];
             attached++;
+            MacWSTransientLayer *layer = client.transientLayers[key];
+            BOOL usedSurfaceMeasurement = NO;
+            CGFloat presentationScale = LayerPresentationScale(
+                candidateBounds, layer.latestSurface, scale,
+                &usedSurfaceMeasurement);
             CGRect destination = CGRectMake(
                 (candidateBounds.origin.x - baseBounds.origin.x) * scale,
                 (candidateBounds.origin.y - baseBounds.origin.y) * scale,
-                candidateBounds.size.width * scale,
-                candidateBounds.size.height * scale);
-            MacWSTransientLayer *layer = client.transientLayers[key];
+                usedSurfaceMeasurement
+                    ? IOSurfaceGetWidth(layer.latestSurface)
+                    : candidateBounds.size.width * presentationScale,
+                usedSurfaceMeasurement
+                    ? IOSurfaceGetHeight(layer.latestSurface)
+                    : candidateBounds.size.height * presentationScale);
             BOOL isNew = layer == nil;
             if (isNew) {
                 layer = [MacWSTransientLayer new];

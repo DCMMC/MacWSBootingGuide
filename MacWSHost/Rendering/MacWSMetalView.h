@@ -57,6 +57,7 @@ typedef NS_ENUM(NSUInteger, MacWSHostPresentationResolution) {
 @property(nonatomic, readonly) BOOL hasFinalCompositeFrame;
 @property(nonatomic, readonly) BOOL streamServiceConnected;
 @property(nonatomic, readonly) CGFloat effectiveDensityScale;
+@property(nonatomic, readonly) BOOL windowConfigurationAwaitingAcknowledgement;
 @property(nonatomic, readonly) MacWSPerformanceMonitor *performanceMonitor;
 - (void)setMacWSInputEnabled:(BOOL)enabled
                       reason:(nullable NSString *)reason;
@@ -68,6 +69,8 @@ typedef NS_ENUM(NSUInteger, MacWSHostPresentationResolution) {
 - (void)resetViewportZoom;
 - (void)geometryDidChange;
 - (void)observeTargetWindowLogicalSize:(CGSize)logicalSize;
+- (void)beginSceneResizeFollowingTargetWindowLogicalSize:(CGSize)logicalSize;
+- (void)cancelSceneResizeFollowingTargetWindow;
 - (void)suspendStream;
 - (void)emitSoftwareText:(NSString *)text modifiers:(uint32_t)modifiers;
 - (void)emitSoftwareKeySym:(uint32_t)keySym modifiers:(uint32_t)modifiers;

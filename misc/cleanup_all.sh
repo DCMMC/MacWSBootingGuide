@@ -86,7 +86,7 @@ sleep 3
 for p in $(jobs -p); do kill -9 $p 2>/dev/null; done
 
 echo === killing chroot processes ===
-for pat in WindowServer launchservicesd OSXvnc-server Terminal GlassDemo \
+for pat in WindowServer launchservicesd coreservicesd OSXvnc-server Terminal GlassDemo \
            "Activity Monitor" launchdchrootexec MTLSimDriverHost macwsinputd \
            macwsdisplayd macwsinteropd \
            "Visual Studio Code.app" "Code Helper" \
@@ -166,7 +166,7 @@ sleep 2
 echo
 echo === final state ===
 ps aux | grep -iE \
-  "WindowServer|macwsallocd|macwsinputd|macwsdisplayd|macwsinteropd|OSXvnc|autosignd|launchdchroot|GlassDemo|Terminal|launchservicesd|Visual Studio Code|Code Helper|Google Chrome|Chrome Helper|Steam Helper|Steam.app/Contents/MacOS/steam_osx|MacWSHost" \
+  "WindowServer|macwsallocd|macwsinputd|macwsdisplayd|macwsinteropd|OSXvnc|autosignd|launchdchroot|GlassDemo|Terminal|launchservicesd|coreservicesd|Visual Studio Code|Code Helper|Google Chrome|Chrome Helper|Steam Helper|Steam.app/Contents/MacOS/steam_osx|MacWSHost" \
   | grep -v grep | head -10 || echo "(none)"
 echo
 uptime

@@ -71,6 +71,7 @@ static NSMutableSet<NSString *> *MacWSSceneSessionsPreservingMacWindow;
 static NSMutableDictionary<NSString *, NSUserActivity *> *MacWSSceneBindings;
 static NSMutableSet<NSString *> *MacWSSceneCloseRequestsSent;
 static NSMutableSet<NSString *> *MacWSObservedWindowIdentities;
+static NSMutableSet<NSString *> *MacWSPreviouslyFrontmostWindowIdentities;
 static NSMutableSet<NSString *> *MacWSPendingWindowSceneIdentities;
 static NSMutableDictionary<NSString *, NSNumber *> *MacWSClosingWindowIdentities;
 static NSString *const MacWSSceneBindingsDefaultsKey =
@@ -162,6 +163,8 @@ static NSString *MacWSLocalizedPhase(NSString *phase) {
 - (void)resumeSceneStream;
 - (void)cancelBootstrapTerminal;
 - (void)sceneGeometryDidChange;
+- (void)followNativeSceneSizeForAppliedLogicalSize:(CGSize)logicalSize
+                                            reason:(NSString *)reason;
 - (BOOL)activateCurrentMacWindow;
 - (BOOL)activateMacWindow:(MacWSStreamWindow *)window;
 - (BOOL)isFullscreenWorkspace;
@@ -1032,6 +1035,7 @@ typedef void (^MacWSCompactMenuSelection)(MacWSMenuItem *item);
     MacWSMenuSnapshot *_menuSnapshot;
     UIVisualEffectView *_semanticMenuBar;
     NSLayoutConstraint *_semanticMenuHeightConstraint;
+    NSLayoutConstraint *_semanticMenuContentTopConstraint;
     UIScrollView *_semanticMenuScroll;
     UIStackView *_semanticMenuTitles;
     UIViewController *_semanticMenuPanel;
@@ -1199,7 +1203,9 @@ typedef void (^MacWSCompactMenuSelection)(MacWSMenuItem *item);
 - (void)updateWorkspaceChrome {
     BOOL fullscreen = _streamMode == MacWSStreamModeFullscreen;
     _semanticMenuBar.hidden = fullscreen;
-    _semanticMenuHeightConstraint.constant = fullscreen ? 0.0 : 26.0;
+    CGFloat safeTop = MAX(0.0, self.view.safeAreaInsets.top);
+    _semanticMenuHeightConstraint.constant = fullscreen ? 0.0 : 28.0 + safeTop;
+    _semanticMenuContentTopConstraint.constant = fullscreen ? 0.0 : safeTop;
     if (_menuBarButton) {
         [self setButton:_menuBarButton
                   title:fullscreen
@@ -1212,6 +1218,15 @@ typedef void (^MacWSCompactMenuSelection)(MacWSMenuItem *item);
     }
     _closeWindowButton.hidden = fullscreen || _windowID == 0;
     [self.view setNeedsLayout];
+}
+
+- (void)viewSafeAreaInsetsDidChange {
+    [super viewSafeAreaInsetsDidChange];
+    // In Stage Manager the native scene title strip is represented by the
+    // top safe-area inset. Extend the same semantic material through it so
+    // the scene no longer exposes the root view's black background above the
+    // simulated menu bar.
+    [self updateWorkspaceChrome];
 }
 
 - (void)restoreWorkspaceReturnFromActivity:(NSUserActivity *)activity {
@@ -1870,7 +1885,7 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
 
 - (void)loadView {
     UIView *root = [UIView new];
-    root.backgroundColor = UIColor.blackColor;
+    root.backgroundColor = UIColor.systemBackgroundColor;
     self.view = root;
 
     _metalView = [[MacWSMetalView alloc] initWithFrame:CGRectZero];
@@ -2064,13 +2079,13 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
     _crossAppDragHandleTitle.userInteractionEnabled = NO;
     _crossAppDragHandleTitle.hidden = YES;
     [root addSubview:_crossAppDragHandleTitle];
-    MacWSPerformanceHUDMode savedHUDMode = (MacWSPerformanceHUDMode)
-        [NSUserDefaults.standardUserDefaults integerForKey:
-            @"MacWSPerformanceHUDMode"];
-    if (savedHUDMode < MacWSPerformanceHUDModeOff ||
-        savedHUDMode > MacWSPerformanceHUDModeFull)
-        savedHUDMode = MacWSPerformanceHUDModeOff;
-    _metalView.performanceMonitor.HUDMode = savedHUDMode;
+    // The performance controls are no longer part of the product control
+    // center. Clear a previously persisted HUD selection as well; otherwise a
+    // user who enabled it on an older build would retain an overlay with no UI
+    // affordance for turning it back off.
+    [NSUserDefaults.standardUserDefaults removeObjectForKey:
+        @"MacWSPerformanceHUDMode"];
+    _metalView.performanceMonitor.HUDMode = MacWSPerformanceHUDModeOff;
     [_metalView.performanceMonitor attachHUDToView:root];
 
     // The iPadOS Scene exists before its default Terminal window is launched.
@@ -2098,13 +2113,14 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
             colorWithAlphaComponent:0.58];
         [_semanticMenuBar.contentView addSubview:menuSeparator];
         [root addSubview:_semanticMenuBar];
+        _semanticMenuContentTopConstraint = [_semanticMenuScroll.topAnchor
+            constraintEqualToAnchor:_semanticMenuBar.contentView.topAnchor];
         [NSLayoutConstraint activateConstraints:@[
             [_semanticMenuScroll.leadingAnchor constraintEqualToAnchor:
                 _semanticMenuBar.contentView.leadingAnchor constant:4],
             [_semanticMenuScroll.trailingAnchor constraintEqualToAnchor:
                 _semanticMenuBar.contentView.trailingAnchor constant:-40],
-            [_semanticMenuScroll.topAnchor constraintEqualToAnchor:
-                _semanticMenuBar.contentView.topAnchor],
+            _semanticMenuContentTopConstraint,
             [_semanticMenuScroll.bottomAnchor constraintEqualToAnchor:
                 _semanticMenuBar.contentView.bottomAnchor],
             [_semanticMenuTitles.leadingAnchor constraintEqualToAnchor:
@@ -2447,62 +2463,6 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
     [_densityControl addTarget:self action:@selector(densityChanged:)
                forControlEvents:UIControlEventValueChanged];
 
-    _presentationResolutionControl = [[UISegmentedControl alloc]
-        initWithItems:@[@"自动清晰", @"始终清晰", @"性能优先"]];
-    _presentationResolutionControl.selectedSegmentIndex =
-        _metalView.presentationResolution;
-    [_presentationResolutionControl addTarget:self
-        action:@selector(presentationResolutionChanged:)
-        forControlEvents:UIControlEventValueChanged];
-
-    _performanceHUDControl = [[UISegmentedControl alloc]
-        initWithItems:@[@"关闭", @"简洁", @"完整"]];
-    _performanceHUDControl.selectedSegmentIndex = savedHUDMode;
-    [_performanceHUDControl addTarget:self
-        action:@selector(performanceHUDChanged:)
-        forControlEvents:UIControlEventValueChanged];
-
-    _systemHUDTitleLabel = MacWSMakeLabel(@"Apple 系统渲染 HUD",
-        [UIFont preferredFontForTextStyle:UIFontTextStyleSubheadline],
-        UIColor.labelColor);
-    _systemHUDDetailLabel = MacWSMakeLabel(
-        @"QuartzCore RenderServer 全系统 FPS / GPU / 卡顿视图",
-        [UIFont preferredFontForTextStyle:UIFontTextStyleCaption1],
-        UIColor.secondaryLabelColor);
-    UIStackView *systemHUDLabels = [[UIStackView alloc]
-        initWithArrangedSubviews:@[_systemHUDTitleLabel,
-                                   _systemHUDDetailLabel]];
-    systemHUDLabels.axis = UILayoutConstraintAxisVertical;
-    systemHUDLabels.spacing = 2;
-    _systemPerformanceHUDSwitch = [UISwitch new];
-    NSInteger systemHUDLevel =
-        [MacWSPerformanceMonitor systemPerformanceHUDLevel];
-    _systemPerformanceHUDSwitch.on = systemHUDLevel > 0;
-    _systemPerformanceHUDSwitch.enabled = systemHUDLevel >= 0;
-    [_systemPerformanceHUDSwitch addTarget:self
-        action:@selector(systemPerformanceHUDChanged:)
-        forControlEvents:UIControlEventValueChanged];
-    UIStackView *systemHUDRow = [[UIStackView alloc]
-        initWithArrangedSubviews:@[systemHUDLabels,
-                                   _systemPerformanceHUDSwitch]];
-    systemHUDRow.axis = UILayoutConstraintAxisHorizontal;
-    systemHUDRow.alignment = UIStackViewAlignmentCenter;
-    systemHUDRow.spacing = 10;
-    _performanceResetButton = [self buttonWithTitle:@"重新计时"
-        image:@"stopwatch" action:@selector(resetPerformanceMeasurement)
-        prominent:NO];
-    _performanceExportButton = [self buttonWithTitle:@"导出 JSON"
-        image:@"square.and.arrow.up"
-        action:@selector(exportPerformanceMeasurement) prominent:NO];
-    UIStackView *performanceActions = [[UIStackView alloc]
-        initWithArrangedSubviews:@[_performanceResetButton,
-                                   _performanceExportButton]];
-    performanceActions.axis = UILayoutConstraintAxisHorizontal;
-    performanceActions.distribution = UIStackViewDistributionFillEqually;
-    performanceActions.spacing = 8;
-    _performanceRunButton = [self buttonWithTitle:@"运行标准触摸 / 手势回归"
-        image:@"hand.draw" action:@selector(runPerformanceGestureSuite)
-        prominent:NO];
     _zoomScaleControl = [[UISegmentedControl alloc]
         initWithItems:@[@"双指双击 1.5×", @"双指双击 2.0×"]];
     _zoomScaleControl.selectedSegmentIndex =
@@ -2536,7 +2496,6 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
     _languageSectionLabel = [self sectionTitle:@"语言"];
     _touchSectionLabel = [self sectionTitle:@"触摸方式"];
     _displaySectionLabel = [self sectionTitle:@"显示密度"];
-    _performanceSectionLabel = [self sectionTitle:@"性能测量"];
     _applicationsSectionLabel = [self sectionTitle:@"macOS 应用"];
     _zoomSectionLabel = [self sectionTitle:@"放大视角"];
     _startupLogSectionLabel = [self sectionTitle:@"启动日志（实时）"];
@@ -2560,15 +2519,9 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
         _inputModeControl,
         _displaySectionLabel,
         _densityControl,
-        _presentationResolutionControl,
         _keyboardButton,
         _primaryButton,
         _repairDesktopButton,
-        _performanceSectionLabel,
-        _performanceHUDControl,
-        systemHUDRow,
-        performanceActions,
-        _performanceRunButton,
         _applicationsSectionLabel,
         _appSearchField,
         appRow1,
@@ -2684,11 +2637,11 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
     ]];
     if (_semanticMenuBar) {
         _semanticMenuHeightConstraint = [_semanticMenuBar.heightAnchor
-            constraintEqualToConstant:26];
+            constraintEqualToConstant:28];
         [NSLayoutConstraint activateConstraints:@[
             [_semanticMenuBar.leadingAnchor constraintEqualToAnchor:root.leadingAnchor],
             [_semanticMenuBar.trailingAnchor constraintEqualToAnchor:root.trailingAnchor],
-            [_semanticMenuBar.topAnchor constraintEqualToAnchor:safe.topAnchor],
+            [_semanticMenuBar.topAnchor constraintEqualToAnchor:root.topAnchor],
             _semanticMenuHeightConstraint,
         ]];
         // _semanticMenuBar is constructed for every controller and hidden by
@@ -2870,6 +2823,38 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
     [self.view setNeedsLayout];
     [self.view layoutIfNeeded];
     [_metalView geometryDidChange];
+}
+
+- (void)followNativeSceneSizeForAppliedLogicalSize:(CGSize)logicalSize
+                                            reason:(NSString *)reason {
+    if (_streamMode != MacWSStreamModeWindow || _windowID == 0 ||
+        !isfinite(logicalSize.width) || !isfinite(logicalSize.height) ||
+        logicalSize.width <= 0.0 || logicalSize.height <= 0.0) return;
+    CGFloat density = _metalView.effectiveDensityScale;
+    if (!isfinite(density) || density <= 0.0) density = 1.0;
+    [self.view layoutIfNeeded];
+    CGSize chrome = CGSizeMake(
+        MAX(0.0, self.view.bounds.size.width - _metalView.bounds.size.width),
+        MAX(0.0, self.view.bounds.size.height - _metalView.bounds.size.height));
+    CGSize sceneTarget = CGSizeMake(logicalSize.width * density + chrome.width,
+                                    logicalSize.height * density + chrome.height);
+    CFTimeInterval now = CACurrentMediaTime();
+    if (fabs(sceneTarget.width - _lastConstrainedSceneTargetSize.width) < 1.0 &&
+        fabs(sceneTarget.height - _lastConstrainedSceneTargetSize.height) < 1.0 &&
+        now - _lastConstrainedSceneResizeRequestTime < 0.75) return;
+    _lastConstrainedSceneTargetSize = sceneTarget;
+    _lastConstrainedSceneResizeRequestTime = now;
+    _constrainedSceneResizeSerial++;
+    [_metalView beginSceneResizeFollowingTargetWindowLogicalSize:logicalSize];
+    BOOL requested = MacWSRequestNativeSceneSizeWithRole(
+        self.view.window.windowScene, sceneTarget, NO);
+    if (!requested)
+        [_metalView cancelSceneResizeFollowingTargetWindow];
+    MacWSLog(@"window-size follows-appkit window=%u pid=%d reason=%@ logical=%.1fx%.1f density=%.3f chrome=%.1fx%.1f scene=%.1fx%.1f requested=%@",
+             _windowID, _windowOwnerPID, reason ?: @"unknown",
+             logicalSize.width, logicalSize.height, density,
+             chrome.width, chrome.height, sceneTarget.width,
+             sceneTarget.height, requested ? @"YES" : @"NO");
 }
 
 - (void)viewWillDisappear:(BOOL)animated {
@@ -5503,6 +5488,48 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
     NSMutableSet<NSString *> *observableIdentities =
         [NSMutableSet setWithArray:current.allKeys];
     [observableIdentities minusSet:closingGrace];
+    NSMutableSet<NSNumber *> *frontmostOwnerPIDs = [NSMutableSet set];
+    for (NSString *identity in current) {
+        MacWSStreamWindow *window = current[identity];
+        if ((window.descriptor.flags &
+                MacWSStreamWindowFrontmostApplication) != 0)
+            [frontmostOwnerPIDs addObject:@(window.descriptor.ownerPID)];
+    }
+    NSMutableSet<NSNumber *> *frontmostOwnersWithKeyWindow =
+        [NSMutableSet set];
+    NSMutableSet<NSString *> *frontmostIdentities = [NSMutableSet set];
+    for (NSString *identity in current) {
+        MacWSStreamWindow *window = current[identity];
+        MacWSStreamWindowFlags flags = window.descriptor.flags;
+        if (![closingGrace containsObject:identity] &&
+            [frontmostOwnerPIDs containsObject:
+                @(window.descriptor.ownerPID)] &&
+            (flags & MacWSStreamWindowFocused) != 0 &&
+            (flags & MacWSStreamWindowOnScreen) != 0 &&
+            (flags & MacWSStreamWindowTransient) == 0) {
+            [frontmostIdentities addObject:identity];
+            [frontmostOwnersWithKeyWindow addObject:
+                @(window.descriptor.ownerPID)];
+        }
+    }
+    // CGWindow's compositor order and AppKit's keyWindow can settle in
+    // separate transactions. Runtime-confirmed after reopening IMG_0120 in
+    // Preview PID 84629: CGWindow listed PDF 215 first while the process
+    // sidecar identified image 214 as Focused. The process is globally
+    // frontmost in either case; its real key window is the document the user
+    // requested. Fall back to the CG identity only if that process publishes
+    // no eligible AppKit key window.
+    for (NSString *identity in current) {
+        MacWSStreamWindow *window = current[identity];
+        MacWSStreamWindowFlags flags = window.descriptor.flags;
+        NSNumber *owner = @(window.descriptor.ownerPID);
+        if (![closingGrace containsObject:identity] &&
+            (flags & MacWSStreamWindowFrontmostApplication) != 0 &&
+            ![frontmostOwnersWithKeyWindow containsObject:owner] &&
+            (flags & MacWSStreamWindowOnScreen) != 0 &&
+            (flags & MacWSStreamWindowTransient) == 0)
+            [frontmostIdentities addObject:identity];
+    }
     if ([self hasForegroundFullscreenWorkspace]) {
         // New AppKit windows are already visible in the desktop stream. They
         // must not become additional iPadOS Scenes until every foreground
@@ -5538,6 +5565,10 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
             }
         }
         [MacWSObservedWindowIdentities setSet:observableIdentities];
+        if (!MacWSPreviouslyFrontmostWindowIdentities)
+            MacWSPreviouslyFrontmostWindowIdentities = [NSMutableSet set];
+        [MacWSPreviouslyFrontmostWindowIdentities
+            setSet:frontmostIdentities];
         [MacWSPendingWindowSceneIdentities removeAllObjects];
         BOOL changesInputOwner = newTarget &&
             newTarget.descriptor.ownerPID != _metalView.targetPID;
@@ -5571,11 +5602,16 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
     if (![self isWindowDiscoveryCoordinator]) return;
     if (!MacWSObservedWindowIdentities) {
         MacWSObservedWindowIdentities = [observableIdentities mutableCopy];
+        MacWSPreviouslyFrontmostWindowIdentities =
+            [frontmostIdentities mutableCopy];
         MacWSPendingWindowSceneIdentities = [NSMutableSet set];
         return;
     }
+    if (!MacWSPreviouslyFrontmostWindowIdentities)
+        MacWSPreviouslyFrontmostWindowIdentities = [NSMutableSet set];
 
     NSMutableSet<NSString *> *occupied = [NSMutableSet set];
+    NSMutableSet<NSString *> *keySceneIdentities = [NSMutableSet set];
     for (UISceneSession *session in UIApplication.sharedApplication.openSessions) {
         NSUserActivity *activity = MacWSSceneBindings[
             session.persistentIdentifier] ?:
@@ -5587,108 +5623,89 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
         NSString *identity = MacWSSceneOwnedWindowFields(
             info, &ownerPID, &windowID, &groupID)
             ? MacWSWindowIdentity(ownerPID, windowID, groupID) : nil;
-        if (identity) [occupied addObject:identity];
+        if (!identity) continue;
+        [occupied addObject:identity];
+        for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
+            if (scene.session != session ||
+                ![scene isKindOfClass:UIWindowScene.class] ||
+                scene.activationState != UISceneActivationStateForegroundActive)
+                continue;
+            BOOL sceneIsKey = NO;
+            for (UIWindow *window in ((UIWindowScene *)scene).windows) {
+                if (window.isKeyWindow) {
+                    sceneIsKey = YES;
+                    break;
+                }
+            }
+            if (sceneIsKey) [keySceneIdentities addObject:identity];
+            break;
+        }
     }
 
-    // AppKit focus and UIKit Scene foreground are separate lifecycles in this
-    // bridge. Finder can reuse an already-open Preview/TextEdit window for a
-    // document, making that exact CGWindow frontmost without creating a new
-    // catalog identity. Re-activate the existing bound Scene whenever the
-    // authoritative frontmost catalog window lacks a foreground Scene. This
-    // deliberately searches openSessions as well as connectedScenes: iPadOS
-    // can reclaim a background Scene's UIKit connection while preserving its
-    // session, which was the remaining intermittent no-popup path.
-    MacWSStreamWindow *frontmostWindow = nil;
-    NSString *frontmostIdentity = nil;
-    for (NSString *identity in current) {
-        MacWSStreamWindow *window = current[identity];
-        if ((window.descriptor.flags &
-                MacWSStreamWindowFrontmostApplication) == 0 ||
-            [closingGrace containsObject:identity]) continue;
-        frontmostWindow = window;
-        frontmostIdentity = identity;
-        break;
-    }
-    BOOL frontmostAlreadyObserved = frontmostIdentity &&
-        ([occupied containsObject:frontmostIdentity] ||
-         [MacWSObservedWindowIdentities containsObject:frontmostIdentity]);
-    if (frontmostWindow && frontmostAlreadyObserved &&
-        ![MacWSPendingWindowSceneIdentities
-            containsObject:frontmostIdentity]) {
-        UISceneSession *boundSession = nil;
-        for (UISceneSession *session in
-                UIApplication.sharedApplication.openSessions) {
-            NSUserActivity *activity = MacWSSceneBindings[
-                session.persistentIdentifier] ?:
-                MacWSPersistedSceneActivity(session.persistentIdentifier) ?:
-                session.stateRestorationActivity;
-            int32_t ownerPID = 0;
-            uint32_t windowID = 0, groupID = 0;
-            NSString *identity = MacWSSceneOwnedWindowFields(
-                activity.userInfo, &ownerPID, &windowID, &groupID)
-                ? MacWSWindowIdentity(ownerPID, windowID, groupID) : nil;
-            if ([identity isEqualToString:frontmostIdentity]) {
-                boundSession = session;
-                break;
-            }
-        }
-        UIScene *boundScene = nil;
-        for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
-            if (scene.session == boundSession) {
-                boundScene = scene;
-                break;
-            }
-        }
-        // Stage Manager can keep several Scenes ForegroundActive at once;
-        // that state says they are interactive, not which one is visually on
-        // top. Runtime witness on 2026-09-07 showed Maps first in the live CG
-        // z-order while both its and Preview's Scenes had already reported
-        // ForegroundActive, and skipping here left the requested Scene behind.
-        // The activation request itself is the public ordering transaction.
-        MacWSLog(@"scene-foreground follows-frontmost identity=%@ session=%@ connected=%@ state=%ld route=%@",
-                 frontmostIdentity,
-                 boundSession.persistentIdentifier ?: @"none",
-                 boundScene ? @"YES" : @"NO",
-                 boundScene ? (long)boundScene.activationState : -1L,
-                 boundSession ? @"reactivate-session" : @"create-scene");
-        [MacWSPendingWindowSceneIdentities addObject:frontmostIdentity];
-        MacWSRequestNewScene(self.view.window.windowScene,
-            frontmostWindow.descriptor.windowID,
-            frontmostWindow.descriptor.ownerPID,
-            frontmostWindow.descriptor.logicalGroupID,
-            CGSizeMake(frontmostWindow.descriptor.logicalWidth,
-                       frontmostWindow.descriptor.logicalHeight),
-            CGSizeMake(frontmostWindow.descriptor.minimumLogicalWidth,
-                       frontmostWindow.descriptor.minimumLogicalHeight),
-            (frontmostWindow.descriptor.flags &
-                MacWSStreamWindowResizable) != 0,
-            frontmostWindow.title, ^(NSError *error) {
-                [MacWSPendingWindowSceneIdentities
-                    removeObject:frontmostIdentity];
-                MacWSLog(@"scene-foreground follows-frontmost failed identity=%@ error=%@",
-                         frontmostIdentity, error);
-            });
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
-                                     2 * NSEC_PER_SEC),
-                       dispatch_get_main_queue(), ^{
-            [MacWSPendingWindowSceneIdentities
-                removeObject:frontmostIdentity];
-        });
-    }
+    // Scene ordering is owned by the user's Stage Manager gesture.  A catalog
+    // update only describes AppKit ordering; using it to reactivate an already
+    // bound iOS Scene creates a two-way focus loop. Runtime-confirmed by
+    // MacWSHost.log on 2026-09-08: alternating
+    // "scene-foreground follows-frontmost" requests repeatedly brought the
+    // previous Scene back after the user selected another Stage Manager
+    // window. The forward transaction now lives in sceneDidBecomeActive:,
+    // where that selected Scene activates its exact AppKit window.
 
     NSMutableArray<MacWSStreamWindow *> *newWindows = [NSMutableArray array];
+    NSMutableSet<NSString *> *reusedFrontmostWindows = [NSMutableSet set];
+    NSMutableSet<NSString *> *reusedBoundFrontmostWindows =
+        [NSMutableSet set];
     for (NSString *identity in current) {
         if ([closingGrace containsObject:identity]) continue;
-        if ([MacWSObservedWindowIdentities containsObject:identity] ||
-            [MacWSPendingWindowSceneIdentities containsObject:identity] ||
-            [occupied containsObject:identity]) continue;
+        if ([MacWSPendingWindowSceneIdentities containsObject:identity])
+            continue;
         MacWSStreamWindow *window = current[identity];
-        BOOL relevantOwner = _windowOwnerPID > 1 &&
-            window.descriptor.ownerPID == _windowOwnerPID;
-        BOOL focused = (window.descriptor.flags & MacWSStreamWindowFocused) != 0;
-        if (relevantOwner || focused) [newWindows addObject:window];
+        MacWSStreamWindowFlags flags = window.descriptor.flags;
+        // A newly opened document can publish its real level-0 CGWindow one
+        // catalog before AppKit changes keyWindow.  Tying Scene creation to
+        // this coordinator's owner or to that first Focused bit therefore
+        // made the result depend on which of several foreground Scenes won
+        // the coordinator election.  Runtime-confirmed with Preview PID
+        // 62596: image window 182 and PDF window 183 were both ordinary,
+        // visible, on-screen level-0 windows, while the metrics sidecar could
+        // focus only one of them.  Every such on-screen top-level identity is
+        // already an independently presentable macOS window; dialogs and
+        // sheets remain excluded by displayd's metrics/layer join and the
+        // explicit Transient flag.
+        BOOL presentableTopLevel = window.descriptor.ownerPID > 1 &&
+            (flags & MacWSStreamWindowOnScreen) != 0 &&
+            (flags & MacWSStreamWindowTransient) == 0;
+        BOOL alreadyObserved =
+            [MacWSObservedWindowIdentities containsObject:identity];
+        BOOL hasSceneSession = [occupied containsObject:identity];
+        BOOL becameFrontmost =
+            [frontmostIdentities containsObject:identity] &&
+            ![MacWSPreviouslyFrontmostWindowIdentities
+                containsObject:identity];
+        BOOL needsNewScene = !alreadyObserved && !hasSceneSession;
+        BOOL needsFrontmostScene = becameFrontmost &&
+            ![keySceneIdentities containsObject:identity];
+        if (presentableTopLevel &&
+            (needsNewScene || needsFrontmostScene)) {
+            [newWindows addObject:window];
+            if (alreadyObserved) [reusedFrontmostWindows addObject:identity];
+            if (hasSceneSession)
+                [reusedBoundFrontmostWindows addObject:identity];
+        }
     }
-    [MacWSObservedWindowIdentities setSet:observableIdentities];
+    // Do not consume an identity merely because it appeared in one catalog.
+    // In particular, an ordinary window that is initially off-screen must be
+    // eligible again after AppKit orders it on-screen.  Keep only identities
+    // that were already observed and are still live, plus identities with an
+    // existing UIKit Scene.  A selected identity is protected by the pending
+    // set until its Scene connects; the next catalog then moves it into the
+    // occupied/observed set below.
+    NSMutableSet<NSString *> *retainedObserved =
+        [MacWSObservedWindowIdentities mutableCopy];
+    [retainedObserved intersectSet:observableIdentities];
+    [retainedObserved unionSet:occupied];
+    [MacWSObservedWindowIdentities setSet:retainedObserved];
+    [MacWSPreviouslyFrontmostWindowIdentities setSet:frontmostIdentities];
 
     // A user gesture normally creates one native window. Bound a pathological
     // application burst so one catalog invalidation cannot flood FrontBoard.
@@ -5699,6 +5716,14 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
             window.descriptor.windowID, window.descriptor.logicalGroupID);
         if (!identity) continue;
         [MacWSPendingWindowSceneIdentities addObject:identity];
+        MacWSLog(@"window-auto-scene candidate identity=%@ pid=%d window=%u flags=%#x reason=%@",
+                 identity, window.descriptor.ownerPID,
+                 window.descriptor.windowID, window.descriptor.flags,
+                 [reusedBoundFrontmostWindows containsObject:identity]
+                    ? @"existing-session-became-frontmost"
+                    : [reusedFrontmostWindows containsObject:identity]
+                        ? @"existing-unbound-became-frontmost"
+                        : @"new-onscreen-top-level");
         // AppKit dialogs can briefly appear as a layer-0 catalog window and
         // then become the base window's transient layer on the next commit.
         // Runtime-confirmed with Terminal's Low Disk Space alert: requesting
@@ -5716,13 +5741,18 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
                     candidate.descriptor.windowID,
                     candidate.descriptor.logicalGroupID);
                 if ([candidateIdentity isEqualToString:identity] &&
-                    (candidate.descriptor.flags & MacWSStreamWindowVisible)) {
+                    (candidate.descriptor.flags & MacWSStreamWindowVisible) &&
+                    (candidate.descriptor.flags & MacWSStreamWindowOnScreen) &&
+                    (candidate.descriptor.flags &
+                        MacWSStreamWindowTransient) == 0) {
                     stableWindow = candidate;
                     break;
                 }
             }
             if (!stableWindow) {
                 [MacWSPendingWindowSceneIdentities removeObject:identity];
+                [MacWSPreviouslyFrontmostWindowIdentities
+                    removeObject:identity];
                 MacWSLog(@"window-auto-scene cancelled identity=%@ reason=transient",
                          identity);
                 return;
@@ -5754,6 +5784,8 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
                 title, ^(NSError *error) {
                     [MacWSPendingWindowSceneIdentities removeObject:identity];
                     [MacWSObservedWindowIdentities removeObject:identity];
+                    [MacWSPreviouslyFrontmostWindowIdentities
+                        removeObject:identity];
                     [self setNotice:error.localizedDescription success:NO];
                 });
         });
@@ -5973,11 +6005,47 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
     // are the actual native windows created after Host became live.
     if (!MacWSObservedWindowIdentities) {
         MacWSObservedWindowIdentities = [NSMutableSet set];
+        MacWSPreviouslyFrontmostWindowIdentities = [NSMutableSet set];
+        NSMutableSet<NSNumber *> *frontmostOwners = [NSMutableSet set];
         for (MacWSStreamWindow *window in windows) {
             NSString *identity = MacWSWindowIdentity(
                 window.descriptor.ownerPID, window.descriptor.windowID,
                 window.descriptor.logicalGroupID);
-            if (identity) [MacWSObservedWindowIdentities addObject:identity];
+            if (!identity) continue;
+            [MacWSObservedWindowIdentities addObject:identity];
+            if ((window.descriptor.flags &
+                    MacWSStreamWindowFrontmostApplication) != 0)
+                [frontmostOwners addObject:@(window.descriptor.ownerPID)];
+        }
+        NSMutableSet<NSNumber *> *ownersWithKeyWindow = [NSMutableSet set];
+        for (MacWSStreamWindow *window in windows) {
+            NSString *identity = MacWSWindowIdentity(
+                window.descriptor.ownerPID, window.descriptor.windowID,
+                window.descriptor.logicalGroupID);
+            MacWSStreamWindowFlags flags = window.descriptor.flags;
+            if (identity && [frontmostOwners containsObject:
+                    @(window.descriptor.ownerPID)] &&
+                (flags & MacWSStreamWindowFocused) != 0 &&
+                (flags & MacWSStreamWindowOnScreen) != 0 &&
+                (flags & MacWSStreamWindowTransient) == 0) {
+                [MacWSPreviouslyFrontmostWindowIdentities
+                    addObject:identity];
+                [ownersWithKeyWindow addObject:@(window.descriptor.ownerPID)];
+            }
+        }
+        for (MacWSStreamWindow *window in windows) {
+            NSString *identity = MacWSWindowIdentity(
+                window.descriptor.ownerPID, window.descriptor.windowID,
+                window.descriptor.logicalGroupID);
+            MacWSStreamWindowFlags flags = window.descriptor.flags;
+            if (identity &&
+                (flags & MacWSStreamWindowFrontmostApplication) != 0 &&
+                ![ownersWithKeyWindow containsObject:
+                    @(window.descriptor.ownerPID)] &&
+                (flags & MacWSStreamWindowOnScreen) != 0 &&
+                (flags & MacWSStreamWindowTransient) == 0)
+                [MacWSPreviouslyFrontmostWindowIdentities
+                    addObject:identity];
         }
     }
     [self openInitialFinderBrowserWindowIfNeeded:windows];
@@ -6022,6 +6090,10 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
             resolvedWindow = groupReplacement;
         if (!resolvedWindow) resolvedWindow = groupReplacement;
         if (resolvedWindow) {
+            BOOL previouslyObservedTarget = _targetWindowObservedInCatalog;
+            CGSize previousPreferredSize = _windowPreferredSize;
+            BOOL configurationPending =
+                _metalView.windowConfigurationAwaitingAcknowledgement;
             _targetWindowObservedInCatalog = YES;
             _targetWindowMissingCheckPending = NO;
             _targetWindowMissingSerial++;
@@ -6031,16 +6103,32 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
             _windowMinimumSize = CGSizeMake(
                 resolvedWindow.descriptor.minimumLogicalWidth,
                 resolvedWindow.descriptor.minimumLogicalHeight);
-            _windowPreferredSize = CGSizeMake(
+            CGSize observedLogicalSize = CGSizeMake(
                 resolvedWindow.descriptor.logicalWidth,
                 resolvedWindow.descriptor.logicalHeight);
+            _windowPreferredSize = observedLogicalSize;
             _windowResizable =
                 (resolvedWindow.descriptor.flags & MacWSStreamWindowResizable) != 0;
-            [_metalView observeTargetWindowLogicalSize:
-                CGSizeMake(resolvedWindow.descriptor.logicalWidth,
-                           resolvedWindow.descriptor.logicalHeight)];
+            [_metalView observeTargetWindowLogicalSize:observedLogicalSize];
             _metalView.minimumLogicalSize = _windowMinimumSize;
             _metalView.targetWindowResizable = _windowResizable;
+            BOOL appKitChangedItsOwnSize = previouslyObservedTarget &&
+                resolvedID == _windowID && !configurationPending &&
+                previousPreferredSize.width > 0.0 &&
+                previousPreferredSize.height > 0.0 &&
+                (fabs(observedLogicalSize.width -
+                      previousPreferredSize.width) >= 0.75 ||
+                 fabs(observedLogicalSize.height -
+                      previousPreferredSize.height) >= 0.75);
+            if (appKitChangedItsOwnSize) {
+                // No Host ConfigureWindow transaction was outstanding, so
+                // this catalog generation is an autonomous AppKit geometry
+                // change (for example an application's loading window being
+                // replaced by its constrained main window). Follow it once
+                // at the native Scene layer.
+                [self followNativeSceneSizeForAppliedLogicalSize:
+                    observedLogicalSize reason:@"appkit-autonomous"];
+            }
             if (resolvedID != _windowID) {
                 uint32_t oldID = _windowID;
                 [_metalView suspendStream];
@@ -6290,38 +6378,17 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
     _windowPreferredSize = appliedSize;
     MacWSRememberSceneBinding(self.view.window.windowScene.session,
                               [self streamRestorationActivity]);
-    CGFloat density = view.effectiveDensityScale;
-    CGSize sceneTarget = {
-        round(appliedSize.width * density),
-        round(appliedSize.height * density),
-    };
-    uint64_t serial = ++_constrainedSceneResizeSerial;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
-                                 300 * NSEC_PER_MSEC),
-                   dispatch_get_main_queue(), ^{
-        if (self->_constrainedSceneResizeSerial != serial ||
-            self->_streamMode != MacWSStreamModeWindow ||
-            self->_windowID == 0) return;
-        UIWindowScene *scene = self.view.window.windowScene;
-        CGRect bounds = self.view.window.bounds;
-        if (fabs(bounds.size.width - sceneTarget.width) < 1.0 &&
-            fabs(bounds.size.height - sceneTarget.height) < 1.0) return;
-        CFTimeInterval now = CACurrentMediaTime();
-        if (fabs(sceneTarget.width -
-                 self->_lastConstrainedSceneTargetSize.width) < 1.0 &&
-            fabs(sceneTarget.height -
-                 self->_lastConstrainedSceneTargetSize.height) < 1.0 &&
-            now - self->_lastConstrainedSceneResizeRequestTime < 1.5)
-            return;
-        self->_lastConstrainedSceneTargetSize = sceneTarget;
-        self->_lastConstrainedSceneResizeRequestTime = now;
-        MacWSLog(@"scene-size follows-appkit window=%u pid=%d requested-logical=%.1fx%.1f applied-logical=%.1fx%.1f density=%.3f scene-target=%.1fx%.1f",
-                 self->_windowID, self->_windowOwnerPID,
-                 requestedSize.width, requestedSize.height,
-                 appliedSize.width, appliedSize.height, density,
-                 sceneTarget.width, sceneTarget.height);
-        MacWSRequestNativeSceneSizeWithRole(scene, sceneTarget, NO);
-    });
+    // Runtime-confirmed by MacWSHost.log on 2026-09-08: unqualified feedback
+    // caused Scene geometry -> ConfigureWindow -> constrained AppKit geometry
+    // -> Scene geometry loops. The Metal view now marks this specific
+    // AppKit->Scene transaction and suppresses only its reciprocal configure,
+    // allowing the iOS window to follow the real constrained result without
+    // reintroducing that oscillation.
+    MacWSLog(@"window-size constrained-follow window=%u pid=%d requested-logical=%.1fx%.1f applied-logical=%.1fx%.1f",
+             _windowID, _windowOwnerPID, requestedSize.width,
+             requestedSize.height, appliedSize.width, appliedSize.height);
+    [self followNativeSceneSizeForAppliedLogicalSize:appliedSize
+                                              reason:@"appkit-constrained"];
 }
 @end
 
@@ -6338,6 +6405,22 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
 @end
 
 @implementation MacWSWorkspaceWindow
+- (void)becomeKeyWindow {
+    [super becomeKeyWindow];
+    // Stage Manager may keep several MacWS Scenes ForegroundActive at once,
+    // but UIKit has one key UIWindow for the user's actual interaction
+    // target. Propagate that stronger public lifecycle edge to the bound
+    // AppKit window so another merely-active Scene cannot steal focus.
+    UIViewController *root = self.rootViewController;
+    if ([root isKindOfClass:MacWSViewController.class]) {
+        BOOL activated = [(MacWSViewController *)root
+            activateCurrentMacWindow];
+        MacWSLog(@"window-became-key activates-appkit scene=%@ activated=%@",
+                 self.windowScene.session.persistentIdentifier ?: @"none",
+                 activated ? @"YES" : @"NO");
+    }
+}
+
 - (void)sendEvent:(UIEvent *)event {
     if ([event isKindOfClass:UIPressesEvent.class]) {
         UIViewController *root = self.rootViewController;
@@ -6682,6 +6765,15 @@ static void MacWSDeduplicateWindowScenes(void) {
     MacWSViewController *controller =
         (MacWSViewController *)self.window.rootViewController;
     [controller reassertFullscreenScenePresentation];
+    // The iPadOS Scene selected by Stage Manager is the user's focus intent.
+    // Propagate that one-way to the exact AppKit window instead of letting a
+    // later passive macOS catalog update reactivate some other iOS Scene.
+    if (![controller isFullscreenWorkspace] && self.window.isKeyWindow) {
+        BOOL activated = [controller activateCurrentMacWindow];
+        MacWSLog(@"scene-active activates-appkit id=%@ activated=%@",
+                 scene.session.persistentIdentifier,
+                 activated ? @"YES" : @"NO");
+    }
     dispatch_async(dispatch_get_main_queue(), ^{
         [controller restoreHardwareKeyboardFocusWithReason:@"scene-active"];
     });

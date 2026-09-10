@@ -302,6 +302,9 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
     CFTimeInterval _windowConfigurationIssuedAt;
     uint64_t _windowConfigurationSettlementSerial;
     BOOL _windowConfigurationAwaitingAcknowledgement;
+    BOOL _sceneResizeFollowingTargetWindow;
+    CGSize _sceneResizeTargetWindowLogicalSize;
+    CFTimeInterval _sceneResizeFollowDeadline;
     BOOL _fullscreenGestureRouteActive;
     uint32_t _fullscreenGestureRouteContactID;
     int32_t _fullscreenGestureRoutePID;
@@ -822,6 +825,9 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
     _lastObservedTargetWindowLogicalSize = CGSizeZero;
     _windowConfigurationSourceLogicalSize = CGSizeZero;
     _windowConfigurationIssuedAt = 0.0;
+    _sceneResizeFollowingTargetWindow = NO;
+    _sceneResizeTargetWindowLogicalSize = CGSizeZero;
+    _sceneResizeFollowDeadline = 0.0;
     _fullscreenGestureRouteActive = NO;
     _fullscreenGestureRouteContactID = 0;
     _fullscreenGestureRoutePID = 0;
@@ -1125,6 +1131,33 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
     }
 }
 
+- (BOOL)windowConfigurationAwaitingAcknowledgement {
+    return _windowConfigurationAwaitingAcknowledgement;
+}
+
+- (void)beginSceneResizeFollowingTargetWindowLogicalSize:(CGSize)logicalSize {
+    if (!isfinite(logicalSize.width) || !isfinite(logicalSize.height) ||
+        logicalSize.width <= 0.0 || logicalSize.height <= 0.0) return;
+    _sceneResizeFollowingTargetWindow = YES;
+    _sceneResizeTargetWindowLogicalSize = logicalSize;
+    // SpringBoard's app-layout transaction is asynchronous and its existing
+    // postcondition witness is sampled at 1.5 seconds.  Suppress only the
+    // reciprocal Scene->AppKit configure path while that one transaction is
+    // settling; a later user resize remains authoritative.
+    _sceneResizeFollowDeadline = CACurrentMediaTime() + 1.8;
+    _windowConfigurationSettlementSerial++;
+    _windowConfigurationAwaitingAcknowledgement = NO;
+    MacWSLog(@"window-configuration scene-follow armed window=%u pid=%d target-logical=%.1fx%.1f",
+             self.targetWindowID, self.targetPID,
+             logicalSize.width, logicalSize.height);
+}
+
+- (void)cancelSceneResizeFollowingTargetWindow {
+    _sceneResizeFollowingTargetWindow = NO;
+    _sceneResizeTargetWindowLogicalSize = CGSizeZero;
+    _sceneResizeFollowDeadline = 0.0;
+}
+
 - (void)updateWindowTooSmallState {
     CGFloat density = self.effectiveDensityScale;
     CGSize available = self.bounds.size;
@@ -1164,6 +1197,34 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
         self.bounds.size.width / density,
         self.bounds.size.height / density,
     };
+    if (_sceneResizeFollowingTargetWindow) {
+        CFTimeInterval now = CACurrentMediaTime();
+        if (now <= _sceneResizeFollowDeadline) {
+            BOOL reached =
+                fabs(requested.width -
+                     _sceneResizeTargetWindowLogicalSize.width) < 1.5 &&
+                fabs(requested.height -
+                     _sceneResizeTargetWindowLogicalSize.height) < 1.5;
+            if (reached) {
+                // Record the geometry that AppKit itself selected so the
+                // next layout pass does not echo it back as a new configure
+                // request. This closes the former UIKit/AppKit resize loop.
+                _lastRequestedWindowSize = requested;
+                _lastRequestedDensityScale = density;
+                MacWSLog(@"window-configuration scene-follow reached window=%u pid=%d logical=%.1fx%.1f",
+                         self.targetWindowID, self.targetPID,
+                         requested.width, requested.height);
+                [self cancelSceneResizeFollowingTargetWindow];
+            }
+            return;
+        }
+        MacWSLog(@"window-configuration scene-follow expired window=%u pid=%d target-logical=%.1fx%.1f current-logical=%.1fx%.1f",
+                 self.targetWindowID, self.targetPID,
+                 _sceneResizeTargetWindowLogicalSize.width,
+                 _sceneResizeTargetWindowLogicalSize.height,
+                 requested.width, requested.height);
+        [self cancelSceneResizeFollowingTargetWindow];
+    }
     _pendingRequestedWindowSize = requested;
     _pendingRequestedDensityScale = density;
     if (_windowConfigurationDispatchPending) return;
@@ -1477,6 +1538,110 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
 }
 
 - (BOOL)canBecomeFirstResponder { return YES; }
+
+- (NSArray<UIKeyCommand *> *)keyCommands {
+    // iPadOS owns a subset of the desktop Command-key namespace before
+    // UIPresses reaches a custom view. Publish the Mac editing/document
+    // equivalents explicitly so they resolve to this scene's focused
+    // MacWSMetalView, then forward the original key and modifiers unchanged
+    // to AppKit. This is intentionally a finite desktop set; system-level
+    // iPadOS commands such as Command-Space remain owned by SpringBoard.
+    static NSArray<UIKeyCommand *> *commands;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        NSMutableArray<UIKeyCommand *> *result = [NSMutableArray array];
+        // Register the complete printable Command-letter/digit/punctuation
+        // family rather than guessing which menu equivalents each AppKit app
+        // uses. Finder alone needs Command-I/J/D/Y in addition to C/V, while
+        // editors use B/K/L/R/U and their shifted forms. Command-Tab and
+        // Command-Space are deliberately absent so iPadOS keeps its own app
+        // switcher and system search.
+        NSArray<NSString *> *plain = @[
+            @"a", @"b", @"c", @"d", @"e", @"f", @"g", @"h",
+            @"i", @"j", @"k", @"l", @"m", @"n", @"o", @"p",
+            @"q", @"r", @"s", @"t", @"u", @"v", @"w", @"x",
+            @"y", @"z", @"0", @"1", @"2", @"3", @"4", @"5",
+            @"6", @"7", @"8", @"9", @",", @".", @"/", @";",
+            @"'", @"[", @"]", @"\\", @"-", @"=", @"`"
+        ];
+        NSArray<NSString *> *shifted = plain;
+        for (NSString *input in plain) {
+            UIKeyCommand *key = [UIKeyCommand
+                keyCommandWithInput:input
+                      modifierFlags:UIKeyModifierCommand
+                              action:@selector(forwardMacKeyCommand:)];
+            if ([key respondsToSelector:@selector(setWantsPriorityOverSystemBehavior:)])
+                key.wantsPriorityOverSystemBehavior = YES;
+            [result addObject:key];
+        }
+        for (NSString *input in shifted) {
+            UIKeyCommand *key = [UIKeyCommand
+                keyCommandWithInput:input
+                      modifierFlags:UIKeyModifierCommand | UIKeyModifierShift
+                              action:@selector(forwardMacKeyCommand:)];
+            if ([key respondsToSelector:@selector(setWantsPriorityOverSystemBehavior:)])
+                key.wantsPriorityOverSystemBehavior = YES;
+            [result addObject:key];
+        }
+        commands = [result copy];
+    });
+    return commands;
+}
+
+- (void)forwardMacKeyCommand:(UIKeyCommand *)command {
+    if (!self.isMacWSInputEnabled || command.input.length == 0) return;
+    NSString *input = command.input;
+    uint32_t scalar = [input characterAtIndex:0];
+    [self emitSoftwareKeySym:scalar modifiers:(uint32_t)command.modifierFlags];
+}
+
+// UIKit resolves several Command shortcuts through the responder action
+// system instead of delivering them as ordinary UIPressesEvent records. This
+// is especially visible for the standard editing selectors: the hardware C/V
+// keys work as text in AppKit, but Command-C/Command-V can terminate at the
+// focused MTKView as copy:/paste:. Keep that public UIKit route and translate
+// the action back into the same complete AppKit key lifecycle used by every
+// other hardware key. No pasteboard payload or target action is synthesized;
+// the selected macOS application's normal menu/key-equivalent handling stays
+// authoritative.
+- (BOOL)canPerformAction:(SEL)action withSender:(id)sender {
+    if (action == @selector(copy:) || action == @selector(paste:) ||
+        action == @selector(cut:) || action == @selector(selectAll:) ||
+        action == @selector(undo:) || action == @selector(redo:))
+        return self.isMacWSInputEnabled;
+    return [super canPerformAction:action withSender:sender];
+}
+
+- (void)copy:(id)sender {
+    (void)sender;
+    [self emitSoftwareKeySym:'c' modifiers:UIKeyModifierCommand];
+}
+
+- (void)paste:(id)sender {
+    (void)sender;
+    [self emitSoftwareKeySym:'v' modifiers:UIKeyModifierCommand];
+}
+
+- (void)cut:(id)sender {
+    (void)sender;
+    [self emitSoftwareKeySym:'x' modifiers:UIKeyModifierCommand];
+}
+
+- (void)selectAll:(id)sender {
+    (void)sender;
+    [self emitSoftwareKeySym:'a' modifiers:UIKeyModifierCommand];
+}
+
+- (void)undo:(id)sender {
+    (void)sender;
+    [self emitSoftwareKeySym:'z' modifiers:UIKeyModifierCommand];
+}
+
+- (void)redo:(id)sender {
+    (void)sender;
+    [self emitSoftwareKeySym:'z'
+                   modifiers:UIKeyModifierCommand | UIKeyModifierShift];
+}
 
 - (BOOL)restoreHardwareKeyboardFocusWithReason:(NSString *)reason {
     if (self.softwareKeyboardActive || !self.window ||
@@ -1936,26 +2101,22 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
                      frameWidth, frameHeight);
         }
         _reportedFullscreenCanvasPixels = fullscreenCanvasPixels;
-        CGFloat pixelScaleX = self.drawableSize.width > 0
-            ? self.drawableSize.width / viewWidth : self.contentScaleFactor;
-        CGFloat pixelScaleY = self.drawableSize.height > 0
-            ? self.drawableSize.height / viewHeight : self.contentScaleFactor;
-        if (!isfinite(pixelScaleX) || pixelScaleX <= 0) pixelScaleX = 1.0;
-        if (!isfinite(pixelScaleY) || pixelScaleY <= 0) pixelScaleY = 1.0;
-        CGFloat viewPixelWidth = viewWidth * pixelScaleX;
-        CGFloat viewPixelHeight = viewHeight * pixelScaleY;
+        // Vertices are normalized against the UIKit view, not against the
+        // drawable allocation.  A source-native drawable may deliberately
+        // have a different aspect ratio from the Scene (for example when the
+        // software-key row removes only vertical space).  Converting through
+        // independent drawable X/Y scales makes the fitted rectangle fill the
+        // view and stretches the image.  Fit once in view coordinates so the
+        // same rectangle remains authoritative for pixels and input.
         CGFloat scale = MIN(
-            viewPixelWidth / fullscreenCanvasPixels.size.width,
-            viewPixelHeight / fullscreenCanvasPixels.size.height);
-        CGFloat fittedPixelWidth =
-            round(fullscreenCanvasPixels.size.width * scale);
-        CGFloat fittedPixelHeight =
-            round(fullscreenCanvasPixels.size.height * scale);
+            viewWidth / fullscreenCanvasPixels.size.width,
+            viewHeight / fullscreenCanvasPixels.size.height);
+        CGFloat fittedWidth = fullscreenCanvasPixels.size.width * scale;
+        CGFloat fittedHeight = fullscreenCanvasPixels.size.height * scale;
         _contentRect = CGRectMake(
-            round((viewPixelWidth - fittedPixelWidth) * 0.5) / pixelScaleX,
-            round((viewPixelHeight - fittedPixelHeight) * 0.5) / pixelScaleY,
-            fittedPixelWidth / pixelScaleX,
-            fittedPixelHeight / pixelScaleY);
+            (viewWidth - fittedWidth) * 0.5,
+            (viewHeight - fittedHeight) * 0.5,
+            fittedWidth, fittedHeight);
         _visibleSourceRect = CGRectMake(
             fullscreenCanvasPixels.origin.x / frameWidth,
             fullscreenCanvasPixels.origin.y / frameHeight,
@@ -1994,24 +2155,13 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
     // stretched. Deliberate 1.5x/2x zoom uses the crop/pan path below.
     if (_viewportZoom <= 1.001 && frameWidth > 0 && frameHeight > 0 &&
         viewWidth > 0 && viewHeight > 0) {
-        CGFloat pixelScaleX = self.drawableSize.width > 0
-            ? self.drawableSize.width / viewWidth : self.contentScaleFactor;
-        CGFloat pixelScaleY = self.drawableSize.height > 0
-            ? self.drawableSize.height / viewHeight : self.contentScaleFactor;
-        if (!isfinite(pixelScaleX) || pixelScaleX <= 0) pixelScaleX = 1.0;
-        if (!isfinite(pixelScaleY) || pixelScaleY <= 0) pixelScaleY = 1.0;
-        CGFloat viewPixelWidth = viewWidth * pixelScaleX;
-        CGFloat viewPixelHeight = viewHeight * pixelScaleY;
-        CGFloat scale = MIN(viewPixelWidth / frameWidth,
-                            viewPixelHeight / frameHeight);
-        CGFloat fittedPixelWidth = round(frameWidth * scale);
-        CGFloat fittedPixelHeight = round(frameHeight * scale);
-        CGFloat originPixelX = round((viewPixelWidth - fittedPixelWidth) * 0.5);
-        CGFloat originPixelY = round((viewPixelHeight - fittedPixelHeight) * 0.5);
-        _contentRect = CGRectMake(originPixelX / pixelScaleX,
-                                  originPixelY / pixelScaleY,
-                                  fittedPixelWidth / pixelScaleX,
-                                  fittedPixelHeight / pixelScaleY);
+        CGFloat scale = MIN(viewWidth / frameWidth,
+                            viewHeight / frameHeight);
+        CGFloat fittedWidth = frameWidth * scale;
+        CGFloat fittedHeight = frameHeight * scale;
+        _contentRect = CGRectMake((viewWidth - fittedWidth) * 0.5,
+                                  (viewHeight - fittedHeight) * 0.5,
+                                  fittedWidth, fittedHeight);
         _visibleSourceRect = CGRectMake(0, 0, 1, 1);
         _viewportCenter = CGPointMake(0.5, 0.5);
         _viewportZoom = 1.0;

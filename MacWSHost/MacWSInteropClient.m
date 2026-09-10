@@ -397,12 +397,12 @@ static NSString *MacWSPreferredMaterializationType(
     for (NSString *type in types) {
         if (![type isKindOfClass:NSString.class] || !type.length ||
             [type isEqualToString:UTTypeFileURL.identifier] ||
-            [type hasPrefix:@"com.apple.finder."] ||
-            [type isEqualToString:UTTypeItem.identifier] ||
-            [type isEqualToString:UTTypeContent.identifier] ||
-            [type isEqualToString:UTTypeData.identifier]) continue;
+            [type hasPrefix:@"com.apple.finder."]) continue;
         UTType *uniformType = [UTType typeWithIdentifier:type];
         NSInteger score = uniformType ? 10 : 1;
+        if ([type isEqualToString:UTTypeItem.identifier] ||
+            [type isEqualToString:UTTypeContent.identifier] ||
+            [type isEqualToString:UTTypeData.identifier]) score = 0;
         if (uniformType.preferredFilenameExtension.length) score += 20;
         if ([uniformType conformsToType:UTTypeText]) score += 30;
         if ([uniformType conformsToType:UTTypePDF]) score += 40;
@@ -974,6 +974,54 @@ static NSURL *MacWSResolvedProviderFileURL(id item) {
             scheduledRepresentations++;
         }
         NSString *materializationType = MacWSPreferredMaterializationType(types);
+        BOOL materializationTypeIsAbstract =
+            [materializationType isEqualToString:UTTypeItem.identifier] ||
+            [materializationType isEqualToString:UTTypeContent.identifier] ||
+            [materializationType isEqualToString:UTTypeData.identifier];
+        if (materializationType &&
+            scheduledRepresentations < MACWS_INTEROP_MAX_REPRESENTATIONS) {
+            // Request the provider's primary payload while performDrop: still
+            // owns the UIDropSession. Runtime-confirmed on 2026-09-10: Notes'
+            // public.png endpoint was invalidated after the earlier in-place
+            // and UIImage attempts, so the later data request received zero
+            // bytes. Concrete UTIs are acquired directly as data; abstract
+            // public.content attachments use loadItem so their file URL and
+            // suggested filename survive the provider callback boundary.
+            [jobs addObject:@{
+                @"provider": provider,
+                @"item_index": @(itemIndex),
+                @"order": @(-3),
+                MacWSArchiveTypeKey: materializationType,
+                @"kind": materializationTypeIsAbstract
+                    ? @"direct-item" : @"primary-data",
+                @"materialize_data": @(!materializationTypeIsAbstract)
+            }];
+            scheduledRepresentations++;
+        }
+        if (materializationType &&
+            scheduledRepresentations < MACWS_INTEROP_MAX_REPRESENTATIONS) {
+            [jobs addObject:@{
+                @"provider": provider,
+                @"item_index": @(itemIndex),
+                @"order": @(-1.75),
+                MacWSArchiveTypeKey: materializationType,
+                @"kind": @"in-place"
+            }];
+            scheduledRepresentations++;
+        }
+        UTType *materializationUniformType = materializationType.length
+            ? [UTType typeWithIdentifier:materializationType] : nil;
+        if ([materializationUniformType conformsToType:UTTypeImage] &&
+            scheduledRepresentations < MACWS_INTEROP_MAX_REPRESENTATIONS) {
+            [jobs addObject:@{
+                @"provider": provider,
+                @"item_index": @(itemIndex),
+                @"order": @(-1.5),
+                MacWSArchiveTypeKey: materializationType,
+                @"kind": @"image-object"
+            }];
+            scheduledRepresentations++;
+        }
         if (materializationType &&
             scheduledRepresentations < MACWS_INTEROP_MAX_REPRESENTATIONS) {
             [jobs addObject:@{
@@ -995,6 +1043,8 @@ static NSURL *MacWSResolvedProviderFileURL(id item) {
             // staged URL when NSPasteboardItem de-duplicates identical types.
             if (!type.length || [type isEqualToString:UTTypeFileURL.identifier])
                 continue;
+            if ([type isEqualToString:materializationType] &&
+                !materializationTypeIsAbstract) continue;
             [jobs addObject:@{
                 @"provider": provider,
                 @"item_index": @(itemIndex),
@@ -1038,6 +1088,61 @@ static NSURL *MacWSResolvedProviderFileURL(id item) {
         NSUInteger itemIndex = [job[@"item_index"] unsignedIntegerValue];
         NSString *type = job[MacWSArchiveTypeKey];
         NSString *kind = job[@"kind"];
+        if ([kind isEqualToString:@"direct-item"]) {
+            [provider loadItemForTypeIdentifier:type options:nil
+                completionHandler:^(id item, NSError *providerError) {
+                // Keep every URL operation inside the provider callback: the
+                // security extension and temporary file are not promised to
+                // remain valid after this block returns.
+                NSString *path = nil;
+                NSError *stageError = nil;
+                NSURL *url = providerError ? nil :
+                    MacWSResolvedProviderFileURL(item);
+                if (url) {
+                    MacWSStageProviderURL(url, provider.suggestedName, type,
+                                         itemIndex, &path, &stageError);
+                } else if (!providerError &&
+                           [item isKindOfClass:NSData.class]) {
+                    MacWSStageProviderData(item, provider.suggestedName, type,
+                                          itemIndex, &path, &stageError);
+                } else if (!providerError &&
+                           [item isKindOfClass:UIImage.class]) {
+                    NSData *data = UIImagePNGRepresentation(item);
+                    MacWSStageProviderData(data, provider.suggestedName,
+                                          UTTypePNG.identifier, itemIndex,
+                                          &path, &stageError);
+                } else if (!providerError &&
+                           [item isKindOfClass:NSString.class]) {
+                    NSData *data = [item dataUsingEncoding:
+                        NSUTF8StringEncoding];
+                    MacWSStageProviderData(data, provider.suggestedName, type,
+                                          itemIndex, &path, &stageError);
+                }
+                NSString *itemClass = item
+                    ? NSStringFromClass([item class]) : @"(nil)";
+                dispatch_async(loadQueue, ^{
+                    if (finished) return;
+                    if (path.length && !MacWSSlotHasFileURL(slots[itemIndex])) {
+                        [slots[itemIndex] addObject:@{
+                            @"order": job[@"order"],
+                            MacWSArchiveTypeKey: UTTypeFileURL.identifier,
+                            MacWSArchiveFilePathKey: path
+                        }];
+                    }
+                    MacWSLog(@"interop-provider-load item=%lu kind=%@ type=%@ class=%@ source-url=%@ source-exists=%@ accepted=%@ error=%@",
+                        (unsigned long)itemIndex, kind, type, itemClass,
+                        url.path ?: @"(nil)",
+                        url && [NSFileManager.defaultManager
+                            fileExistsAtPath:url.path] ? @"YES" : @"NO",
+                        path.length ? @"YES" : @"NO",
+                        providerError ?: stageError ?: @"nil");
+                    jobIndex++;
+                    void (^next)(void) = weakLoadNext;
+                    if (next) next();
+                });
+            }];
+            return;
+        }
         if ([kind isEqualToString:@"file-url"]) {
             [provider loadItemForTypeIdentifier:type options:nil
                 completionHandler:^(id item, NSError *providerError) {
@@ -1058,6 +1163,94 @@ static NSURL *MacWSResolvedProviderFileURL(id item) {
                     }];
                     MacWSLog(@"interop-provider-load item=%lu kind=%@ type=%@ accepted=%@ error=%@",
                         (unsigned long)itemIndex, kind, type,
+                        path.length ? @"YES" : @"NO",
+                        providerError ?: stageError ?: @"nil");
+                    jobIndex++;
+                    void (^next)(void) = weakLoadNext;
+                    if (next) next();
+                });
+            }];
+            return;
+        }
+        if ([kind isEqualToString:@"in-place"]) {
+            if (MacWSSlotHasFileURL(slots[itemIndex])) {
+                jobIndex++;
+                void (^next)(void) = weakLoadNext;
+                if (next) next();
+                return;
+            }
+            // Notes and Photos can vend an attachment whose ordinary
+            // loadFileRepresentation path first tries to copy into a
+            // provider-owned temporary directory. Runtime-confirmed in
+            // MacWSHost.log at 1788881880.896: that intermediate copy failed
+            // with NSItemProviderErrorDomain -1000 before Host received a URL.
+            // Ask for the provider's supported in-place representation and
+            // copy it synchronously into the shared MacWS import directory
+            // while the callback's security scope is valid.
+            [provider loadInPlaceFileRepresentationForTypeIdentifier:type
+                completionHandler:^(NSURL *url, BOOL inPlace,
+                                    NSError *providerError) {
+                NSString *path = nil;
+                NSError *stageError = nil;
+                if (!providerError && url) MacWSStageProviderURL(url,
+                    provider.suggestedName, type, itemIndex, &path,
+                    &stageError);
+                dispatch_async(loadQueue, ^{
+                    if (finished) return;
+                    if (path.length && !MacWSSlotHasFileURL(slots[itemIndex])) {
+                        [slots[itemIndex] addObject:@{
+                            @"order": job[@"order"],
+                            MacWSArchiveTypeKey: UTTypeFileURL.identifier,
+                            MacWSArchiveFilePathKey: path
+                        }];
+                    }
+                    MacWSLog(@"interop-provider-load item=%lu kind=%@ type=%@ in-place=%@ accepted=%@ error=%@",
+                        (unsigned long)itemIndex, kind, type,
+                        inPlace ? @"YES" : @"NO",
+                        path.length ? @"YES" : @"NO",
+                        providerError ?: stageError ?: @"nil");
+                    jobIndex++;
+                    void (^next)(void) = weakLoadNext;
+                    if (next) next();
+                });
+            }];
+            return;
+        }
+        if ([kind isEqualToString:@"image-object"]) {
+            if (MacWSSlotHasFileURL(slots[itemIndex])) {
+                jobIndex++;
+                void (^next)(void) = weakLoadNext;
+                if (next) next();
+                return;
+            }
+            // An image object avoids the same temporary-file copy boundary
+            // for inline Notes attachments. UIKit still asks the provider for
+            // its declared image object; the bridge only serializes that real
+            // object into the declared PNG representation.
+            [provider loadObjectOfClass:UIImage.class
+                completionHandler:^(id<NSItemProviderReading> object,
+                                    NSError *providerError) {
+                UIImage *providerImage = [object isKindOfClass:UIImage.class]
+                    ? (UIImage *)object : nil;
+                NSData *data = providerImage
+                    ? UIImagePNGRepresentation(providerImage) : nil;
+                NSString *path = nil;
+                NSError *stageError = nil;
+                if (data.length <= MACWS_INTEROP_MAX_INLINE_BYTES)
+                    MacWSStageProviderData(data, provider.suggestedName,
+                        UTTypePNG.identifier, itemIndex, &path, &stageError);
+                dispatch_async(loadQueue, ^{
+                    if (finished) return;
+                    if (path.length && !MacWSSlotHasFileURL(slots[itemIndex])) {
+                        [slots[itemIndex] addObject:@{
+                            @"order": job[@"order"],
+                            MacWSArchiveTypeKey: UTTypeFileURL.identifier,
+                            MacWSArchiveFilePathKey: path
+                        }];
+                    }
+                    MacWSLog(@"interop-provider-load item=%lu kind=%@ type=%@ bytes=%lu accepted=%@ error=%@",
+                        (unsigned long)itemIndex, kind, type,
+                        (unsigned long)data.length,
                         path.length ? @"YES" : @"NO",
                         providerError ?: stageError ?: @"nil");
                     jobIndex++;
@@ -1149,7 +1342,10 @@ static NSURL *MacWSResolvedProviderFileURL(id item) {
         }];
     };
     weakLoadNext = loadNext;
-    dispatch_async(loadQueue, loadNext);
+    // Initiate the primary representation before UIDropInteraction returns
+    // from performDrop:. Subsequent work stays serialized on loadQueue, but
+    // this first request is now inside the source endpoint's owned lifetime.
+    loadNext();
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 15 * NSEC_PER_SEC), loadQueue, ^{
         if (!finished) {
             finished = YES;

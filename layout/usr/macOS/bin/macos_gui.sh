@@ -94,6 +94,7 @@ QUICKLOOK_THUMBNAILS_PLIST="$GUI_LAUNCHD_DIR/com.macwsguide.quicklook-thumbnails
 QUICKLOOKD_PLIST="$GUI_LAUNCHD_DIR/com.macwsguide.quicklookd.plist"
 QUICKLOOK_SATELLITE_PLIST="$GUI_LAUNCHD_DIR/com.macwsguide.quicklook-satellite.plist"
 CSNAMEDDATAD_PLIST="$GUI_LAUNCHD_DIR/com.macwsguide.csnameddatad.plist"
+CORESERVICESD_PLIST="$GUI_LAUNCHD_DIR/com.macwsguide.coreservicesd.plist"
 AUTHD_PLIST="$GUI_LAUNCHD_DIR/com.macwsguide.authd.plist"
 DESKTOP_SERVICES_HELPER_PLIST="$GUI_LAUNCHD_DIR/com.macwsguide.desktopserviceshelper.plist"
 FINDER_DESKTOP_PLIST="$GUI_LAUNCHD_DIR/com.macwsguide.finder-desktop.plist"
@@ -126,6 +127,7 @@ QUICKLOOK_THUMBNAILS_LABEL=com.macwsguide.quicklook-thumbnails
 QUICKLOOKD_LABEL=com.macwsguide.quicklookd
 QUICKLOOK_SATELLITE_LABEL=com.macwsguide.quicklook-satellite
 CSNAMEDDATAD_LABEL=com.macwsguide.csnameddatad
+CORESERVICESD_LABEL=com.macwsguide.coreservicesd
 AUTHD_LABEL=com.macwsguide.authd
 DESKTOP_SERVICES_HELPER_LABEL=com.macwsguide.desktopserviceshelper
 FINDER_DESKTOP_LABEL=com.macwsguide.finder-desktop
@@ -229,6 +231,7 @@ QUICKLOOKD_BIN=/System/Library/Frameworks/QuickLook.framework/Resources/quickloo
 QUICKLOOK_SATELLITE_BIN=/System/Library/Frameworks/QuickLook.framework/Versions/A/XPCServices/QuickLookSatellite.xpc/Contents/MacOS/QuickLookSatellite
 QUICKLOOK_UI_SERVICE_BIN=/System/Library/Frameworks/QuickLookUI.framework/Versions/A/XPCServices/QuickLookUIService.xpc/Contents/MacOS/QuickLookUIService
 CSNAMEDDATAD_BIN=/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/CarbonCore.framework/Versions/A/XPCServices/csnameddatad.xpc/Contents/MacOS/csnameddatad
+CORESERVICESD_BIN=/System/Library/CoreServices/coreservicesd
 AUTHD_BIN=/System/Library/Frameworks/Security.framework/Versions/A/XPCServices/authd.xpc/Contents/MacOS/authd
 DESKTOP_SERVICES_HELPER_BIN=/System/Library/PrivateFrameworks/DesktopServicesPriv.framework/Versions/A/Resources/DesktopServicesHelper
 CSNAMEDDATA_PROXY=/var/jb/usr/macOS/Frameworks/HIServices.framework/Versions/A/XPCServices/HIServicesProxy.xpc/HIServicesProxy
@@ -288,6 +291,7 @@ P_QUICKLOOK_THUMBNAILS='QuickLookThumbnailing.framework/Support/com.apple.quickl
 P_QUICKLOOKD='QuickLook.framework/Resources/quicklookd.app/Contents/MacOS/quicklookd'
 P_QUICKLOOK_SATELLITE='QuickLook.framework/Versions/A/XPCServices/QuickLookSatellite.xpc/Contents/MacOS/QuickLookSatellite'
 P_CSNAMEDDATAD='XPCServices/csnameddatad.xpc/Contents/MacOS/csnameddatad'
+P_CORESERVICESD='/System/Library/CoreServices/coreservicesd'
 P_DOCK_HELPER='XPCServices/DockHelper.xpc/Contents/MacOS/DockHelper'
 P_INPUTD='/usr/local/bin/macwsinputd'
 P_DISPLAYD='/usr/local/bin/macwsdisplayd'
@@ -818,6 +822,8 @@ stop_ws_dependents() {
         launchctl remove "$QUICKLOOK_SATELLITE_LABEL" 2>/dev/null
         launchctl unload "$CSNAMEDDATAD_PLIST" 2>/dev/null
         launchctl remove "$CSNAMEDDATAD_LABEL" 2>/dev/null
+        launchctl unload "$CORESERVICESD_PLIST" 2>/dev/null
+        launchctl remove "$CORESERVICESD_LABEL" 2>/dev/null
     fi
     for workspace_plist in "$FINDER_DESKTOP_PLIST" "$DOCK_PLIST" \
                            "$SYSTEMUI_PLIST" "$CONTROL_CENTER_PLIST"; do
@@ -866,6 +872,7 @@ stop_ws_dependents() {
         kill_by_pattern "$P_QUICKLOOKD"
         kill_by_pattern "$P_QUICKLOOK_SATELLITE"
         kill_by_pattern "$P_CSNAMEDDATAD"
+        kill_by_pattern "$P_CORESERVICESD"
         kill_by_pattern "$P_SHAREDFILELISTD"
     fi
     kill_by_pattern "$P_INPUTD"
@@ -1141,6 +1148,21 @@ refresh_dock_after_navigation_spaces() {
 
 start_ws_dependents_after_replacement() {
     local old_pid="$1" observed_pid="$2"
+
+    # A memorystatus/resource-pressure event can retire autosignd in the same
+    # interval as WindowServer.  The replacement WindowServer is already a
+    # launchd job, so launchd will keep retrying it; every retry used to reach
+    # libmachook's mandatory JIT authorization with no signing endpoint and
+    # abort at jit.m:81.  Runtime-confirmed 2026-09-10 by the adjacent lines
+    # `MACWS-JIT authorization failed ... connect_errno=61` for WindowServer,
+    # macwsinputd and authd, followed by the watchdog recovery failure.  Repair
+    # that shared upstream prerequisite before waiting for a stable replacement
+    # generation.  wait_for_replacement_ws already follows any PID transition
+    # caused by the endpoint becoming available.
+    ensure_autosignd_ready || {
+        log "watchdog: autosignd prerequisite did not recover"
+        return 1
+    }
     if ! wait_for_replacement_ws "$observed_pid"; then
         log "watchdog: replacement WindowServer did not become stable within 20 seconds"
         return 1
@@ -1193,6 +1215,8 @@ start_ws_dependents_after_replacement() {
         launchctl load "$QUICKLOOK_SATELLITE_PLIST" 2>/dev/null
     [ ! -f "$CSNAMEDDATAD_PLIST" ] || \
         launchctl load "$CSNAMEDDATAD_PLIST" 2>/dev/null
+    [ ! -f "$CORESERVICESD_PLIST" ] || \
+        launchctl load "$CORESERVICESD_PLIST" 2>/dev/null
     for workspace_plist in "$FINDER_DESKTOP_PLIST" "$DOCK_PLIST" \
                            "$SYSTEMUI_PLIST" "$CONTROL_CENTER_PLIST"; do
         [ ! -f "$workspace_plist" ] || launchctl load "$workspace_plist" 2>/dev/null
@@ -1417,7 +1441,7 @@ APPLICATION_TRUST_BOOT_MARKER="$LOGDIR/macws-application-trust.boot-ready"
 APPLICATION_TRUST_PROGRESS="$LOGDIR/macws-application-trust.progress"
 APPLICATION_TRUST_CLOSURE_VERSION=3
 BASE_TRUST_BOOT_MARKER="$LOGDIR/macws-base-trust.boot-ready"
-BASE_TRUST_CLOSURE_VERSION=1
+BASE_TRUST_CLOSURE_VERSION=5
 BASE_TRUST_READY=0
 WINDOWING_READY_WITNESS=/var/mobile/Library/Preferences/com.macwsguide.dense-grid.loaded
 WINDOWING_REQUIRED_VERSION=16
@@ -1677,6 +1701,7 @@ base_trust_marker_value() {
         /var/jb/usr/macOS/bin/launchdchrootexec \
         /var/jb/usr/macOS/lib/libmachook.dylib \
         /var/jb/usr/macOS/lib/libmachook_arm64.dylib \
+        "$ROOTFS/usr/lib/libobjc-trampolines.dylib" \
         "$ROOTFS$CFPREFSD_BIN" \
         "$VSCODE_TRUST_SENTINEL"; do
         [ -f "$path" ] || { value="$value|absent"; continue; }
@@ -1833,11 +1858,14 @@ restore_cold_boot_trust() {
         "$ROOTFS/usr/local/lib/libmachook.dylib" \
         "$ROOTFS/usr/local/lib/libmachook_arm64.dylib" \
         "$ROOTFS/usr/lib/dyld" \
+        "$ROOTFS/usr/lib/libobjc-trampolines.dylib" \
         "$ROOTFS/System/Library/Frameworks/CydiaSubstrate.framework/CydiaSubstrate" \
         /var/jb/Library/Frameworks/CydiaSubstrate.framework/CydiaSubstrate \
         "$ROOTFS/bin/bash" \
         "$ROOTFS/System/Library/CoreServices/launchservicesd" \
         "$ROOTFS/System/Library/CoreServices/launchservicesd.dylib" \
+        "$ROOTFS/System/Library/PrivateFrameworks/SkyLight.framework/Versions/A/Resources/CursorAsset" \
+        "$ROOTFS/System/Library/PrivateFrameworks/SkyLight.framework/Versions/A/Resources/CursorAsset_base" \
         "$ROOTFS$P_SHAREDFILELISTD" \
         "$ROOTFS/System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer" \
         "$ROOTFS/System/Library/PrivateFrameworks/SystemStatusServer.framework/Support/systemstatusd" \
@@ -1845,10 +1873,13 @@ restore_cold_boot_trust() {
         "$ROOTFS/usr/libexec/lsd" \
         "$ROOTFS$PLUGINKIT_PKD_BIN" \
         "$ROOTFS/System/Library/CoreServices/Finder.app/Contents/MacOS/Finder" \
+        "$ROOTFS/System/Applications/Preview.app/Contents/MacOS/Preview" \
+        "$ROOTFS/System/Library/Frameworks/CoreImage.framework/Versions/A/Frameworks/libWrapGL.dylib" \
         "$ROOTFS/System/Library/PrivateFrameworks/TimelineUI.framework/Versions/A/TimelineUI" \
         "$ROOTFS/System/Library/CoreServices/Dock.app/Contents/MacOS/Dock" \
         "$ROOTFS/System/Library/CoreServices/Dock.app/Contents/XPCServices/DockHelper.xpc/Contents/MacOS/DockHelper" \
         "$ROOTFS$CSNAMEDDATAD_BIN" \
+        "$ROOTFS$CORESERVICESD_BIN" \
         "$ROOTFS$AUTHD_BIN" \
         "$ROOTFS$DESKTOP_SERVICES_HELPER_BIN" \
         "$ROOTFS/System/Library/PrivateFrameworks/ViewBridge.framework/Versions/A/XPCServices/ViewBridgeAuxiliary.xpc/Contents/MacOS/ViewBridgeAuxiliary" \
@@ -1880,6 +1911,19 @@ restore_cold_boot_trust() {
         "$ROOTFS/usr/local/bin/macwsworkspacectl"; do
         boot_trust_macho "$path" || return 1
     done
+
+    # Preview is linked against Hydra before libmachook/autosignd can run.
+    # Runtime-confirmed on 2026-09-10 after a cold-boot trust restore: Preview
+    # itself reached dyld, which rejected the on-disk arm64e Hydra slice as
+    # unavailable; its current-boot CDHash was absent from `jbctl trustcache
+    # info`.  postinst already preserves and registers this complete framework
+    # tree, so the reboot repair must restore the same dependency closure.
+    # Scan only Mach-O headers and re-register existing signatures; never
+    # re-sign the framework or alter its nested-code relationship.
+    while IFS= read -r -d '' path; do
+        boot_trust_macho "$path" || return 1
+    done < <(list_boot_macho_files \
+        "$ROOTFS/System/Library/PrivateFrameworks/Hydra.framework")
 
     quicklook_display_root="$ROOTFS/System/Library/Frameworks/QuickLookUI.framework/Versions/A/PlugIns"
     for quicklook_display_bundle in "$quicklook_display_root"/*.qldisplay; do
@@ -1994,6 +2038,40 @@ ensure_launchservices_session_user_dir() {
     mkdir -p "$directory" || return 1
     chown root:wheel "$directory" 2>/dev/null || true
     chmod 0700 "$directory" || return 1
+}
+
+# iconservicesd deliberately runs as Ventura's _iconservices account
+# (uid/gid 240), while the root-session agent is a separate process. A cache
+# directory inherited from an older root-run service remains mode 0700 and
+# makes the real store daemon fail every rendition write with EACCES. Keep
+# ownership aligned with the launch contract before either endpoint starts.
+#
+# The renderer marker is also a one-time cache-compatibility boundary. Runtime
+# traces on 2026-09-10 showed that IconServices had cached fully transparent
+# PDF/TXT renditions while Core Image's libWrapGL CodeDirectory was absent from
+# the reboot-volatile trustcache. Once that real backend is trusted, preserve
+# the old generated store under a precisely-scoped backup name and let the
+# stock daemon regenerate it; user documents are never touched.
+ensure_iconservices_store_tree() {
+    local store="$ROOTFS/Library/Caches/com.apple.iconservices.store"
+    local marker="$ROOTFS/Library/Caches/.macws-iconservices-renderer"
+    local expected="wrapgl-trust-v1"
+    local current="" backup=""
+
+    current=$(sed -n '1p' "$marker" 2>/dev/null || true)
+    if [ "$current" != "$expected" ] && [ -d "$store" ]; then
+        backup="${store}.macws-pre-${expected}.$$"
+        mv "$store" "$backup" || return 1
+        log "Preserved incompatible generated IconServices cache at $backup."
+    fi
+    mkdir -p "$store" || return 1
+    chown -R 240:240 "$store" 2>/dev/null || return 1
+    chmod 0700 "$store" || return 1
+    if [ "$current" != "$expected" ]; then
+        printf '%s\n' "$expected" > "${marker}.new.$$" || return 1
+        chmod 0644 "${marker}.new.$$" || return 1
+        mv -f "${marker}.new.$$" "$marker" || return 1
+    fi
 }
 
 # Ventura's _locationd account is uid/gid 205 and Darwin dirhelper resolves
@@ -2721,6 +2799,47 @@ PLIST
     <key>ThrottleInterval</key><integer>10</integer>
     <key>StandardOutPath</key><string>${LOGDIR}/csnameddatad.log</string>
     <key>StandardErrorPath</key><string>${LOGDIR}/csnameddatad.log</string>
+</dict>
+</plist>
+PLIST
+
+    # CoreDrag's stock CarbonCore client asks the stock coreservicesd for the
+    # CSSeed v0x10001 table before it creates any drag session.  This is a
+    # separate Mach service from csnameddatad: runtime Finder logs showed
+    # CoreDragCreate returning -900 while csnameddatad was healthy, and the
+    # Ventura launch contract below identifies the missing owner precisely.
+    # Publish the unmodified Ventura daemon on a private endpoint; libmachook
+    # maps the daemon's check-in and clients symmetrically.
+    cat > "$CORESERVICESD_PLIST" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>${CORESERVICESD_LABEL}</string>
+    <key>POSIXSpawnType</key><string>Interactive</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>${CHROOTEXEC}</string>
+        <string>0</string>
+        <string>0</string>
+        <string>${ROOTFS}</string>
+        <string>${CORESERVICESD_BIN}</string>
+    </array>
+    <key>MachServices</key>
+    <dict>
+        <key>com.apple.macosbooter.CoreServices.coreservicesd</key>
+        <dict><key>ResetAtClose</key><true/></dict>
+    </dict>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key><string>/Users/root</string>
+        <key>TMPDIR</key><string>/tmp</string>
+    </dict>
+    <key>RunAtLoad</key><true/>
+    <key>EnableTransactions</key><true/>
+    <key>ThrottleInterval</key><integer>10</integer>
+    <key>StandardOutPath</key><string>${LOGDIR}/coreservicesd.log</string>
+    <key>StandardErrorPath</key><string>${LOGDIR}/coreservicesd.log</string>
 </dict>
 </plist>
 PLIST
@@ -4096,6 +4215,7 @@ repair_desktop() {
     # fabricate images.  Recreate the two real Ventura IconServices endpoints
     # and then restart Dock so it resolves every tile from those endpoints.
     local icon_stage_started=$SECONDS csnamed_retire_task="" \
+        coreservices_retire_task="" \
         pkd_retire_task="" ql_retire_task="" quicklookd_retire_task="" \
         quicklook_satellite_retire_task=""
     # The named-data launch contract is independent from both IconServices
@@ -4104,6 +4224,8 @@ repair_desktop() {
     # Dock is allowed to restart.
     retire_desktop_job "$CSNAMEDDATAD_PLIST" "$CSNAMEDDATAD_LABEL" &
     csnamed_retire_task=$!
+    retire_desktop_job "$CORESERVICESD_PLIST" "$CORESERVICESD_LABEL" &
+    coreservices_retire_task=$!
     retire_desktop_job "$PLUGINKIT_PKD_PLIST" "$PLUGINKIT_PKD_LABEL" &
     pkd_retire_task=$!
     retire_desktop_job "$QUICKLOOK_THUMBNAILS_PLIST" \
@@ -4118,6 +4240,7 @@ repair_desktop() {
         "$ICONSERVICESAGENT_PLIST" "$ICONSERVICESAGENT_LABEL" \
         "$ICONSERVICESD_PLIST" "$ICONSERVICESD_LABEL" || {
             wait "$csnamed_retire_task" 2>/dev/null || true
+            wait "$coreservices_retire_task" 2>/dev/null || true
             wait "$pkd_retire_task" 2>/dev/null || true
             wait "$ql_retire_task" 2>/dev/null || true
             wait "$quicklookd_retire_task" 2>/dev/null || true
@@ -4125,10 +4248,15 @@ repair_desktop() {
             return 1
         }
     wait "$csnamed_retire_task" || return 1
+    wait "$coreservices_retire_task" || return 1
     wait "$pkd_retire_task" || return 1
     wait "$ql_retire_task" || return 1
     wait "$quicklookd_retire_task" || return 1
     wait "$quicklook_satellite_retire_task" || return 1
+    ensure_iconservices_store_tree || {
+        log "ERROR: could not prepare the IconServices rendition store."
+        return 1
+    }
     log "TIMING desktop-repair detail=iconservices-nameddata-retire seconds=$((SECONDS - icon_stage_started))"
     icon_stage_started=$SECONDS
     rm -f "$LOGDIR/iconservicesd.log" "$LOGDIR/iconservicesagent.log"
@@ -4148,6 +4276,8 @@ repair_desktop() {
         "macOS Quick Look legacy generator satellite" || return 1
     load_desktop_job "$CSNAMEDDATAD_PLIST" "$CSNAMEDDATAD_LABEL" \
         "Dock CarbonCore named-data service" || return 1
+    load_desktop_job "$CORESERVICESD_PLIST" "$CORESERVICESD_LABEL" \
+        "CarbonCore seed service" || return 1
     log "TIMING desktop-repair detail=iconservices-nameddata-load seconds=$((SECONDS - icon_stage_started))"
     icon_stage_started=$SECONDS
     sleep 2
@@ -4157,7 +4287,8 @@ repair_desktop() {
         desktop_job_loaded "$QUICKLOOK_THUMBNAILS_LABEL" &&
         desktop_job_loaded "$QUICKLOOKD_LABEL" &&
         desktop_job_loaded "$QUICKLOOK_SATELLITE_LABEL" &&
-        desktop_job_loaded "$CSNAMEDDATAD_LABEL" || {
+        desktop_job_loaded "$CSNAMEDDATAD_LABEL" &&
+        desktop_job_loaded "$CORESERVICESD_LABEL" || {
             log "ERROR: IconServices/Quick Look/named-data did not survive its readiness window."
             return 1
         }
@@ -4198,7 +4329,8 @@ repair_desktop() {
                  "$QUICKLOOK_THUMBNAILS_LABEL" \
                  "$QUICKLOOKD_LABEL" \
                  "$QUICKLOOK_SATELLITE_LABEL" \
-                 "$CSNAMEDDATAD_LABEL" "$DOCK_LABEL" "$SYSTEMUI_LABEL" \
+                 "$CSNAMEDDATAD_LABEL" "$CORESERVICESD_LABEL" \
+                 "$DOCK_LABEL" "$SYSTEMUI_LABEL" \
                  "$CONTROL_CENTER_LABEL"; do
         desktop_job_loaded "$label" || {
             log "ERROR: repaired desktop contract is not loaded: $label"
@@ -4306,6 +4438,10 @@ rebuild_desktop_session() {
         "Dock CarbonCore named-data service" || {
         rm -f "$composite_marker"; return 1;
     }
+    ensure_desktop_job "$CORESERVICESD_PLIST" "$CORESERVICESD_LABEL" \
+        "CarbonCore seed service" || {
+        rm -f "$composite_marker"; return 1;
+    }
     ensure_desktop_job "$INPUT_PLIST" "$INPUT_LABEL" \
         "macOS input bridge" || {
         rm -f "$composite_marker"; return 1;
@@ -4399,6 +4535,7 @@ rebuild_desktop_session() {
            desktop_job_loaded "$ICONSERVICESD_LABEL" &&
            desktop_job_loaded "$ICONSERVICESAGENT_LABEL" &&
            desktop_job_loaded "$CSNAMEDDATAD_LABEL" &&
+           desktop_job_loaded "$CORESERVICESD_LABEL" &&
            desktop_job_loaded "$DOCK_LABEL" &&
            desktop_job_loaded "$SYSTEMUI_LABEL" &&
            desktop_job_loaded "$CONTROL_CENTER_LABEL"; then
@@ -4537,6 +4674,10 @@ start_macos() {
     # platform contract.  Both processes must remain alive, not merely have a
     # launchd label, before the application catalog scan begins.
     log "Starting private macOS IconServices store and session agent..."
+    ensure_iconservices_store_tree || {
+        log "ERROR: could not prepare the IconServices rendition store."
+        return 1
+    }
     rm -f "$LOGDIR/iconservicesd.log" "$LOGDIR/iconservicesagent.log"
     launchctl load "$ICONSERVICESD_PLIST" || return 1
     launchctl load "$ICONSERVICESAGENT_PLIST" || return 1
@@ -4565,22 +4706,28 @@ start_macos() {
         return 1
     }
 
-    # CarbonCore's named-data endpoint is independent of IconServices but is
-    # needed by Dock later in the same transaction. Start all three cold-boot
-    # services together and share one liveness/stability window instead of
-    # serially paying two identical two-second quarantine witnesses.
-    log "Publishing CarbonCore named-data service for Dock menus..."
-    rm -f "$LOGDIR/csnameddatad.log"
+    # CarbonCore exposes named-data and CSSeed through two different stock
+    # services.  Dock consumes the first; CoreDrag requires the second before
+    # Finder can create a native file-drag session. Start both with the catalog
+    # services and share one bounded liveness witness.
+    log "Publishing CarbonCore named-data and CSSeed services..."
+    rm -f "$LOGDIR/csnameddatad.log" "$LOGDIR/coreservicesd.log"
     launchctl load "$CSNAMEDDATAD_PLIST" || return 1
     launchctl list "$CSNAMEDDATAD_LABEL" >/dev/null 2>&1 || {
         log "ERROR: CarbonCore named-data MachService contract was not registered."
+        return 1
+    }
+    launchctl load "$CORESERVICESD_PLIST" || return 1
+    launchctl list "$CORESERVICESD_LABEL" >/dev/null 2>&1 || {
+        log "ERROR: CarbonCore CSSeed MachService contract was not registered."
         return 1
     }
     waited=0
     while [ "$waited" -lt 10 ]; do
         proc_running "$P_ICONSERVICESD" &&
             proc_running "$P_ICONSERVICESAGENT" &&
-            proc_running "$P_CSNAMEDDATAD" && break
+            proc_running "$P_CSNAMEDDATAD" &&
+            proc_running "$P_CORESERVICESD" && break
         sleep 1
         waited=$((waited + 1))
     done
@@ -4597,16 +4744,23 @@ start_macos() {
         tail -n 30 "$LOGDIR/csnameddatad.log" 2>/dev/null || true
         return 1
     }
+    proc_running "$P_CORESERVICESD" || {
+        log "ERROR: CarbonCore CSSeed service did not reach a live process."
+        tail -n 30 "$LOGDIR/coreservicesd.log" 2>/dev/null || true
+        return 1
+    }
     # The former quarantine failure happened after the process was briefly
     # visible, so a single ps sample falsely declared readiness.  Require the
     # all three prerequisites to survive beyond that startup window.
     sleep 2
     proc_running "$P_ICONSERVICESD" &&
         proc_running "$P_ICONSERVICESAGENT" &&
-        proc_running "$P_CSNAMEDDATAD" || {
+        proc_running "$P_CSNAMEDDATAD" &&
+        proc_running "$P_CORESERVICESD" || {
             log "ERROR: a catalog prerequisite exited during startup."
             tail -n 20 "$LOGDIR/iconservicesagent.log" 2>/dev/null || true
             tail -n 20 "$LOGDIR/csnameddatad.log" 2>/dev/null || true
+            tail -n 20 "$LOGDIR/coreservicesd.log" 2>/dev/null || true
             return 1
         }
     log "Private macOS IconServices endpoints ready."
@@ -4617,7 +4771,7 @@ start_macos() {
     # in CarbonCore `_CSGetNamedData` and could not drain native gesture work.
     # `restore_cold_boot_trust` now restores the exact executable hash above;
     # require the real process to survive its former AMFI failure window too.
-    log "CarbonCore named-data endpoint ready."
+    log "CarbonCore named-data and CSSeed endpoints ready."
     log "TIMING start-macos stage=catalog-services seconds=$((SECONDS - macos_stage_started)) total=$((SECONDS - macos_started))"
     macos_stage_started=$SECONDS
 

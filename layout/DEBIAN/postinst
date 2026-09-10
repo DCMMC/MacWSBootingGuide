@@ -245,6 +245,32 @@ trust_installed_macho "$LOCATIOND_PROXY"
 trust_installed_macho "$SETTINGS_EXTENSION_PROXY"
 trust_installed_macho "$LOCATION_BRIDGE"
 trust_installed_macho /var/jb/usr/macOS/bin/launchdchrootexec
+# Ventura 13.4's split arm64e shared cache has two fixed CodeDirectories.
+# Runtime-confirmed on a cold 2026-09-09 boot: after the executable loader
+# closure below was admitted, dyld rejected the codesign probe with
+# "code signature registration for shared cache failed" and consequently
+# could not resolve cache-resident libTLE.dylib.  These are the same exact
+# cache hashes validated by macos_gui.sh before every cold workspace start.
+for shared_cache_hash in \
+    b5da39409492ac85e5a8e8ab618fe77e2d7a2980 \
+    bbb765988e2677b98d47a549d612fa0d4af25f69; do
+    /var/jb/usr/bin/jbctl trustcache add "$shared_cache_hash" 2>/dev/null || \
+        exit 1
+done
+# The package's first chroot transaction is the native codesign seal below.
+# On a cold jailbreak boot, trusting only launchdchrootexec and codesign is not
+# sufficient: runtime-confirmed on 2026-09-09, their hashes were present while
+# dyld and both libobjc-trampolines slices were absent, and codesign was killed
+# immediately after launchdchrootexec printed its target.  Admit the real,
+# already-signed loader closure before that first exec; macos_gui.sh retains
+# the same invariant for later workspace starts.
+trust_installed_macho "$ROOTFS/usr/lib/dyld"
+trust_installed_macho "$ROOTFS/usr/lib/libobjc-trampolines.dylib"
+trust_installed_macho \
+    "$ROOTFS/System/Library/Frameworks/CydiaSubstrate.framework/CydiaSubstrate"
+trust_installed_macho \
+    /var/jb/Library/Frameworks/CydiaSubstrate.framework/CydiaSubstrate
+trust_installed_macho "$ROOTFS/usr/bin/codesign"
 # A fresh package install publishes new exec hooks before App-driven repair.
 # Start the matching signing daemon through the same bounded exact-name
 # supervisor so no old instance remains blocked on an unlinked socket inode.
@@ -626,6 +652,8 @@ if [ -d "$ROOTFS/System/Library" ]; then
         "$ROOTFS/System/Library/CoreServices/launchservicesd.dylib"
     ensure_chroot_application_signature \
         "$ROOTFS/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/CarbonCore.framework/Versions/A/XPCServices/csnameddatad.xpc/Contents/MacOS/csnameddatad" || exit 1
+    ensure_chroot_application_signature \
+        "$ROOTFS/System/Library/CoreServices/coreservicesd" || exit 1
     ensure_chroot_extensionkit_signature \
         "$ROOTFS/System/Library/Frameworks/ExtensionFoundation.framework/Versions/A/XPCServices/extensionkitservice.xpc/Contents/MacOS/extensionkitservice" || exit 1
     ensure_chroot_appearance_signature \

@@ -3632,8 +3632,12 @@ static void macws_schedule_settings_symbol_raster_compatibility(void) {
 // documents continue through ImageKit's original renderer.
 typedef void (*MacWSCIContextRenderToSurfaceFn)(
     id, SEL, id, IOSurfaceRef, CGRect, CGColorSpaceRef);
+typedef void (*MacWSIKImageContentUpdateFn)(id, SEL, id);
 static MacWSCIContextRenderToSurfaceFn
     g_macws_preview_original_ci_render_to_surface;
+static MacWSIKImageContentUpdateFn
+    g_macws_preview_original_imagekit_update_content;
+static _Thread_local NSURL *g_macws_preview_imagekit_source_url;
 static pthread_mutex_t g_macws_preview_source_image_lock =
     PTHREAD_MUTEX_INITIALIZER;
 static NSString *g_macws_preview_source_image_path;
@@ -3657,6 +3661,19 @@ static BOOL macws_preview_ci_diagnostics_enabled(void) {
 }
 
 static NSURL *macws_preview_current_document_url(void) {
+    // `updateContentForLayer:` renders tiles on concurrent ImageKit queues.
+    // NSDocumentController's process-wide currentDocument can therefore name
+    // a different Preview window. Runtime-confirmed with Preview PID 41705:
+    // the IKImageContentView owning updateContentForLayer:+0x3fc carried a
+    // non-null file-reference URL at its `_imgURL` ivar (+0x3e8), while
+    // currentDocument's
+    // CGImageSource type was `com.adobe.pdf` for the PNG tile being rendered.
+    // The outer ImageKit hook scopes the owning view's URL to this exact
+    // synchronous render call (RE-confirmed below at ImageKit +0x2c9f75c).
+    NSURL *imageKitURL = g_macws_preview_imagekit_source_url;
+    if ([imageKitURL isKindOfClass:[NSURL class]] &&
+        [imageKitURL isFileURL]) return imageKitURL;
+
     Class controllerClass = objc_getClass("NSDocumentController");
     SEL sharedSelector = sel_registerName("sharedDocumentController");
     SEL currentSelector = sel_registerName("currentDocument");
@@ -3684,6 +3701,50 @@ static NSURL *macws_preview_current_document_url(void) {
     return [url isKindOfClass:[NSURL class]] && [url isFileURL] ? url : nil;
 }
 
+static NSURL *macws_preview_imagekit_source_url(id contentView) {
+    if (!contentView) return nil;
+    SEL getter = sel_registerName("imgURL");
+    id url = [contentView respondsToSelector:getter]
+        ? ((id (*)(id, SEL))objc_msgSend)(contentView, getter) : nil;
+    if (!url) {
+        // Ventura ImageKit's exact setter disassembly stores the retained URL
+        // through the ivar-offset slot used by `_imgURL` (setImgURL: +0x1c).
+        // Some builds do not export a synthesized getter, so read that same
+        // object ivar through the Objective-C runtime rather than hard-coding
+        // its runtime offset (0x3e8 in the tested ImageKit image).
+        Ivar ivar = class_getInstanceVariable(object_getClass(contentView),
+                                               "_imgURL");
+        if (!ivar)
+            ivar = class_getInstanceVariable(object_getClass(contentView),
+                                             "imgURL");
+        if (ivar) url = object_getIvar(contentView, ivar);
+    }
+    return [url isKindOfClass:[NSURL class]] && [url isFileURL] ? url : nil;
+}
+
+static void macws_preview_imagekit_update_content(
+        id contentView, SEL command, id layer) {
+    MacWSIKImageContentUpdateFn original =
+        g_macws_preview_original_imagekit_update_content;
+    if (!original) return;
+
+    // RE-confirmed in Ventura ImageKit
+    // -[IKImageContentView updateContentForLayer:] +0x3f8: the call to
+    // -[CIContext render:toIOSurface:bounds:colorSpace:] is synchronous and
+    // returns at +0x3fc before the IOSurface is installed on the layer. A
+    // thread-local scope therefore follows the exact view even when Preview
+    // has several documents rendering concurrently.
+    NSURL *previousURL = g_macws_preview_imagekit_source_url;
+    NSURL *sourceURL = [macws_preview_imagekit_source_url(contentView) retain];
+    g_macws_preview_imagekit_source_url = sourceURL;
+    @try {
+        original(contentView, command, layer);
+    } @finally {
+        g_macws_preview_imagekit_source_url = previousURL;
+        [sourceURL release];
+    }
+}
+
 static CGImageRef macws_preview_copy_current_source_image(
         size_t requestedMaxPixel) {
     NSURL *url = macws_preview_current_document_url();
@@ -3702,6 +3763,30 @@ static CGImageRef macws_preview_copy_current_source_image(
         g_macws_preview_source_image_max_pixel < requestedMaxPixel) {
         CGImageSourceRef source = CGImageSourceCreateWithURL(
             (CFURLRef)url, NULL);
+        // ImageIO can rasterize the first page of a PDF, but doing so here
+        // discards PDFKit's live annotation/compositing graph. That made
+        // Preview's built-in pen strokes exist in the document while this
+        // adapter kept presenting the unannotated source page. The bitmap
+        // fast path is exclusively for raster image documents; PDF and every
+        // other non-raster type stay on Preview's original renderer.
+        CFStringRef sourceType = source ? CGImageSourceGetType(source) : NULL;
+        char sourceTypeName[64] = {0};
+        // Do not compare against an injected-image CFSTR here. LLDB captured
+        // Preview's PNG render faulting in CFEqual with x0=@"public.png" and
+        // x1=libmachook's unauthenticated constant-string pointer
+        // 0x00200001f9ec45d8. Convert the real ImageIO type to UTF-8 instead;
+        // this keeps the PDF exclusion exact without crossing the arm64e
+        // constant-object ABI boundary.
+        BOOL isPDF = sourceType &&
+            CFStringGetCString(sourceType, sourceTypeName,
+                               sizeof(sourceTypeName),
+                               kCFStringEncodingUTF8) &&
+            strcmp(sourceTypeName, "com.adobe.pdf") == 0;
+        if (isPDF) {
+            CFRelease(source);
+            pthread_mutex_unlock(&g_macws_preview_source_image_lock);
+            return NULL;
+        }
         NSDictionary *properties = source
             ? (NSDictionary *)CGImageSourceCopyPropertiesAtIndex(
                 source, 0, NULL) : nil;
@@ -3748,14 +3833,29 @@ static CGImageRef macws_preview_copy_current_source_image(
 }
 
 static BOOL macws_preview_render_coregraphics_bitmap(
-        IOSurfaceRef surface, CGRect imageExtent) {
+        IOSurfaceRef surface, CGRect imageExtent,
+        CGColorSpaceRef destinationColorSpace) {
+    uint32_t pixelFormat = surface ? IOSurfaceGetPixelFormat(surface) : 0;
+    size_t bytesPerElement = surface
+        ? IOSurfaceGetBytesPerElement(surface) : 0;
+    // Runtime-confirmed in Preview PID 83009 while opening two image
+    // documents: ImageKit also requests an 8-bit RGBA destination
+    // (FourCC `RGBA`, 0x52474241, four bytes per element). The former
+    // half-float-only predicate sent that exact call into Core Image's
+    // unavailable GL renderer, where one render:toIOSurface: invocation took
+    // 15.254901 seconds and kept Preview at ~100% CPU. Both layouts below are
+    // native CGBitmapContext layouts; no pixel-format reinterpretation or
+    // protocol check is bypassed.
+    BOOL halfFloatRGBA = pixelFormat == UINT32_C(0x52476841) &&
+        bytesPerElement == 8; // `RGhA`
+    BOOL byteRGBA = pixelFormat == UINT32_C(0x52474241) &&
+        bytesPerElement == 4; // `RGBA`
     if (!surface || CGRectIsEmpty(imageExtent) ||
         !isfinite(imageExtent.origin.x) ||
         !isfinite(imageExtent.origin.y) ||
         !isfinite(imageExtent.size.width) ||
         !isfinite(imageExtent.size.height) ||
-        IOSurfaceGetPixelFormat(surface) != UINT32_C(0x52476841) ||
-        IOSurfaceGetBytesPerElement(surface) != 8)
+        (!halfFloatRGBA && !byteRGBA))
         return NO;
 
     size_t requestedMaxPixel = (size_t)ceil(fmax(
@@ -3770,12 +3870,22 @@ static BOOL macws_preview_render_coregraphics_bitmap(
     int lockResult = IOSurfaceLock(surface, 0, &seed);
     void *base = lockResult == 0
         ? IOSurfaceGetBaseAddress(surface) : NULL;
-    CGColorSpaceRef colorSpace = CGColorSpaceCreateWithName(
-        kCGColorSpaceExtendedLinearSRGB);
-    CGBitmapInfo bitmapInfo = kCGBitmapByteOrder16Little |
-        kCGImageAlphaPremultipliedLast | kCGBitmapFloatComponents;
+    // CIContext's colorSpace argument is the contract for this half-float
+    // IOSurface. Rendering through a hard-coded Extended Linear sRGB context
+    // reinterpreted Display-P3/profiled images and visibly shifted their
+    // colors. Preserve the exact destination space selected by ImageKit; only
+    // use the prior linear-sRGB space when the caller supplies none.
+    CGColorSpaceRef colorSpace = destinationColorSpace
+        ? CGColorSpaceRetain(destinationColorSpace)
+        : CGColorSpaceCreateWithName(halfFloatRGBA
+            ? kCGColorSpaceExtendedLinearSRGB : kCGColorSpaceSRGB);
+    size_t bitsPerComponent = halfFloatRGBA ? 16 : 8;
+    CGBitmapInfo bitmapInfo = halfFloatRGBA
+        ? (kCGBitmapByteOrder16Little |
+           kCGImageAlphaPremultipliedLast | kCGBitmapFloatComponents)
+        : (kCGBitmapByteOrder32Big | kCGImageAlphaPremultipliedLast);
     CGContextRef bitmap = base && width && height && rowBytes && colorSpace
-        ? CGBitmapContextCreate(base, width, height, 16, rowBytes,
+        ? CGBitmapContextCreate(base, width, height, bitsPerComponent, rowBytes,
                                 colorSpace, bitmapInfo)
         : NULL;
     if (bitmap) {
@@ -3837,7 +3947,8 @@ static void macws_preview_ci_render_to_surface(
         fflush(stderr);
     }
     if (imageKitCaller &&
-        macws_preview_render_coregraphics_bitmap(surface, extent)) {
+        macws_preview_render_coregraphics_bitmap(
+            surface, extent, colorSpace)) {
         if (diagnostics) {
             struct timespec finished = {0};
             clock_gettime(CLOCK_MONOTONIC, &finished);
@@ -3882,29 +3993,49 @@ static void macws_preview_ci_render_to_surface(
 }
 
 static BOOL macws_install_preview_coreimage_renderer_adapter(void) {
-    if (g_macws_preview_original_ci_render_to_surface) return YES;
     if (!macws_process_is_preview()) return YES;
-    Class contextClass = objc_getClass("CIContext");
-    SEL selector = sel_registerName(
-        "render:toIOSurface:bounds:colorSpace:");
-    Method method = contextClass
-        ? class_getInstanceMethod(contextClass, selector) : NULL;
-    if (!method) return NO;
-    IMP current = method_getImplementation(method);
-    if (current != (IMP)macws_preview_ci_render_to_surface) {
-        g_macws_preview_original_ci_render_to_surface =
-            (MacWSCIContextRenderToSurfaceFn)current;
-        method_setImplementation(
-            method, (IMP)macws_preview_ci_render_to_surface);
+    if (!g_macws_preview_original_ci_render_to_surface) {
+        Class contextClass = objc_getClass("CIContext");
+        SEL selector = sel_registerName(
+            "render:toIOSurface:bounds:colorSpace:");
+        Method method = contextClass
+            ? class_getInstanceMethod(contextClass, selector) : NULL;
+        if (method) {
+            IMP current = method_getImplementation(method);
+            if (current != (IMP)macws_preview_ci_render_to_surface) {
+                g_macws_preview_original_ci_render_to_surface =
+                    (MacWSCIContextRenderToSurfaceFn)current;
+                method_setImplementation(
+                    method, (IMP)macws_preview_ci_render_to_surface);
+            }
+        }
     }
+    if (!g_macws_preview_original_imagekit_update_content) {
+        Class viewClass = objc_getClass("IKImageContentView");
+        SEL selector = sel_registerName("updateContentForLayer:");
+        Method method = viewClass
+            ? class_getInstanceMethod(viewClass, selector) : NULL;
+        if (method) {
+            IMP current = method_getImplementation(method);
+            if (current != (IMP)macws_preview_imagekit_update_content) {
+                g_macws_preview_original_imagekit_update_content =
+                    (MacWSIKImageContentUpdateFn)current;
+                method_setImplementation(
+                    method, (IMP)macws_preview_imagekit_update_content);
+            }
+        }
+    }
+    BOOL installed = g_macws_preview_original_ci_render_to_surface &&
+        g_macws_preview_original_imagekit_update_content;
     if (macws_preview_ci_diagnostics_enabled()) {
         fprintf(stderr,
                 "#### MACWS PREVIEW-CI adapter installed original=%p "
-                "renderer=CoreGraphics-Bitmap\n",
-                g_macws_preview_original_ci_render_to_surface);
+                "imagekit-update=%p renderer=CoreGraphics-Bitmap\n",
+                g_macws_preview_original_ci_render_to_surface,
+                g_macws_preview_original_imagekit_update_content);
         fflush(stderr);
     }
-    return YES;
+    return installed;
 }
 
 static void macws_try_preview_coreimage_renderer_adapter(unsigned attempt) {
@@ -10520,6 +10651,296 @@ static bool macws_is_crashpad_simulated_task_port_send(
            exception == kMachExceptionSimulated && codeCount == 2;
 }
 
+// Diagnostic only: Ventura IconServices reaches CarbonCore's
+// SCSessionUniverse MIG client before its first catalog lookup. iPadOS kills
+// that send with EXC_GUARD/ILLEGAL_MOVE, but the crash report records only the
+// guarded port name. Under the existing explicit mach-message trace switch,
+// capture a bounded copy of the untouched request plus the live header-port
+// right types. This neither changes a disposition nor suppresses the kernel
+// result; it exists to identify the upstream producer of the illegal move.
+static void macws_trace_core_services_session_send(
+        const mach_msg_header_t *message, mach_msg_option_t option,
+        mach_msg_size_t send_size) {
+    if (!message || !(option & MACH_SEND_MSG)) return;
+    const char *program = getprogname();
+    if (!program ||
+        (strcmp(program, "iconservicesd") != 0 &&
+         strcmp(program, "iconservicesagent") != 0)) return;
+
+    static _Atomic unsigned traceCount = 0;
+    unsigned sequence = atomic_fetch_add_explicit(
+        &traceCount, 1, memory_order_relaxed);
+    if (sequence >= 128) return;
+
+    mach_port_type_t remoteTypes = 0;
+    mach_port_type_t localTypes = 0;
+    kern_return_t remoteResult = mach_port_type(
+        mach_task_self(), message->msgh_remote_port, &remoteTypes);
+    kern_return_t localResult = message->msgh_local_port
+        ? mach_port_type(mach_task_self(), message->msgh_local_port,
+                         &localTypes)
+        : KERN_INVALID_NAME;
+    uint32_t descriptorCount = 0;
+    if ((message->msgh_bits & MACH_MSGH_BITS_COMPLEX) &&
+        send_size >= sizeof(mach_msg_header_t) + sizeof(mach_msg_body_t)) {
+        mach_msg_body_t body = {0};
+        memcpy(&body, (const uint8_t *)message + sizeof(*message),
+               sizeof(body));
+        descriptorCount = body.msgh_descriptor_count;
+    }
+
+    char line[512];
+    int length = snprintf(
+        line, sizeof(line),
+        "#### CORESERVICES-MACH-SEND program=%s seq=%u id=%d "
+        "bits=%#x dispositions={remote=%u,local=%u,voucher=%u} "
+        "ports={remote=%u/types=%#x/kr=%#x,local=%u/types=%#x/kr=%#x} "
+        "size=%u descriptors=%u\n",
+        program, sequence, message->msgh_id, message->msgh_bits,
+        MACH_MSGH_BITS_REMOTE(message->msgh_bits),
+        MACH_MSGH_BITS_LOCAL(message->msgh_bits),
+        MACH_MSGH_BITS_VOUCHER(message->msgh_bits),
+        message->msgh_remote_port, remoteTypes, remoteResult,
+        message->msgh_local_port, localTypes, localResult,
+        send_size, descriptorCount);
+    if (length > 0) {
+        size_t writeLength = (size_t)length < sizeof(line)
+            ? (size_t)length : sizeof(line) - 1;
+        (void)write(STDERR_FILENO, line, writeLength);
+    }
+
+    if (descriptorCount > 0 &&
+        send_size >= sizeof(mach_msg_header_t) + sizeof(mach_msg_body_t) +
+                     sizeof(mach_msg_port_descriptor_t)) {
+        mach_msg_port_descriptor_t descriptor = {0};
+        memcpy(&descriptor,
+               (const uint8_t *)message + sizeof(mach_msg_header_t) +
+                   sizeof(mach_msg_body_t),
+               sizeof(descriptor));
+        if (descriptor.type == MACH_MSG_PORT_DESCRIPTOR) {
+            mach_port_type_t descriptorTypes = 0;
+            kern_return_t descriptorTypeResult = mach_port_type(
+                mach_task_self(), descriptor.name, &descriptorTypes);
+            mach_port_info_ext_t info = {0};
+            mach_msg_type_number_t infoCount = MACH_PORT_INFO_EXT_COUNT;
+            kern_return_t infoResult = mach_port_get_attributes(
+                mach_task_self(), descriptor.name, MACH_PORT_INFO_EXT,
+                (mach_port_info_t)&info, &infoCount);
+            length = snprintf(
+                line, sizeof(line),
+                "#### CORESERVICES-MACH-PORT program=%s seq=%u "
+                "descriptor=0 name=%u disposition=%u type=%u "
+                "right-types=%#x/type-kr=%#x task-self=%u is-task-self=%u "
+                "info-kr=%#x status-flags=%#x\n",
+                program, sequence, descriptor.name, descriptor.disposition,
+                descriptor.type, descriptorTypes, descriptorTypeResult,
+                mach_task_self(), descriptor.name == mach_task_self(),
+                infoResult, info.mpie_status.mps_flags);
+            if (length > 0) {
+                size_t writeLength = (size_t)length < sizeof(line)
+                    ? (size_t)length : sizeof(line) - 1;
+                (void)write(STDERR_FILENO, line, writeLength);
+            }
+        }
+    }
+
+    size_t captured = send_size < 128 ? send_size : 128;
+    const uint8_t *bytes = (const uint8_t *)message;
+    for (size_t offset = 0; offset < captured; offset += 24) {
+        size_t chunk = captured - offset;
+        if (chunk > 24) chunk = 24;
+        int used = snprintf(line, sizeof(line),
+            "#### CORESERVICES-MACH-BYTES program=%s seq=%u "
+            "offset=%zu data=", program, sequence, offset);
+        for (size_t index = 0; index < chunk && used > 0 &&
+             (size_t)used + 3 < sizeof(line); index++) {
+            used += snprintf(line + used, sizeof(line) - (size_t)used,
+                             "%02x", bytes[offset + index]);
+        }
+        if (used > 0 && (size_t)used + 1 < sizeof(line))
+            line[used++] = '\n';
+        if (used > 0) (void)write(STDERR_FILENO, line, (size_t)used);
+    }
+}
+
+enum {
+    MacWSCoreServicesMapRequestID = 0x4d57434d, // "MWCM"
+    MacWSCoreServicesMapMagic = 0x43534d50,     // "CSMP"
+    MacWSCoreServicesMapVersion = 1,
+};
+
+typedef struct {
+    mach_msg_header_t header;
+    mach_msg_body_t body;
+    mach_msg_port_descriptor_t object;
+    uint32_t magic;
+    uint32_t version;
+    uint64_t size;
+    uint64_t mask;
+    uint64_t offset;
+    int32_t flags;
+    int32_t copy;
+    int32_t currentProtection;
+    int32_t maximumProtection;
+    int32_t inheritance;
+    uint32_t reserved;
+} MacWSCoreServicesMapRequest;
+
+typedef struct {
+    mach_msg_header_t header;
+    uint32_t magic;
+    int32_t result;
+    uint64_t address;
+} MacWSCoreServicesMapReply;
+
+typedef union {
+    MacWSCoreServicesMapRequest request;
+    MacWSCoreServicesMapReply reply;
+    uint8_t receiveStorage[512];
+} MacWSCoreServicesMapMessage;
+
+extern kern_return_t mach_vm_map(
+    vm_map_t target_task, mach_vm_address_t *address, mach_vm_size_t size,
+    mach_vm_offset_t mask, int flags, mach_port_t object,
+    memory_object_offset_t offset, boolean_t copy,
+    vm_prot_t current_protection, vm_prot_t maximum_protection,
+    vm_inherit_t inheritance);
+
+static void *macws_core_services_map_bridge_thread(void *context) {
+    mach_port_t receivePort = (mach_port_t)(uintptr_t)context;
+    for (;;) {
+        MacWSCoreServicesMapMessage message = {0};
+        mach_msg_return_t receiveResult = mach_msg(
+            &message.request.header, MACH_RCV_MSG, 0,
+            sizeof(message.receiveStorage), receivePort,
+            MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL);
+        if (receiveResult != MACH_MSG_SUCCESS) continue;
+
+        MacWSCoreServicesMapRequest *request = &message.request;
+        if (request->header.msgh_id != MacWSCoreServicesMapRequestID ||
+            request->header.msgh_size < sizeof(*request) ||
+            !(request->header.msgh_bits & MACH_MSGH_BITS_COMPLEX) ||
+            request->body.msgh_descriptor_count != 1 ||
+            request->object.type != MACH_MSG_PORT_DESCRIPTOR ||
+            request->magic != MacWSCoreServicesMapMagic ||
+            request->version != MacWSCoreServicesMapVersion) {
+            mach_msg_destroy(&request->header);
+            continue;
+        }
+
+        mach_port_t replyPort = request->header.msgh_remote_port;
+        mach_vm_address_t address = 0;
+        kern_return_t mapResult = mach_vm_map(
+            mach_task_self(), &address, request->size, request->mask,
+            request->flags, request->object.name, request->offset,
+            request->copy, request->currentProtection,
+            request->maximumProtection, request->inheritance);
+        (void)mach_port_deallocate(mach_task_self(), request->object.name);
+
+        MacWSCoreServicesMapReply reply = {0};
+        reply.header.msgh_bits = MACH_MSGH_BITS(
+            MACH_MSG_TYPE_MOVE_SEND_ONCE, 0);
+        reply.header.msgh_size = sizeof(reply);
+        reply.header.msgh_remote_port = replyPort;
+        reply.header.msgh_id = MacWSCoreServicesMapRequestID + 100;
+        reply.magic = MacWSCoreServicesMapMagic;
+        reply.result = mapResult;
+        reply.address = address;
+        (void)mach_msg(&reply.header, MACH_SEND_MSG, sizeof(reply), 0,
+                       MACH_PORT_NULL, MACH_MSG_TIMEOUT_NONE,
+                       MACH_PORT_NULL);
+    }
+    return NULL;
+}
+
+static mach_port_t macws_core_services_map_bridge_port(void) {
+    static dispatch_once_t once;
+    static mach_port_t bridgePort = MACH_PORT_NULL;
+    dispatch_once(&once, ^{
+        mach_port_t port = MACH_PORT_NULL;
+        kern_return_t result = mach_port_allocate(
+            mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &port);
+        if (result == KERN_SUCCESS) {
+            result = mach_port_insert_right(
+                mach_task_self(), port, port, MACH_MSG_TYPE_MAKE_SEND);
+        }
+        if (result != KERN_SUCCESS) {
+            if (port != MACH_PORT_NULL) {
+                (void)mach_port_mod_refs(mach_task_self(), port,
+                                         MACH_PORT_RIGHT_RECEIVE, -1);
+            }
+            return;
+        }
+
+        pthread_attr_t attributes;
+        pthread_t thread;
+        if (pthread_attr_init(&attributes) != 0) {
+            (void)mach_port_mod_refs(mach_task_self(), port,
+                                     MACH_PORT_RIGHT_SEND, -1);
+            (void)mach_port_mod_refs(mach_task_self(), port,
+                                     MACH_PORT_RIGHT_RECEIVE, -1);
+            return;
+        }
+        (void)pthread_attr_setdetachstate(&attributes,
+                                          PTHREAD_CREATE_DETACHED);
+        int threadResult = pthread_create(
+            &thread, &attributes, macws_core_services_map_bridge_thread,
+            (void *)(uintptr_t)port);
+        (void)pthread_attr_destroy(&attributes);
+        if (threadResult != 0) {
+            (void)mach_port_mod_refs(mach_task_self(), port,
+                                     MACH_PORT_RIGHT_SEND, -1);
+            (void)mach_port_mod_refs(mach_task_self(), port,
+                                     MACH_PORT_RIGHT_RECEIVE, -1);
+            return;
+        }
+        bridgePort = port;
+    });
+    return bridgePort;
+}
+
+// Ventura's SCSessionUniverse connection handshake sends mach_task_self() in
+// MIG request 10054 so coreservicesd can map its shared catalog pages directly
+// into the client. Runtime-confirmed on iPadOS 16.3: the task-control port is
+// hard-immovable and the kernel terminates that COPY_SEND with
+// EXC_GUARD/ILLEGAL_MOVE. A transferable task-name port avoids the guard but
+// cannot satisfy the server's mach_vm_map calls (KERN_INVALID_ARGUMENT).
+//
+// Preserve the actual shared-memory protocol: replace only that exact
+// CarbonCore descriptor with a private client mapping port. The coreservicesd
+// mach_vm_map adapter below forwards the real memory-entry right and mapping
+// arguments to the client, which maps the page into its own task and returns
+// the real address/result. No server result or catalog payload is fabricated.
+static mach_msg_port_descriptor_t *
+macws_core_services_task_descriptor(
+        mach_msg_header_t *message, mach_msg_option_t option,
+        mach_msg_size_t send_size, void *callerAddress) {
+    if (!message || !(option & MACH_SEND_MSG) ||
+        !(message->msgh_bits & MACH_MSGH_BITS_COMPLEX) ||
+        message->msgh_id != 10054 || send_size != 56 ||
+        send_size < sizeof(mach_msg_header_t) + sizeof(mach_msg_body_t) +
+                    sizeof(mach_msg_port_descriptor_t)) {
+        return NULL;
+    }
+
+    Dl_info caller = {0};
+    if (!dladdr(callerAddress, &caller) ||
+        !caller.dli_fname || !strstr(caller.dli_fname, "CarbonCore")) {
+        return NULL;
+    }
+
+    mach_msg_body_t *body = (mach_msg_body_t *)(message + 1);
+    mach_msg_port_descriptor_t *descriptor =
+        (mach_msg_port_descriptor_t *)(body + 1);
+    if (body->msgh_descriptor_count != 1 ||
+        descriptor->type != MACH_MSG_PORT_DESCRIPTOR ||
+        descriptor->disposition != MACH_MSG_TYPE_COPY_SEND ||
+        descriptor->name != mach_task_self()) {
+        return NULL;
+    }
+    return descriptor;
+}
+
 mach_msg_return_t mach_msg_new(mach_msg_header_t *message,
                                mach_msg_option_t option,
                                mach_msg_size_t send_size,
@@ -10528,6 +10949,8 @@ mach_msg_return_t mach_msg_new(mach_msg_header_t *message,
                                mach_msg_timeout_t timeout,
                                mach_port_name_t notify) {
     bool machTraceEnabled = macws_mach_msg_trace_enabled();
+    if (machTraceEnabled)
+        macws_trace_core_services_session_send(message, option, send_size);
     bool tracePostRendezvous = machTraceEnabled && message &&
         atomic_load_explicit(&g_macws_steam_mojo_rendezvous_received,
                              memory_order_acquire);
@@ -10609,6 +11032,27 @@ mach_msg_return_t mach_msg_new(mach_msg_header_t *message,
     bool rejectCrashpadSimulatedTaskPort =
         macws_is_crashpad_simulated_task_port_send(message, option,
                                                     send_size);
+    mach_msg_port_descriptor_t *coreServicesTaskDescriptor =
+        macws_core_services_task_descriptor(
+            message, option, send_size, __builtin_return_address(0));
+    mach_port_name_t originalCoreServicesTaskPort = MACH_PORT_NULL;
+    bool usingCoreServicesMapBridge = false;
+    if (coreServicesTaskDescriptor) {
+        mach_port_t bridgePort = macws_core_services_map_bridge_port();
+        if (bridgePort != MACH_PORT_NULL) {
+            originalCoreServicesTaskPort = coreServicesTaskDescriptor->name;
+            coreServicesTaskDescriptor->name = bridgePort;
+            usingCoreServicesMapBridge = true;
+            dprintf(STDERR_FILENO,
+                    "#### CORESERVICES-MAP-BRIDGE client pid=%d "
+                    "message=10054 task-self=%u bridge-port=%u\n",
+                    getpid(), originalCoreServicesTaskPort, bridgePort);
+        } else {
+            dprintf(STDERR_FILENO,
+                    "#### CORESERVICES-MAP-BRIDGE client pid=%d "
+                    "message=10054 setup-failed\n", getpid());
+        }
+    }
     mach_msg_return_t result;
     if (rejectCrashpadSimulatedTaskPort) {
         result = MACH_SEND_INVALID_RIGHT;
@@ -10632,6 +11076,19 @@ mach_msg_return_t mach_msg_new(mach_msg_header_t *message,
     } else {
         result = mach_msg(message, option, send_size, receive_limit,
                           receive_name, timeout, notify);
+    }
+    if (usingCoreServicesMapBridge) {
+        // A failed combined send leaves the outbound request intact. Restore
+        // it for the caller's error path; a successful receive has replaced
+        // the request buffer with its reply and must not be edited.
+        if (result != MACH_MSG_SUCCESS && coreServicesTaskDescriptor)
+            coreServicesTaskDescriptor->name = originalCoreServicesTaskPort;
+        dprintf(STDERR_FILENO,
+                "#### CORESERVICES-MAP-BRIDGE client-result pid=%d "
+                "message=10054 result=%#x reply-id=%d reply-size=%u\n",
+                getpid(), result,
+                result == MACH_MSG_SUCCESS ? message->msgh_id : 0,
+                result == MACH_MSG_SUCCESS ? message->msgh_size : 0);
     }
     if (tracePostRendezvous && postRendezvousRecord < 256) {
         char line[384];
@@ -10987,15 +11444,95 @@ extern kern_return_t mach_vm_remap(
     vm_prot_t *current_protection, vm_prot_t *maximum_protection,
     vm_inherit_t inheritance);
 
+static bool macws_core_services_bridge_map(
+    vm_map_t targetTask, mach_vm_address_t *address, mach_vm_size_t size,
+    mach_vm_offset_t mask, int flags, mach_port_t object,
+    memory_object_offset_t offset, boolean_t copy,
+    vm_prot_t currentProtection, vm_prot_t maximumProtection,
+    vm_inherit_t inheritance, kern_return_t *resultOut) {
+    if (!atomic_load_explicit(&g_macws_libsystem_runtime_ready,
+                              memory_order_acquire)) {
+        return false;
+    }
+    const char *program = getprogname();
+    if (!program || strcmp(program, "coreservicesd") != 0 || !address ||
+        targetTask == mach_task_self() || !MACH_PORT_VALID(targetTask) ||
+        !MACH_PORT_VALID(object) || !resultOut) {
+        return false;
+    }
+
+    mach_port_t replyPort = MACH_PORT_NULL;
+    kern_return_t setupResult = mach_port_allocate(
+        mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &replyPort);
+    if (setupResult != KERN_SUCCESS) return false;
+
+    MacWSCoreServicesMapMessage message = {0};
+    MacWSCoreServicesMapRequest *request = &message.request;
+    request->header.msgh_bits = MACH_MSGH_BITS_COMPLEX |
+        MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND,
+                       MACH_MSG_TYPE_MAKE_SEND_ONCE);
+    request->header.msgh_size = sizeof(*request);
+    request->header.msgh_remote_port = targetTask;
+    request->header.msgh_local_port = replyPort;
+    request->header.msgh_id = MacWSCoreServicesMapRequestID;
+    request->body.msgh_descriptor_count = 1;
+    request->object.name = object;
+    request->object.disposition = MACH_MSG_TYPE_COPY_SEND;
+    request->object.type = MACH_MSG_PORT_DESCRIPTOR;
+    request->magic = MacWSCoreServicesMapMagic;
+    request->version = MacWSCoreServicesMapVersion;
+    request->size = size;
+    request->mask = mask;
+    request->offset = offset;
+    request->flags = flags;
+    request->copy = copy;
+    request->currentProtection = currentProtection;
+    request->maximumProtection = maximumProtection;
+    request->inheritance = inheritance;
+
+    mach_msg_return_t messageResult = mach_msg(
+        &request->header,
+        MACH_SEND_MSG | MACH_RCV_MSG | MACH_SEND_TIMEOUT | MACH_RCV_TIMEOUT,
+        sizeof(*request), sizeof(message.receiveStorage), replyPort, 250,
+        MACH_PORT_NULL);
+    (void)mach_port_mod_refs(mach_task_self(), replyPort,
+                             MACH_PORT_RIGHT_RECEIVE, -1);
+    if (messageResult != MACH_MSG_SUCCESS ||
+        message.reply.header.msgh_id != MacWSCoreServicesMapRequestID + 100 ||
+        message.reply.header.msgh_size < sizeof(message.reply) ||
+        message.reply.magic != MacWSCoreServicesMapMagic) {
+        dprintf(STDERR_FILENO,
+                "#### CORESERVICES-MAP-BRIDGE server pid=%d target=%u "
+                "object=%u message-result=%#x\n",
+                getpid(), targetTask, object, messageResult);
+        return false;
+    }
+
+    *address = message.reply.address;
+    *resultOut = message.reply.result;
+    dprintf(STDERR_FILENO,
+            "#### CORESERVICES-MAP-BRIDGE server pid=%d target=%u "
+            "object=%u size=%#llx result=%#x address=%#llx\n",
+            getpid(), targetTask, object, (unsigned long long)size,
+            *resultOut, (unsigned long long)*address);
+    return true;
+}
+
 kern_return_t mach_vm_map_new(
     vm_map_t target_task, mach_vm_address_t *address, mach_vm_size_t size,
     mach_vm_offset_t mask, int flags, mach_port_t object,
     memory_object_offset_t offset, boolean_t copy,
     vm_prot_t current_protection, vm_prot_t maximum_protection,
     vm_inherit_t inheritance) {
-    kern_return_t result = mach_vm_map(
+    kern_return_t result = KERN_FAILURE;
+    bool bridged = macws_core_services_bridge_map(
         target_task, address, size, mask, flags, object, offset, copy,
-        current_protection, maximum_protection, inheritance);
+        current_protection, maximum_protection, inheritance, &result);
+    if (!bridged) {
+        result = mach_vm_map(
+            target_task, address, size, mask, flags, object, offset, copy,
+            current_protection, maximum_protection, inheritance);
+    }
     if (macws_mach_msg_trace_enabled() && MACH_PORT_VALID(object)) {
         static _Atomic unsigned recordCount = 0;
         unsigned record = atomic_fetch_add_explicit(
@@ -12179,6 +12716,9 @@ DYLD_INTERPOSE(objc_alloc_trace, objc_alloc);
 #define HISERVICES_SERVICE_NEW  "com.apple.macosbooter.hiservices-xpcservice"
 #define AUTHD_SERVICE_ORIG "com.apple.authd"
 #define AUTHD_SERVICE_NEW  "com.apple.macosbooter.authd"
+#define CORESERVICESD_SERVICE_ORIG "com.apple.CoreServices.coreservicesd"
+#define CORESERVICESD_SERVICE_NEW \
+    "com.apple.macosbooter.CoreServices.coreservicesd"
 #define QUICKLOOK_THUMBNAILS_ORIG "com.apple.quicklook.ThumbnailsAgent"
 #define QUICKLOOK_THUMBNAILS_NEW \
     "com.apple.macosbooter.quicklook.ThumbnailsAgent"
@@ -12368,6 +12908,15 @@ static const char *macws_private_bootstrap_service_name(const char *name) {
         return QUICKLOOK_SATELLITE_NEW;
     if (!strcmp(name, "com.apple.carboncore.csnameddata"))
         return "com.apple.macosbooter.carboncore.csnameddata";
+    // RE-confirmed from Ventura 13.4 CarbonCore's _initSeedService and the
+    // stock com.apple.coreservicesd launch plist: CoreDrag asks this daemon
+    // for the CSSeed v0x10001 client table before it creates a drag session.
+    // Runtime-confirmed on the target: without this service CoreDragCreate
+    // returns -900 after _CSCreateSeed("com.apple.coredragseed", ...).
+    // Isolate the real Ventura daemon from any iPadOS CarbonCore endpoint;
+    // both its bootstrap check-in and every injected client traverse here.
+    if (!strcmp(name, CORESERVICESD_SERVICE_ORIG))
+        return CORESERVICESD_SERVICE_NEW;
     if (!strcmp(name, DOCK_HELPER_SERVICE_ORIG))
         return DOCK_HELPER_SERVICE_NEW;
     const char *lsdEndpoint = macws_private_bootstrap_lsd_service_name(name);
@@ -13311,6 +13860,82 @@ void macws_xpc_connection_set_instance_early(
 extern void macws_xpc_main_raw(xpc_connection_handler_t handler)
     __asm("_xpc_main") __attribute__((noreturn));
 
+// QuickLookSatellite is normally launched by xpcproxy as a separate
+// _MultipleInstances service for each client.  MacWS has to host that stock
+// executable behind one launchd Mach listener instead (the macOS XPC bundle
+// activator is not available in the chroot), so a request can outlive the
+// listener block that delivered its peer connection.
+//
+// Runtime-confirmed in QuickLookSatellite-2026-09-10-014900.ips: the PDF
+// generator completed asynchronously and crashed in objc_retain, called from
+// -[QLSatelliteMessage sendOnConnection:queue:reply:]+0x30, while retaining
+// the connection loaded from QLSatellite+0x18.  The fault address was +0x20
+// through an already-cleared object.  RE-confirmed in the exact Ventura
+// QuickLookSatellite executable: -[QLSatellite setConnection:] at
+// main+0x5684 is only `str x2, [x0, #0x18]; ret`, and the later completion at
+// main+0x4708 reloads that unretained field before sending the reply.
+//
+// Restore the ownership invariant at the object that owns the asynchronous
+// request.  The stock ivar and wire protocol remain untouched; the associated
+// strong reference is replaced whenever the stock setter replaces the peer,
+// and is released automatically when that QLSatellite instance is destroyed.
+typedef void (*MacWSQLSatelliteSetConnectionIMP)(id, SEL, id);
+static MacWSQLSatelliteSetConnectionIMP
+    macws_qlsatellite_set_connection_original = NULL;
+static _Atomic int macws_qlsatellite_connection_owner_installed = 0;
+static char macws_qlsatellite_connection_owner_key;
+
+static void macws_qlsatellite_set_connection(id self, SEL selector,
+                                              id connection) {
+    objc_setAssociatedObject(
+        self, &macws_qlsatellite_connection_owner_key, connection,
+        OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    if (macws_qlsatellite_set_connection_original) {
+        macws_qlsatellite_set_connection_original(
+            self, selector, connection);
+    }
+}
+
+static BOOL macws_install_qlsatellite_connection_owner(void) {
+    const char *program = getprogname();
+    if (!program || strcmp(program, "QuickLookSatellite") != 0) return YES;
+    if (atomic_load_explicit(
+            &macws_qlsatellite_connection_owner_installed,
+            memory_order_acquire)) return YES;
+
+    Class satelliteClass = objc_getClass("QLSatellite");
+    SEL selector = sel_registerName("setConnection:");
+    Method method = satelliteClass
+        ? class_getInstanceMethod(satelliteClass, selector) : NULL;
+    const char *types = method ? method_getTypeEncoding(method) : NULL;
+    if (!method || !types || strcmp(types, "v24@0:8@16") != 0) {
+        dprintf(STDERR_FILENO,
+                "#### MACWS-QUICKLOOK-XPC connection owner unavailable "
+                "class=%p method=%p types=%s\n",
+                satelliteClass, method, types ?: "(nil)");
+        return NO;
+    }
+
+    int expected = 0;
+    if (!atomic_compare_exchange_strong_explicit(
+            &macws_qlsatellite_connection_owner_installed, &expected, 1,
+            memory_order_acq_rel, memory_order_acquire)) return YES;
+    macws_qlsatellite_set_connection_original =
+        (MacWSQLSatelliteSetConnectionIMP)method_getImplementation(method);
+    if (!macws_qlsatellite_set_connection_original) {
+        atomic_store_explicit(
+            &macws_qlsatellite_connection_owner_installed, 0,
+            memory_order_release);
+        return NO;
+    }
+    method_setImplementation(method,
+                             (IMP)macws_qlsatellite_set_connection);
+    dprintf(STDERR_FILENO,
+            "#### MACWS-QUICKLOOK-XPC connection owner installed "
+            "class=%p method=%p\n", satelliteClass, method);
+    return YES;
+}
+
 // xpc_main only accepts a process born as an XPCService.  These root MacWS
 // jobs are deliberately launchd Mach services so their
 // freestanding proxies can chroot without a setuid transition; runtime oslog
@@ -13346,6 +13971,7 @@ void macws_xpc_main(xpc_connection_handler_t handler) {
                service && strcmp(service,
                     "com.macwsguide.quicklook-satellite") == 0) {
         privateMachService = QUICKLOOK_SATELLITE_NEW;
+        (void)macws_install_qlsatellite_connection_owner();
     }
     if (privateMachService && getuid() == 0 && geteuid() == 0) {
         xpc_connection_t listener =
