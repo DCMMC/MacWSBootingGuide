@@ -4096,6 +4096,31 @@ static BOOL MacWSPostLegacySystemPointerEvent(
         secondResult = postMouse(quartzPoint, true, 3,
             false, false, false);
     } else {
+        // An interoperability probe creates a real Finder source-drag solely
+        // to populate NSDragPboard. A button release is a DROP, not a cancel:
+        // converting TouchCancel to mouse-up alone commits the probe's short
+        // displacement. Cancel through CoreDrag's native Escape input before
+        // releasing the button. Only the exact probe contact owns this pair;
+        // ordinary one-finger drags, taps and physical keyboard input are not
+        // changed. The release still runs even if posting Escape fails, so no
+        // mouse button can be left held by a failed transport.
+        if (exactContinuation && record.kind == MacWSInputKindTouchCancel &&
+            record.source == MacWSInputSourceInteropDragProbe) {
+            static MacWSPostLegacyKeyboardEvent postCancelKey;
+            static dispatch_once_t cancelKeyOnce;
+            dispatch_once(&cancelKeyOnce, ^{
+                postCancelKey = (MacWSPostLegacyKeyboardEvent)dlsym(
+                    RTLD_DEFAULT, "CGPostKeyboardEvent");
+            });
+            int32_t cancelDown = postCancelKey
+                ? postCancelKey(27, 53, true) : -1;
+            int32_t cancelUp = postCancelKey
+                ? postCancelKey(27, 53, false) : -1;
+            fprintf(stderr, "#### APP-INPUT INTEROP-CANCEL pid=%d "
+                "window=%u contact=%u escape=%d/%d before-mouse-up=YES\n",
+                getpid(), exactWindow, record.contactID, cancelDown, cancelUp);
+            fflush(stderr);
+        }
         firstResult = postMouse(quartzPoint, true, 3,
             leftDown, rightDown, false);
     }

@@ -208,7 +208,7 @@ static HIDRef TouchEvent(uint64_t sender, double x, double y, int phase) {
     return hand;
 }
 static int SendDrag(uint64_t sender, double x0, double y0, double x1, double y1,
-                    double duration, double midpointPause) {
+                    double duration, double midpointPause, double initialHold) {
     HIDRef client = api.createSimple(kCFAllocatorDefault);
     if (!client) return 69;
     // Prepare release before touch-down, so any later allocation failure can
@@ -235,7 +235,7 @@ static int SendDrag(uint64_t sender, double x0, double y0, double x1, double y1,
         // native resize that stops moving without a finger-up; a sequence of
         // independent drags cannot detect premature reverse settlement.
         double pauseOffset = i > steps / 2 ? midpointPause : 0;
-        WaitUntil(started + .05 + duration * progress + pauseOffset);
+        WaitUntil(started + .05 + initialHold + duration * progress + pauseOffset);
         if (interrupted) break;
         double nextX = x0 + (x1 - x0) * progress;
         double nextY = y0 + (y1 - y0) * progress;
@@ -267,6 +267,51 @@ static int SendDrag(uint64_t sender, double x0, double y0, double x1, double y1,
     return interrupted ? 130 : status;
 }
 
+// Two stationary contacts in one hardware report. This exercises UIKit's
+// two-finger recognizers, not a synthetic AppInput secondary-click shortcut.
+// Allocate the terminal report first and always release both contacts.
+static HIDRef TwoFingerEvent(uint64_t sender, double x0, double y0,
+                            double x1, double y1, BOOL released) {
+    HIDRef hand = TouchEvent(sender, x0, y0, released ? 2 : 0);
+    if (!hand) return NULL;
+    HIDRef second = api.finger(kCFAllocatorDefault, mach_absolute_time(),
+        6, 6, 1 | 2 | 32, x1, y1, 0, 0, 0, !released, !released, 0);
+    if (!second) { CFRelease(hand); return NULL; }
+    api.setFloat(second, 0xb0014, .04);
+    api.setFloat(second, 0xb0015, .04);
+    api.append(hand, second, 0);
+    CFRelease(second);
+    return hand;
+}
+
+static int SendTwoFingerHold(uint64_t sender, double x0, double y0,
+                             double x1, double y1, double duration) {
+    HIDRef client = api.createSimple(kCFAllocatorDefault);
+    HIDRef release = TwoFingerEvent(sender, x0, y0, x1, y1, YES);
+    HIDRef down = TwoFingerEvent(sender, x0, y0, x1, y1, NO);
+    if (!client || !release || !down) {
+        if (client) CFRelease(client);
+        if (release) CFRelease(release);
+        if (down) CFRelease(down);
+        return 71;
+    }
+    double started = Now();
+    api.dispatch(client, down);
+    WaitUntil(started + duration);
+    uint64_t ended = mach_absolute_time();
+    api.setTime(release, ended);
+    CFArrayRef children = api.children(release);
+    for (CFIndex i = 0; children && i < CFArrayGetCount(children); i++)
+        api.setTime(CFArrayGetValueAtIndex(children, i), ended);
+    api.dispatch(client, release);
+    CFRelease(down);
+    CFRelease(release);
+    CFRelease(client);
+    fprintf(stderr, "two-finger-hold elapsed=%.3f contacts=2 released=2 interrupted=%d "
+        "visual-acceptance=UNVERIFIED\n", Now() - started, interrupted != 0);
+    return interrupted ? 130 : 0;
+}
+
 int main(int argc, char **argv) {
     @autoreleasepool {
         signal(SIGINT, Interrupted);
@@ -290,7 +335,9 @@ int main(int argc, char **argv) {
             return LoadAPI(YES) ? Observe(deadline) : 69;
         }
         BOOL paused = argc == 9 && strcmp(argv[1], "--send-paused-drag") == 0;
-        BOOL execute = paused || (argc == 8 && strcmp(argv[1], "--send-drag") == 0);
+        BOOL held = argc == 9 && strcmp(argv[1], "--send-hold-drag") == 0;
+        BOOL twoFinger = argc == 8 && strcmp(argv[1], "--send-two-finger-hold") == 0;
+        BOOL execute = twoFinger || paused || held || (argc == 8 && strcmp(argv[1], "--send-drag") == 0);
         BOOL describe = argc == 8 && strcmp(argv[1], "--describe-drag") == 0;
         if (!execute && !describe) {
             fprintf(stderr, "usage: ios_hid_touch_probe --metadata\n"
@@ -298,6 +345,8 @@ int main(int argc, char **argv) {
                 "   or: --describe-drag SENDER X0 Y0 X1 Y1 DURATION\n"
                 "   or: --send-drag SENDER X0 Y0 X1 Y1 DURATION\n"
                 "   or: --send-paused-drag SENDER X0 Y0 X1 Y1 DURATION PAUSE\n"
+                "   or: --send-hold-drag SENDER X0 Y0 X1 Y1 DURATION HOLD\n"
+                "   or: --send-two-finger-hold SENDER X0 Y0 X1 Y1 DURATION\n"
                 "Coordinates are normalized raw sensor space, NOT screenshot pixels.\n"
                 "Use a sender and coordinate transform verified by --observe.\n"
                 "Duration 0.1..1.5 seconds; do not overlap physical touches.\n");
@@ -315,7 +364,7 @@ int main(int argc, char **argv) {
         }
         if (values[4] < .1 || values[4] > 1.5) return 64;
         double midpointPause = 0;
-        if (paused) {
+        if (paused || held) {
             midpointPause = strtod(argv[8], &end);
             if (!*argv[8] || *end || !isfinite(midpointPause) ||
                 midpointPause < .1 || midpointPause > .6) return 64;
@@ -325,7 +374,10 @@ int main(int argc, char **argv) {
             values[2], values[3], values[4], execute ? "YES" : "NO");
         fflush(stdout);
         if (paused) fprintf(stderr, "midpoint-pause=%.3f contact-held=YES\n", midpointPause);
+        if (held) fprintf(stderr, "initial-hold=%.3f contact-held=YES\n", midpointPause);
         if (describe) return 0;
-        return LoadAPI(NO) ? SendDrag(sender, values[0], values[1], values[2], values[3], values[4], midpointPause) : 69;
+        if (twoFinger) return LoadAPI(NO) ? SendTwoFingerHold(sender,
+            values[0], values[1], values[2], values[3], values[4]) : 69;
+        return LoadAPI(NO) ? SendDrag(sender, values[0], values[1], values[2], values[3], values[4], held ? 0 : midpointPause, held ? midpointPause : 0) : 69;
     }
 }

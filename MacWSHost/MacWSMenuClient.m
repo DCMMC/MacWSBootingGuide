@@ -22,6 +22,8 @@ static char MacWSMenuClientQueueKey;
 @end
 
 @interface MacWSMenuSnapshot ()
+@property(nonatomic, readwrite) int32_t representedOwnerPID;
+@property(nonatomic, readwrite) uint32_t representedWindowID;
 @property(nonatomic, readwrite) int32_t ownerPID;
 @property(nonatomic, readwrite) uint32_t windowID;
 @property(nonatomic, readwrite) uint64_t generation;
@@ -268,6 +270,21 @@ typedef void (^MacWSMenuRawCompletion)(NSData * _Nullable,
             NSError *parseError = nil;
             MacWSMenuSnapshot *snapshot = data
                 ? [self parseSnapshot:data error:&parseError] : nil;
+            if (snapshot) {
+                const MacWSMenuResponseHeader *header = data.bytes;
+                if (header->nonce != nonce) {
+                    snapshot = nil;
+                    parseError = [self errorWithStatus:MacWSMenuStatusInvalidRequest
+                        description:@"菜单快照不属于当前请求"];
+                } else {
+                    // The trusted display service already validates the
+                    // same-UID parent chain for provider fallback. Preserve
+                    // its provider identity; bind the represented identity
+                    // to this request, not whatever scene is now frontmost.
+                    snapshot.representedOwnerPID = ownerPID;
+                    snapshot.representedWindowID = windowID;
+                }
+            }
             completion(snapshot, transportError ?: parseError);
         }];
 }

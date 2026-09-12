@@ -2788,7 +2788,26 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
             CGRect destination = CGRectMake(
                 overlay.destinationX, overlay.destinationY,
                 overlay.destinationWidth, overlay.destinationHeight);
-            CGRect clipped = CGRectIntersection(destination, visiblePixels);
+            BOOL nativePopup = (overlay.flags &
+                MacWSStreamFrameNativePopupComposite) != 0;
+            CGRect paintDestination = destination;
+            if (nativePopup) {
+                // The descriptor retains the exact menu bounds for input.
+                // Its texture also contains WindowServer's native shadow:
+                // paint that bounded surrounding region, not an invented SDF.
+                // displayd validates this same 20-point region for occlusion.
+                CGFloat outset = 20.0 * overlay.backingScale;
+                CGRect textureDestination = CGRectMake(
+                    destination.origin.x - overlay.contentX *
+                        destination.size.width / overlay.contentWidth,
+                    destination.origin.y - overlay.contentY *
+                        destination.size.height / overlay.contentHeight,
+                    overlay.width * destination.size.width / overlay.contentWidth,
+                    overlay.height * destination.size.height / overlay.contentHeight);
+                paintDestination = CGRectIntersection(
+                    CGRectInset(destination, -outset, -outset), textureDestination);
+            }
+            CGRect clipped = CGRectIntersection(paintDestination, visiblePixels);
             if (!overlayTexture || CGRectIsNull(clipped) ||
                 CGRectIsEmpty(clipped) || viewWidth <= 0 || viewHeight <= 0 ||
                 visiblePixels.size.width <= 0 ||
@@ -2826,7 +2845,7 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
             // copy.  AppInputBridge now publishes NSWindow.hasShadow from the
             // real window; render one inexpensive rounded Gaussian SDF behind
             // that layer on the GPU before painting its authoritative pixels.
-            if (!directLayerAuthoritative && _shadowPipeline &&
+            if (!directLayerAuthoritative && !nativePopup && _shadowPipeline &&
                 [_shadowWindowIDs containsObject:
                     @(overlay.layerWindowID)]) {
                 const CGFloat marginLeft = 32.0;
@@ -4003,8 +4022,10 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
             if (!resolved) return NO;
             record->x = layerX;
             record->y = layerY;
-            record->frameWidth = descriptor.width;
-            record->frameHeight = descriptor.height;
+            BOOL popupComposite = (descriptor.flags &
+                MacWSStreamFrameNativePopupComposite) != 0;
+            record->frameWidth = popupComposite ? descriptor.contentWidth : descriptor.width;
+            record->frameHeight = popupComposite ? descriptor.contentHeight : descriptor.height;
             record->targetPID = ownerPID;
         } else {
             // Dock and similar global owners use a real process-local CGS

@@ -1,6 +1,7 @@
 """Bounded read-only cache ranges; does not extract or map a cache in memory.
 
 Run on the device with Python: script CACHE_DIRECTORY START_ADDRESS BYTE_COUNT.
+Class metadata: script CACHE_DIRECTORY --class/--ivars IMAGE_BASE CLASS_NAME.
 Only real dyld cache files with validated mapping tables are opened. In
 particular the adjacent .map text file is never parsed as a binary header.
 """
@@ -12,9 +13,9 @@ import signal
 
 
 def main():
-    class_mode = len(sys.argv) == 5 and sys.argv[2] == "--class"
+    class_mode = len(sys.argv) == 5 and sys.argv[2] in ("--class", "--ivars")
     if not class_mode and len(sys.argv) != 4:
-        raise SystemExit("usage: script CACHE_DIRECTORY START_ADDRESS BYTE_COUNT; or CACHE_DIRECTORY --class IMAGE_BASE NAME")
+        raise SystemExit("usage: script CACHE_DIRECTORY START_ADDRESS BYTE_COUNT; or CACHE_DIRECTORY --class/--ivars IMAGE_BASE NAME")
     root = Path(sys.argv[1])
     start, count = (int(sys.argv[3], 0), 0) if class_mode else (int(sys.argv[2], 0), int(sys.argv[3], 0))
     if start <= 0 or (not class_mode and not 0 < count <= 32768):
@@ -119,6 +120,18 @@ def main():
                         continue
                     if name != wanted: continue
                     print("CLASS", name, hex(cls))
+                    if sys.argv[2] == "--ivars":
+                        ivars = pointer(ro + 48)
+                        if not ivars: return
+                        stride, entries = struct.unpack("<II", read(ivars, 8))
+                        if entries > 4096 or stride != 32:
+                            raise ValueError("invalid ivar list")
+                        for index in range(entries):
+                            entry = ivars + 8 + index * stride
+                            offset, = struct.unpack("<I", read(pointer(entry), 4))
+                            print("IVAR", hex(offset), string(pointer(entry + 8)),
+                                  string(pointer(entry + 16)))
+                        return
                     mlist = pointer(ro + 32)
                     if not mlist: return
                     flags, entries = struct.unpack("<II", read(mlist, 8))

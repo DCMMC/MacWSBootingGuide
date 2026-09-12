@@ -14,6 +14,7 @@
 #include <unistd.h>
 #include <notify.h>
 #include "../include/macws_resize_gesture.h"
+#include "../include/macws_switcher_selection.h"
 
 // Source-confirmed against TrollPad 1.3 and RE-confirmed against the target
 // iPadOS 16.3.1 SpringBoard: SBSwitcherChamoisLayoutAttributes stores the
@@ -72,6 +73,11 @@ static NSMutableDictionary<NSString *, NSDictionary *> *
 // or the first observed model after this SpringBoard generation starts.
 static NSMutableDictionary<NSString *, NSValue *> *
     MacWSStableModelSizeByScene;
+// Presentation owns whether AppKit geometry applies. A workspace still uses
+// the same iPadOS Scene, but no longer presents one fixed AppKit window.
+// Keep the transition timestamp so delayed window requests cannot reattach
+// the old policy after the fullscreen transaction has begun.
+static NSMutableDictionary<NSString *, NSNumber *> *MacWSWorkspaceSinceByScene;
 // SpringBoard's gesture modifier and layout-grid calls are synchronous on its
 // main thread.  This unsafe reference is live only inside handleGestureEvent:
 // and is restored before that method returns.
@@ -192,7 +198,10 @@ static BOOL MacWSResizeModifierTargetsHost(id modifier) {
     id item = MacWSResizeModifierSelectedItem(modifier);
     NSString *bundleIdentifier = MacWSMessageObject(
         item, NSSelectorFromString(@"bundleIdentifier"));
-    return [bundleIdentifier isEqualToString:@"com.macwsguide.host"];
+    NSString *scene = MacWSMessageObject(
+        item, NSSelectorFromString(@"uniqueIdentifier"));
+    return [bundleIdentifier isEqualToString:@"com.macwsguide.host"] && scene.length > 0 &&
+        !MacWSWorkspaceSinceByScene[scene];
 }
 
 static NSDictionary *MacWSResizePolicyForModifier(id modifier) {
@@ -203,8 +212,8 @@ static NSDictionary *MacWSResizePolicyForModifier(id modifier) {
         return nil;
     NSString *sceneIdentifier = MacWSMessageObject(
         item, NSSelectorFromString(@"uniqueIdentifier"));
-    return sceneIdentifier.length ? MacWSResizePolicyByScene[sceneIdentifier]
-                                  : nil;
+    return sceneIdentifier.length && !MacWSWorkspaceSinceByScene[sceneIdentifier]
+        ? MacWSResizePolicyByScene[sceneIdentifier] : nil;
 }
 
 static void MacWSPublishResizeGestureState(id modifier, BOOL active) {
@@ -684,6 +693,11 @@ static void MacWSApplyFullscreenRequest(NSDictionary *request,
         actionAvailable ? @"YES" : @"NO",
         (unsigned long)(attempt + 1)]);
     if (alreadyExpected) {
+        if (exactScene && expectedFullscreen) {
+            if (!MacWSWorkspaceSinceByScene)
+                MacWSWorkspaceSinceByScene = [NSMutableDictionary dictionary];
+            MacWSWorkspaceSinceByScene[requestedIdentifier] = @(issuedAt);
+        }
         MacWSVerifyMaximizationPostcondition(
             MacWSMessageObject(switcherController,
                                NSSelectorFromString(@"switcherCoordinator")),
@@ -754,6 +768,20 @@ static void MacWSApplyFullscreenRequest(NSDictionary *request,
             (unsigned long)(attempt + 1)]);
         return;
     }
+    // Runtime-confirmed in MacWSWindowing.log at 1789194093.115-.116:
+    // Apple's 1389x970 proposal was constrained back to the former 898x676
+    // AppKit frame. Detach only this Scene's window-sizing scope BEFORE the
+    // native action. Do not force a frame or bypass Apple's size validation.
+    if (expectedFullscreen) {
+        if (!MacWSWorkspaceSinceByScene)
+            MacWSWorkspaceSinceByScene = [NSMutableDictionary dictionary];
+        MacWSWorkspaceSinceByScene[requestedIdentifier] = @(issuedAt);
+    } else {
+        [MacWSWorkspaceSinceByScene removeObjectForKey:requestedIdentifier];
+    }
+    MacWSWindowingLogLine([NSString stringWithFormat:
+        @"scene-sizing-presentation scene=%@ workspace=%@ source=native-maximization",
+        requestedIdentifier, expectedFullscreen ? @"YES" : @"NO"]);
     MacWSMessageToggleMaximization(switcherController);
     MacWSVerifyMaximizationPostcondition(
         MacWSMessageObject(switcherController,
@@ -1088,6 +1116,17 @@ static void MacWSApplyResizeRequest(NSDictionary *request, NSString *path,
         return;
     }
     BOOL policyOnly = [request[@"policy_only"] boolValue];
+    NSNumber *workspaceSince = MacWSWorkspaceSinceByScene[sceneIdentifier];
+    if (workspaceSince && issuedAt <= workspaceSince.doubleValue) {
+        MacWSFinishResizeRequest(path, [NSString stringWithFormat:
+            @"resize-superseded scene=%@ reason=entered-workspace", sceneIdentifier]);
+        return;
+    }
+    // A newer, valid window request is the reverse presentation transition.
+    if (workspaceSince) {
+        [MacWSWorkspaceSinceByScene removeObjectForKey:sceneIdentifier];
+        [MacWSStableModelSizeByScene removeObjectForKey:sceneIdentifier];
+    }
     NSString *latestNonce = MacWSLatestResizeNonceByScene[sceneIdentifier];
     if (!policyOnly && ![latestNonce isEqualToString:nonce]) {
         MacWSFinishResizeRequest(path, [NSString stringWithFormat:
@@ -1808,6 +1847,41 @@ static NSArray<NSNumber *> *MacWSDenseCandidates(NSArray<NSNumber *> *source,
     return ordered.count ? ordered : source;
 }
 
+%hook SBHomeGestureToSwitcherSwitcherModifier
+- (id)adjustedAppLayoutsForAppLayouts:(id)layouts {
+    NSArray *adjusted = %orig(layouts);
+    // RE-confirmed on 20D67, SpringBoard UUID 13B37E5E-5290-3E2E-91B9-
+    // 4378BD2E8312: init at 0x1c7c60bf8 retains selectedAppLayout in
+    // _appLayout (metadata offset 0x88). appLayoutsToCacheSnapshots at
+    // 0x1c7c617a8 uses indexOfObject: on that same object, then passes the
+    // unchecked result to subarrayWithRange: (0x1c7963418). The fullsize,
+    // visible and scroll-position consumers also use this selection.
+    // Runtime crash SpringBoard-2026-09-12-161745.ips reaches that exact
+    // subarray call while a new Host Scene replaces its Stage Manager group.
+    // Repair the selection at the adjusted-model publication boundary, before
+    // ANY of those consumers run. Preserve Apple's array, order, range checks
+    // and cache work. This is a retained real replacement, not a fake index.
+    Ivar selection = class_getInstanceVariable(
+        NSClassFromString(@"SBHomeGestureToSwitcherSwitcherModifier"),
+        "_appLayout");
+    if (selection && strcmp(ivar_getTypeEncoding(selection),
+                            "@\"SBAppLayout\"") == 0) {
+        id previous = object_getIvar(self, selection);
+        id replacement = MacWSSwitcherReplacementSelection(previous, adjusted);
+        if (replacement) {
+            object_setIvarWithStrongDefault(self, selection, replacement);
+            MacWSWindowingLogLine([NSString stringWithFormat:
+                @"switcher-selection rebound old=%@ new=%@ index=%lu count=%lu route=adjusted-layout-publication",
+                MacWSAppLayoutItemIdentifiers(previous),
+                MacWSAppLayoutItemIdentifiers(replacement),
+                (unsigned long)[adjusted indexOfObject:replacement],
+                (unsigned long)adjusted.count]);
+        }
+    }
+    return adjusted;
+}
+%end
+
 %hook SBDisplayItemLayoutAttributesCalculator
 - (id)_appLayoutByPerformingAutoLayoutIfNeededInAppLayout:(id)appLayout
         containerOrientation:(NSInteger)containerOrientation
@@ -1884,7 +1958,8 @@ overlappingModelBeforeDragging:(id)overlappingModelBeforeDragging
     NSString *scene = MacWSMessageObject(
         item, NSSelectorFromString(@"uniqueIdentifier"));
     BOOL host = isChamoisWindowingUIEnabled &&
-        [bundle isEqualToString:@"com.macwsguide.host"] && scene.length > 0;
+        [bundle isEqualToString:@"com.macwsguide.host"] && scene.length > 0 &&
+        !MacWSWorkspaceSinceByScene[scene];
     id attributes = item && [appLayout respondsToSelector:
         NSSelectorFromString(@"layoutAttributesForItem:")]
         ? ((id (*)(id, SEL, id))objc_msgSend)(
@@ -2518,7 +2593,9 @@ static void MacWSInstallRequestObservers(void *context) {
         int fd = open(MacWSDenseGridLoaded,
                       O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
         if (fd >= 0) {
-            dprintf(fd, "version=51 pid=%d sizing=exact-live-proposal "
+            dprintf(fd, "version=59 pid=%d sizing=exact-live-proposal "
+                    "switcher-selection=scene-identity-rebind-at-model-publication "
+                    "presentation=workspace-detaches-appkit-sizing "
                     "resize-gesture=exact-scene-native-end-notification "
                         "fallback-step=10 minimum=150 "
                         "observers=main-queue-after-dyld "

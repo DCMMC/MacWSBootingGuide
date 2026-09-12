@@ -1756,7 +1756,13 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
     UIButton *button = [UIButton buttonWithType:UIButtonTypeSystem];
     UIButtonConfiguration *configuration = prominent
         ? [UIButtonConfiguration filledButtonConfiguration]
-        : [UIButtonConfiguration tintedButtonConfiguration];
+        : [UIButtonConfiguration grayButtonConfiguration];
+    // Neutral, adaptive surfaces retain contrast over dark games and bright
+    // documents. Reserve the accent for the primary action and selection.
+    configuration.baseForegroundColor = prominent ? UIColor.whiteColor
+                                                   : UIColor.labelColor;
+    configuration.baseBackgroundColor = prominent ? UIColor.systemBlueColor
+                                                   : UIColor.secondarySystemFillColor;
     configuration.title = title;
     configuration.image = [UIImage systemImageNamed:imageName];
     configuration.imagePadding = 8;
@@ -1948,7 +1954,18 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
     }
     if (visible.count == 0) {
         UIButton *retry = [UIButton buttonWithType:UIButtonTypeSystem];
-        [retry setTitle:@"macOS 菜单…" forState:UIControlStateNormal];
+        UIButtonConfiguration *configuration =
+            [UIButtonConfiguration plainButtonConfiguration];
+        configuration.title = @"macOS 菜单…";
+        configuration.baseForegroundColor = UIColor.secondaryLabelColor;
+        configuration.contentInsets = NSDirectionalEdgeInsetsMake(0, 8, 0, 8);
+        configuration.titleTextAttributesTransformer =
+            ^NSDictionary *(NSDictionary *attributes) {
+                NSMutableDictionary *result = [attributes mutableCopy];
+                result[NSFontAttributeName] = [UIFont systemFontOfSize:14.0];
+                return result;
+            };
+        retry.configuration = configuration;
         retry.tag = -1;
         [retry addTarget:self action:@selector(semanticMenuTitleTapped:)
           forControlEvents:UIControlEventTouchUpInside];
@@ -1980,8 +1997,13 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
     }
     [_menuClient requestSnapshotForPID:_windowOwnerPID windowID:_windowID
         completion:^(MacWSMenuSnapshot *snapshot, NSError *error) {
-            if (snapshot && snapshot.windowID == self->_windowID &&
-                snapshot.ownerPID == self->_windowOwnerPID) {
+            if (snapshot && snapshot.representedWindowID == self->_windowID &&
+                snapshot.representedOwnerPID == self->_windowOwnerPID) {
+                if (snapshot.ownerPID != snapshot.representedOwnerPID)
+                    MacWSLog(@"semantic-menu provider=%d/%u represented=%d/%u nodes=%lu",
+                        snapshot.ownerPID, snapshot.windowID,
+                        snapshot.representedOwnerPID, snapshot.representedWindowID,
+                        (unsigned long)snapshot.items.count);
                 self->_menuSnapshot = snapshot;
                 [self applyMacOSMenuAppearance:snapshot.appearance];
                 [self renderSemanticMenuTitles];
@@ -2243,8 +2265,8 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
             // Unlike the old bridge-side makeKeyAndOrderFront:, this happens
             // only for explicit user intent and never during passive refresh.
             [self activateCurrentMacWindow];
-            uint32_t selectedWindowID = snapshot.windowID;
-            int32_t selectedOwnerPID = snapshot.ownerPID;
+            uint32_t selectedWindowID = snapshot.representedWindowID;
+            int32_t selectedOwnerPID = snapshot.representedOwnerPID;
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
                                           120 * NSEC_PER_MSEC),
                            dispatch_get_main_queue(), ^{
@@ -2629,10 +2651,10 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
                    forControlEvents:UIControlEventTouchUpInside];
     [root addSubview:_controlDismissLayer];
 
-    // Use the same adaptive UIKit material/semantic labels in both light and
-    // dark appearances. An opaque contentView fill would hide the backdrop.
+    // Regular material attenuates saturated game/content backdrops more than
+    // thin material while retaining native live blur in light and dark modes.
     _controlPanel = [[UIVisualEffectView alloc] initWithEffect:
-        [UIBlurEffect effectWithStyle:UIBlurEffectStyleSystemThinMaterial]];
+        [UIBlurEffect effectWithStyle:UIBlurEffectStyleSystemMaterial]];
     _controlPanel.translatesAutoresizingMaskIntoConstraints = NO;
     _controlPanel.layer.cornerRadius = 22;
     _controlPanel.layer.cornerCurve = kCACornerCurveContinuous;
@@ -2832,7 +2854,7 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
     _repairDesktopButton = [self buttonWithTitle:@"修复桌面"
                                            image:@"arrow.clockwise.circle"
                                           action:@selector(repairDesktopAction)
-                                       prominent:YES];
+                                       prominent:NO];
     _repairDesktopButton.accessibilityIdentifier = @"repair-desktop";
     _repairButton = [self buttonWithTitle:@"修复环境" image:@"wrench.and.screwdriver"
                                    action:@selector(repairAction) prominent:NO];
@@ -5266,16 +5288,16 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
                               [self streamRestorationActivity]);
     NSUserActivity *workspaceActivity = [self streamRestorationActivity];
     BOOL requestedSystemFullscreen =
-        MacWSRequestCurrentSceneImmersiveFullscreen(
-        self.view.window.windowScene, workspaceActivity,
+        MacWSRequestCurrentSceneMaximization(
+        self.view.window.windowScene, YES,
         ^(NSError *error) {
             [self setNotice:[NSString stringWithFormat:
                 @"完整 macOS 桌面已经打开，但 iPadOS 无法最大化当前窗口：%@",
                 error.localizedDescription ?: @"未知错误"] success:NO];
         });
     if (!requestedSystemFullscreen) {
-        requestedSystemFullscreen = MacWSRequestCurrentSceneMaximization(
-            self.view.window.windowScene, YES,
+        requestedSystemFullscreen = MacWSRequestCurrentSceneImmersiveFullscreen(
+            self.view.window.windowScene, workspaceActivity,
             ^(NSError *error) {
                 [self setNotice:[NSString stringWithFormat:
                     @"完整 macOS 桌面已经打开，但 iPadOS 无法最大化当前窗口：%@",
@@ -5283,10 +5305,9 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
             });
     }
     if (requestedSystemFullscreen) {
-        // _requestFullscreen: is asynchronous and can be accepted without a
-        // FrontBoard geometry transition for an already-connected Stage
-        // Manager Scene. Verify the real UIWindow, then use the SpringBoard
-        // window action only when the native video/game route did not land.
+        // Both native presentation routes are asynchronous. Verify the real
+        // UIWindow rather than treating request acceptance (or isFullScreen)
+        // as a geometry witness. Retry the exact Scene action only if needed.
         __weak MacWSViewController *weakSelf = self;
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
                                      1250 * NSEC_PER_MSEC),
@@ -5303,7 +5324,7 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
                                    screenBounds.size.width) <= 1.0 &&
                 fabs(visibleBounds.size.height -
                      screenBounds.size.height) <= 1.0;
-            if (systemState || fillsPanel) {
+            if (fillsPanel) {
                 MacWSLog(@"scene-immersive landed session=%@ is-fullscreen=%@ bounds=%@ screen=%@",
                          currentScene.session.persistentIdentifier,
                          systemState ? @"YES" : @"NO",

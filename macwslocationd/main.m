@@ -14,6 +14,7 @@
 
 #include <dlfcn.h>
 #include <objc/message.h>
+#include <notify.h>
 #include <stdio.h>
 #include <string.h>
 #include <xpc/xpc.h>
@@ -47,6 +48,9 @@ static NSString *const MacWSEffectiveLocationClient =
 @property(nonatomic, strong) CLLocationManager *locationManager;
 @property(nonatomic) xpc_connection_t interopConnection;
 @property(nonatomic) NSUInteger deliveredCount;
+@property(nonatomic) int refreshToken;
+@property(nonatomic) NSTimeInterval lastRefreshTime;
+@property(nonatomic) BOOL updatingLocation;
 @end
 
 static int MacWSNativeLocationType(CLLocation *location) {
@@ -152,6 +156,14 @@ static void MacWSSetXPCDouble(xpc_object_t dictionary, const char *key,
 
 - (void)start {
     [self connectInteropService];
+    __weak typeof(self) weakSelf = self;
+    uint32_t result = notify_register_dispatch(MACWS_LOCATION_REFRESH_NOTIFICATION,
+        &_refreshToken, dispatch_get_main_queue(), ^(int token) {
+            (void)token;
+            [weakSelf reconnectLocationClientForReason:@"maps-launch"];
+        });
+    if (result != NOTIFY_STATUS_OK)
+        [self log:[NSString stringWithFormat:@"location refresh subscription failed=%u", result]];
     // Use the installed MacWS Host identity instead of borrowing Maps'
     // When-In-Use grant.  An iOS daemon has no foreground scene, so locationd
     // correctly stops a Maps-identified client as soon as Maps is not
@@ -171,29 +183,84 @@ static void MacWSSetXPCDouble(xpc_object_t dictionary, const char *key,
     [self log:[NSString stringWithFormat:
         @"native effective client=%@ authorization=%ld",
         MacWSEffectiveLocationClient, (long)effectiveAuthorization]];
+    [self reconnectLocationClientForReason:@"startup"];
+}
+
+- (void)reconnectLocationClientForReason:(NSString *)reason {
+    NSTimeInterval now = NSProcessInfo.processInfo.systemUptime;
+    if (self.lastRefreshTime && now - self.lastRefreshTime < 3.0) return;
+    self.lastRefreshTime = now;
+    // Runtime-confirmed: native locationd retained an AuthorizedAlways grant
+    // but marked the Host client TimeMissing with an empty registration.
+    // A new real CLLocationManager registration removed TimeMissing and the
+    // stock authorization getter returned 3 again. Do not manufacture a fix,
+    // write readiness, reset privacy, or repeatedly restart the daemon.
+    self.locationManager.delegate = nil;
+    [self.locationManager stopUpdatingLocation];
+    self.locationManager = nil;
+    self.updatingLocation = NO;
+    if (!self.interopConnection) [self connectInteropService];
     CLLocationManager *manager = [[CLLocationManager alloc]
         initWithEffectiveBundleIdentifier:MacWSEffectiveLocationClient];
     manager.delegate = self;
     manager.desiredAccuracy = kCLLocationAccuracyBest;
     manager.distanceFilter = 5.0;
     self.locationManager = manager;
-    [self log:[NSString stringWithFormat:@"native authorization=%ld",
-                                             (long)manager.authorizationStatus]];
-    [manager startUpdatingLocation];
+    [self log:[NSString stringWithFormat:@"native client refreshed reason=%@ authorization=%ld services=%d",
+        reason, (long)manager.authorizationStatus, CLLocationManager.locationServicesEnabled]];
+    [self startAuthorizedLocationClient:manager attempt:0];
+}
+
+- (void)startAuthorizedLocationClient:(CLLocationManager *)manager
+                              attempt:(NSUInteger)attempt {
+    if (!manager || manager != self.locationManager || self.updatingLocation) return;
+    // Registration and its initial delegate callback are asynchronous. The
+    // diagnostic observed an initial cached0, then a real daemon readback3.
+    // Poll that stock readback briefly; never convert denied/unknown to ready.
+    CLAuthorizationStatus status = [CLLocationManager
+        authorizationStatusForBundleIdentifier:MacWSEffectiveLocationClient];
+    if (status == kCLAuthorizationStatusAuthorizedAlways ||
+        status == kCLAuthorizationStatusAuthorizedWhenInUse) {
+        self.updatingLocation = YES;
+        [manager startUpdatingLocation];
+        [self log:[NSString stringWithFormat:@"native client started verified-authorization=%ld attempt=%lu",
+            (long)status, (unsigned long)attempt]];
+    } else if (status == kCLAuthorizationStatusNotDetermined && attempt < 8) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 500 * NSEC_PER_MSEC),
+            dispatch_get_main_queue(), ^{
+                [self startAuthorizedLocationClient:manager attempt:attempt + 1];
+            });
+    } else {
+        [self log:[NSString stringWithFormat:@"native client awaiting authorization=%ld attempt=%lu",
+            (long)status, (unsigned long)attempt]];
+    }
 }
 
 - (void)locationManagerDidChangeAuthorization:(CLLocationManager *)manager {
+    if (manager != self.locationManager) return;
     [self log:[NSString stringWithFormat:@"native authorization changed=%ld",
                                              (long)manager.authorizationStatus]];
     if (manager.authorizationStatus == kCLAuthorizationStatusAuthorizedAlways ||
         manager.authorizationStatus == kCLAuthorizationStatusAuthorizedWhenInUse) {
-        [manager startUpdatingLocation];
+        [self startAuthorizedLocationClient:manager attempt:0];
+    } else if (manager.authorizationStatus == kCLAuthorizationStatusDenied ||
+               manager.authorizationStatus == kCLAuthorizationStatusRestricted) {
+        [manager stopUpdatingLocation];
+        self.updatingLocation = NO;
     }
+}
+
+- (void)locationManagerDidPauseLocationUpdates:(CLLocationManager *)manager {
+    if (manager == self.locationManager) [self log:@"native location updates paused"];
+}
+
+- (void)locationManagerDidResumeLocationUpdates:(CLLocationManager *)manager {
+    if (manager == self.locationManager) [self log:@"native location updates resumed"];
 }
 
 - (void)locationManager:(CLLocationManager *)manager
       didUpdateLocations:(NSArray<CLLocation *> *)locations {
-    (void)manager;
+    if (manager != self.locationManager) return;
     CLLocation *location = locations.lastObject;
     if (!location || location.horizontalAccuracy < 0) return;
 
@@ -250,7 +317,7 @@ static void MacWSSetXPCDouble(xpc_object_t dictionary, const char *key,
 
 - (void)locationManager:(CLLocationManager *)manager
        didFailWithError:(NSError *)error {
-    (void)manager;
+    if (manager != self.locationManager) return;
     [self log:[NSString stringWithFormat:@"native location failed: %@", error]];
 }
 

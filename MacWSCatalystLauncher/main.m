@@ -2,6 +2,8 @@
 @import UIKit;
 
 #include "macws_macho_arch.h"
+#include "macws_interop_protocol.h"
+#include <notify.h>
 
 extern int proc_pidpath(int pid, void *buffer, uint32_t buffersize);
 #define MACWS_PROC_PIDPATH_MAX 4096
@@ -168,6 +170,9 @@ static bool macws_wait_for_location_provider(void) {
     // Host remains responsive while this short-lived helper waits for the
     // first real Ventura CLLocationManager callback.  Maps must not cache a
     // hardware-capability result before that end-to-end witness exists.
+    if (macws_live_location_provider_ready()) return true;
+    uint32_t refreshed = notify_post(MACWS_LOCATION_REFRESH_NOTIFICATION);
+    fprintf(stderr, "[MacWSCatalystLauncher] requested native location client refresh status=%u\n", refreshed);
     for (unsigned attempt = 0; attempt < 300; attempt++) {
         if (macws_live_location_provider_ready()) return true;
         usleep(100 * 1000);

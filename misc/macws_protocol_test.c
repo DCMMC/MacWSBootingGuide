@@ -401,6 +401,32 @@ int main(void) {
     assert(MacWSStreamMapDesktopPointToLayer(
         &movedFrame, 500.0f, 300.0f, &layerX, &layerY));
     assert(Near(layerX, 250.0f));
+    // A native popup's crop is in the full compositor texture, but mouse
+    // coordinates must remain local to the popup, independent of its global
+    // desktop position. Never enable this representation for a base or Dock.
+    MacWSStreamFrameDescriptor popup = frame;
+    popup.flags = MacWSStreamFrameComplete | MacWSStreamFrameOverlay |
+        MacWSStreamFrameNativePopupComposite;
+    popup.layerOwnerPID = 99;
+    popup.layerWindowID = 77;
+    popup.contentX = 1200;
+    popup.contentY = 200;
+    popup.contentWidth = popup.destinationWidth = 300;
+    popup.contentHeight = popup.destinationHeight = 400;
+    assert(MacWSStreamFrameDescriptorIsValid(&popup, sizeof(popup)));
+    assert(MacWSStreamMapDesktopPointToLayer(
+        &popup, popup.destinationX + 150, popup.destinationY + 200, &layerX, &layerY));
+    assert(Near(layerX, 150) && Near(layerY, 200));
+    popup.flags &= ~MacWSStreamFrameOverlay;
+    assert(!MacWSStreamFrameDescriptorIsValid(&popup, sizeof(popup)));
+    popup.flags |= MacWSStreamFrameOverlay | MacWSStreamFrameFinalComposite;
+    assert(!MacWSStreamFrameDescriptorIsValid(&popup, sizeof(popup)));
+    popup.flags &= ~MacWSStreamFrameFinalComposite;
+    popup.flags |= MacWSStreamFrameGlobalSystemSurface;
+    assert(!MacWSStreamFrameDescriptorIsValid(&popup, sizeof(popup)));
+    popup.flags &= ~MacWSStreamFrameGlobalSystemSurface;
+    popup.windowID = 0;
+    assert(!MacWSStreamFrameDescriptorIsValid(&popup, sizeof(popup)));
     MacWSStreamLayerGeometry layerGeometry = {
         .magic = MACWS_STREAM_MAGIC,
         .version = MACWS_STREAM_VERSION,

@@ -6,6 +6,7 @@
 #include <stdint.h>
 
 #define MACWS_INTEROP_SERVICE "com.macwsguide.interop"
+#define MACWS_LOCATION_REFRESH_NOTIFICATION "com.macwsguide.location.refresh-client"
 #define MACWS_INTEROP_MAGIC 0x4d57494fu /* "MWIO" */
 #define MACWS_INTEROP_VERSION 2u
 

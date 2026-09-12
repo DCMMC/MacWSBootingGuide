@@ -145,6 +145,10 @@ enum {
     // layer and compositor-only effect. Host keeps overlay descriptors and
     // surfaces for hit testing, but must not paint them over these pixels.
     MacWSStreamFrameFinalComposite = 1u << 7,
+    // A window-mode popup samples its exact, catalog-validated rectangle in
+    // WindowServer's completed composite. Texture crop coordinates are not
+    // AppKit-local input coordinates. The base remains an isolated stream.
+    MacWSStreamFrameNativePopupComposite = 1u << 8,
 };
 
 // Title bytes immediately follow this descriptor in a window-list item.  The
@@ -310,8 +314,9 @@ static inline bool MacWSStreamMapDesktopPointToLayer(
     if (u > 0.999999) u = 0.999999;
     if (v < 0.0) v = 0.0;
     if (v > 0.999999) v = 0.999999;
-    *layerX = descriptor->contentX + (float)(u * descriptor->contentWidth);
-    *layerY = descriptor->contentY + (float)(v * descriptor->contentHeight);
+    bool popup = (descriptor->flags & MacWSStreamFrameNativePopupComposite) != 0;
+    *layerX = (popup ? 0 : descriptor->contentX) + (float)(u * descriptor->contentWidth);
+    *layerY = (popup ? 0 : descriptor->contentY) + (float)(v * descriptor->contentHeight);
     return true;
 }
 
@@ -503,11 +508,16 @@ static inline bool MacWSStreamFrameDescriptorIsValid(
         MacWSStreamFrameOccluded | MacWSStreamFrameOverlay |
         MacWSStreamFrameGlobalSystemSurface |
         MacWSStreamFrameInputPassthrough |
-        MacWSStreamFrameFinalComposite;
+        MacWSStreamFrameFinalComposite | MacWSStreamFrameNativePopupComposite;
     if ((descriptor->flags & ~allowedFlags) != 0) return false;
     if ((descriptor->flags & MacWSStreamFrameFinalComposite) != 0 &&
         ((descriptor->flags & MacWSStreamFrameOverlay) != 0 ||
          descriptor->windowID != 0)) return false;
+    if ((descriptor->flags & MacWSStreamFrameNativePopupComposite) != 0 &&
+        ((descriptor->flags & MacWSStreamFrameOverlay) == 0 ||
+         (descriptor->flags & (MacWSStreamFrameFinalComposite |
+             MacWSStreamFrameGlobalSystemSurface)) != 0 ||
+         descriptor->windowID == 0 || descriptor->layerOwnerPID <= 1)) return false;
     return (uint64_t)descriptor->bytesPerRow * descriptor->height <= SIZE_MAX;
 }
 

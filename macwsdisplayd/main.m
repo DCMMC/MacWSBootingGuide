@@ -165,7 +165,7 @@ static void SuspendFullscreenLayerCapturesForFinalComposite(void);
 static void ResumeFullscreenLayerCapturesForFallback(void);
 static void ClearDirectDrawableActivity(MacWSDisplayClient *client,
                                         NSString *reason);
-static NSDictionary<NSNumber *, NSValue *> *CopyWindowMetrics(int32_t pid);
+static NSDictionary<NSNumber *, NSData *> *CopyWindowMetrics(int32_t pid);
 
 extern int proc_pidinfo(int pid, int flavor, uint64_t arg, void *buffer,
                         int buffersize);
@@ -236,6 +236,24 @@ static void DisplayLog(NSString *format, ...) {
 
 static void WriteFinalCompositeState(NSString *state, pid_t producerPID,
                                      uint64_t sequence, NSString *reason) {
+    // Runtime-confirmed disk-writes report C8090A4D-3011-4581-B452-
+    // 2E5C461EDCCB maps its heaviest stack to this diagnostic atomic rename:
+    // 1073.75 MB dirtied in 5257 seconds. XPC carries every completed frame;
+    // this sidecar is only a human/pipeline status witness, not a frame fence.
+    // Publish state/producer transitions immediately, but coalesce unchanged
+    // status heartbeats BEFORE allocating/writing another payload.
+    static NSString *lastState;
+    static NSString *lastReason;
+    static pid_t lastProducer;
+    static NSTimeInterval lastAttempt;
+    NSTimeInterval now = NSProcessInfo.processInfo.systemUptime;
+    BOOL changed = ![lastState isEqualToString:state] ||
+        ![lastReason isEqualToString:reason] || lastProducer != producerPID;
+    if (!changed && now - lastAttempt < 5.0) return;
+    lastState = [state copy];
+    lastReason = [reason copy];
+    lastProducer = producerPID;
+    lastAttempt = now;
     NSString *payload = [NSString stringWithFormat:
         @"state=%@\nproducer=%d\nsequence=%llu\nupdated=%.6f\nreason=%@\n",
         state ?: @"missing", producerPID, (unsigned long long)sequence,
@@ -288,6 +306,11 @@ static void WriteFinalCompositeState(NSString *state, pid_t producerPID,
 // source if that final producer becomes unavailable.
 @property(nonatomic) MacWSStreamWindowFlags windowFlags;
 @property(nonatomic) CGRect destinationBounds;
+@property(nonatomic) CGRect popupCompositeSource;
+@property(nonatomic) uint64_t popupCompositeMinimumTime;
+@property(nonatomic) BOOL popupCompositeEligible;
+@property(nonatomic) BOOL popupCompositeReported;
+@property(nonatomic) uint64_t lastPopupCompositeSequence;
 @property(nonatomic) uint64_t streamID;
 @property(nonatomic) uint64_t sequence;
 @property(nonatomic) uint64_t firstDisplayTime;
@@ -1026,7 +1049,7 @@ static BOOL CopyWindowBounds(uint32_t windowID, CGRect *result) {
     return NO;
 }
 
-static NSDictionary<NSNumber *, NSValue *> *CopyWindowMetrics(int32_t pid) {
+static NSDictionary<NSNumber *, NSData *> *CopyWindowMetrics(int32_t pid) {
     if (pid <= 1) return @{};
     NSString *path = [NSString stringWithFormat:
         @"/private/tmp/macws_window_metrics.%d.bin", pid];
@@ -1048,8 +1071,12 @@ static NSDictionary<NSNumber *, NSValue *> *CopyWindowMetrics(int32_t pid) {
             entry.minimumLogicalHeight < 0 ||
             entry.minimumLogicalWidth > MACWS_STREAM_MAX_DIMENSION ||
             entry.minimumLogicalHeight > MACWS_STREAM_MAX_DIMENSION) continue;
-        result[@(entry.windowID)] = [NSValue valueWithBytes:&entry
-                                                  objCType:@encode(MacWSWindowMetricsEntry)];
+        // runtime-confirmed on Ventura: sizeof this packed wire record is
+        // 56, but NSGetSizeAndAlignment(@encode(...)) is 64. ObjC encodings
+        // discard packing; NSValue therefore copied eight bytes past both
+        // stack buffers, corrupting an ARC owner in SendWindowList. Preserve
+        // the explicit wire length at both storage and read boundaries.
+        result[@(entry.windowID)] = [NSData dataWithBytes:&entry length:sizeof(entry)];
     }
     return result;
 }
@@ -1148,16 +1175,16 @@ static void SendWindowList(MacWSDisplayClient *client) {
         uint32_t windowID = [info[(id)kCGWindowNumber] unsignedIntValue];
         if (ownerPID <= 1 || windowID == 0) continue;
         NSNumber *pidKey = @(ownerPID);
-        NSDictionary<NSNumber *, NSValue *> *processMetrics =
+        NSDictionary<NSNumber *, NSData *> *processMetrics =
             metricsByPID[pidKey];
         if (!processMetrics) {
             processMetrics = CopyWindowMetrics(ownerPID);
             metricsByPID[pidKey] = processMetrics;
         }
-        NSValue *metricsValue = processMetrics[@(windowID)];
+        NSData *metricsValue = processMetrics[@(windowID)];
         if (!metricsValue) continue;
         MacWSWindowMetricsEntry metrics = {0};
-        [metricsValue getValue:&metrics];
+        [metricsValue getBytes:&metrics length:sizeof(metrics)];
         if ((metrics.flags & MacWSStreamWindowVisible) == 0 ||
             (metrics.flags & MacWSStreamWindowTransient) != 0) continue;
         MacWSStreamWindowFlags fullscreenAuthority =
@@ -1185,13 +1212,13 @@ static void SendWindowList(MacWSDisplayClient *client) {
         if (candidateWindowID != 0 && ownerPID > 1)
             liveWindowOwners[@(candidateWindowID)] = @(ownerPID);
         NSNumber *pidKey = @(ownerPID);
-        NSDictionary<NSNumber *, NSValue *> *processMetrics = metricsByPID[pidKey];
+        NSDictionary<NSNumber *, NSData *> *processMetrics = metricsByPID[pidKey];
         if (!processMetrics) {
             processMetrics = CopyWindowMetrics(ownerPID);
             metricsByPID[pidKey] = processMetrics;
         }
         MacWSWindowMetricsEntry metrics = {0};
-        NSValue *metricsValue = processMetrics[@(candidateWindowID)];
+        NSData *metricsValue = processMetrics[@(candidateWindowID)];
         // A selectable Scene must correspond to a real, published AppKit
         // top-level window. Cursor/menu-bar/plugin surfaces have no matching
         // per-process metrics entry, while menus and overlays use nonzero
@@ -1200,7 +1227,7 @@ static void SendWindowList(MacWSDisplayClient *client) {
         // its live CGWindow identity and exact layer remain independently
         // validated below.
         if (!metricsValue) continue;
-        [metricsValue getValue:&metrics];
+        [metricsValue getBytes:&metrics length:sizeof(metrics)];
         MacWSStreamWindowFlags fullscreenAuthority =
             MacWSStreamWindowFocused | MacWSStreamWindowFullscreenCanvas;
         BOOL focusedFullscreenCanvas =
@@ -1489,6 +1516,17 @@ static void PublishFrame(MacWSDisplayClient *client,
     // manufacture leases for a dead XPC connection. The replacement Host
     // republishes these surfaces when it atomically takes ownership.
     if (!client.connection || client.deliveryPaused) return;
+    BOOL nativePopup = layer && !layer.retiring &&
+        client.mode == MacWSStreamModeWindow && layer.popupCompositeEligible &&
+        FinalCompositeSurface && FinalCompositeRecord.producerPID > 1 &&
+        FinalCompositeRecord.completionTime >= layer.popupCompositeMinimumTime &&
+        CGRectContainsRect(CGRectMake(0, 0, FinalCompositeRecord.width,
+            FinalCompositeRecord.height), layer.popupCompositeSource);
+    if (nativePopup) {
+        if (layer.lastPopupCompositeSequence == FinalCompositeRecord.sequence) return;
+        surface = FinalCompositeSurface;
+        displayTime = FinalCompositeRecord.completionTime;
+    }
     uint32_t layerWindowID = layer ? layer.windowID
         : (client.windowID ? client.windowID : UINT32_MAX);
     uint64_t producerStreamID = layer ? layer.streamID : client.streamID;
@@ -1545,8 +1583,10 @@ static void PublishFrame(MacWSDisplayClient *client,
             break;
         }
     }
-    uint32_t contentWidth = (uint32_t)width;
-    uint32_t contentHeight = (uint32_t)height;
+    uint32_t contentX = nativePopup ? (uint32_t)layer.popupCompositeSource.origin.x : 0;
+    uint32_t contentY = nativePopup ? (uint32_t)layer.popupCompositeSource.origin.y : 0;
+    uint32_t contentWidth = nativePopup ? (uint32_t)layer.popupCompositeSource.size.width : (uint32_t)width;
+    uint32_t contentHeight = nativePopup ? (uint32_t)layer.popupCompositeSource.size.height : (uint32_t)height;
     int32_t destinationX = layer
         ? (int32_t)llround(layer.destinationBounds.origin.x) : 0;
     int32_t destinationY = layer
@@ -1568,7 +1608,7 @@ static void PublishFrame(MacWSDisplayClient *client,
     lease.token = NextLeaseToken++;
     if (lease.token == 0) lease.token = NextLeaseToken++;
     lease.surface = (IOSurfaceRef)CFRetain(surface);
-    if (finalComposite) {
+    if (finalComposite || nativePopup) {
         IOSurfaceIncrementUseCount(surface);
         lease.holdsSurfaceUseCount = YES;
     }
@@ -1588,6 +1628,7 @@ static void PublishFrame(MacWSDisplayClient *client,
         .flags = MacWSStreamFrameComplete |
                  (finalComposite
                      ? MacWSStreamFrameFinalComposite : 0) |
+                 (nativePopup ? MacWSStreamFrameNativePopupComposite : 0) |
                  (layer ? MacWSStreamFrameOverlay : 0) |
                  (layer && [layer.ownerName isEqualToString:@"Dock"]
                      ? MacWSStreamFrameGlobalSystemSurface : 0) |
@@ -1602,8 +1643,8 @@ static void PublishFrame(MacWSDisplayClient *client,
         .bytesPerRow = (uint32_t)bytesPerRow,
         .pixelFormat = IOSurfaceGetPixelFormat(surface),
         .backingScale = scale,
-        .contentX = 0,
-        .contentY = 0,
+        .contentX = contentX,
+        .contentY = contentY,
         .contentWidth = contentWidth,
         .contentHeight = contentHeight,
         .layerWindowID = layerWindowID,
@@ -1614,6 +1655,19 @@ static void PublishFrame(MacWSDisplayClient *client,
         .destinationWidth = destinationWidth,
         .destinationHeight = destinationHeight,
     };
+    if (layer) layer.lastPopupCompositeSequence = nativePopup
+        ? FinalCompositeRecord.sequence : 0;
+    if (nativePopup && !layer.popupCompositeReported) {
+        layer.popupCompositeReported = YES;
+        DisplayLog(@"native-popup-composite base=%u layer=%u owner=%d "
+            "source=%u,%u %ux%u destination=%d,%d %ux%u "
+            "completed=%llu required=%llu route=completed-AGX-region no-copy=YES",
+            client.windowID, layer.windowID, layer.ownerPID,
+            contentX, contentY, contentWidth, contentHeight,
+            destinationX, destinationY, destinationWidth, destinationHeight,
+            (unsigned long long)displayTime,
+            (unsigned long long)layer.popupCompositeMinimumTime);
+    }
     if (descriptor.sequence == 1) {
         if (layer) layer.firstDisplayTime = displayTime;
         else client.firstDisplayTime = displayTime;
@@ -1834,8 +1888,15 @@ static void DeliverFinalComposite(
 
     NSUInteger subscribers = 0;
     for (MacWSDisplayClient *client in [Clients copy]) {
-        if (!client.subscriptionActive || client.deliveryPaused ||
-            client.mode != MacWSStreamModeFullscreen) continue;
+        if (!client.subscriptionActive || client.deliveryPaused) continue;
+        if (client.mode == MacWSStreamModeWindow) {
+            for (MacWSTransientLayer *layer in client.transientLayers.allValues) {
+                if (layer.popupCompositeEligible && !layer.retiring && layer.latestSurface)
+                    PublishFrame(client, layer, layer.latestDisplayTime, layer.latestSurface);
+            }
+            continue;
+        }
+        if (client.mode != MacWSStreamModeFullscreen) continue;
         subscribers++;
         PublishFrame(client, nil, record.completionTime,
                      FinalCompositeSurface);
@@ -2148,7 +2209,13 @@ static void ApplyWorkspaceGeometryDescriptions(
                         : bounds.size.height * scale);
             if (CGRectEqualToRect(layer.destinationBounds, destination))
                 continue;
+            // The texture crop belongs to the old global geometry. Do not
+            // slide an old desktop rectangle with a newly moved NSWindow.
+            // Reconciliation establishes a fresh crop/completion boundary.
+            layer.popupCompositeEligible = NO;
             layer.destinationBounds = destination;
+            if (windowed && layer.lastPopupCompositeSequence && layer.latestSurface)
+                PublishFrame(client, layer, layer.latestDisplayTime, layer.latestSurface);
             AppendLayerGeometry(geometryBatch, client, layer, displayTime);
         }
         WorkspaceGeometryRecordsSent += geometryBatch.length /
@@ -3101,6 +3168,68 @@ static void StartSubscription(MacWSDisplayClient *client,
 // exact and attach each same-owner transient as an independent native layer.
 // Host composites the layers with Metal; no RFB, CPU copy, or stream-mode
 // restart is involved.
+static void ConfigureNativePopupComposite(MacWSTransientLayer *layer,
+        MacWSDisplayClient *client, NSArray<NSDictionary *> *windows,
+        CGRect baseBounds, CGRect popupBounds) {
+    BOOL wasEligible = layer.popupCompositeEligible;
+    layer.popupCompositeEligible = NO;
+    // A popup is globally frontmost while tracking. Use completed compositor
+    // pixels only for the part painted over this exact base and no window ABOVE THE
+    // POPUP occupies its rectangle. The Dock has a full-display transparent
+    // backing at level 20 (runtime window 21); testing until the level-zero
+    // base mistakes that backing for an occluder of a level-101 menu.
+    // Never screen-crop ordinary
+    // or occluded app windows: their isolated streams remain authoritative.
+    if (layer.skyLightLayer != CGWindowLevelForKey(kCGPopUpMenuWindowLevelKey) ||
+        !CGRectIntersectsRect(baseBounds, popupBounds)) return;
+    CGRect desktop = CGDisplayBounds(CGMainDisplayID());
+    CGRect paintBounds = CGRectIntersection(CGRectIntersection(
+        CGRectInset(popupBounds, -20.0, -20.0), baseBounds), desktop);
+    if (CGRectIsNull(paintBounds) || CGRectIsEmpty(paintBounds)) return;
+    BOOL reachedPopup = NO;
+    for (NSDictionary *info in windows) {
+        uint32_t number = [info[(id)kCGWindowNumber] unsignedIntValue];
+        if (number == layer.windowID) { reachedPopup = YES; break; }
+        if ([info[(id)kCGWindowAlpha] doubleValue] <= 0.01 ||
+            [info[(id)kCGWindowLayer] integerValue] >=
+                CGWindowLevelForKey(kCGCursorWindowLevelKey)) continue;
+        // A same-owner submenu is already part of this completed native
+        // image. It will be painted at its own z-order too, using the same
+        // opaque pixels; do not flatten the parent material when it opens.
+        if ([info[(id)kCGWindowOwnerPID] intValue] == layer.ownerPID &&
+            [info[(id)kCGWindowLayer] integerValue] ==
+                CGWindowLevelForKey(kCGPopUpMenuWindowLevelKey) &&
+            client.transientLayers[@(number)]) continue;
+        CGRect other = CGRectZero;
+        if (!CGRectMakeWithDictionaryRepresentation(
+                (__bridge CFDictionaryRef)info[(id)kCGWindowBounds], &other) ||
+            CGRectIntersectsRect(other, paintBounds)) return;
+    }
+    if (!reachedPopup || !CGRectContainsRect(desktop, popupBounds) ||
+        !FinalCompositeSurface || CGRectIsEmpty(desktop)) return;
+    CGFloat sx = FinalCompositeRecord.width / desktop.size.width;
+    CGFloat sy = FinalCompositeRecord.height / desktop.size.height;
+    if (!isfinite(sx) || !isfinite(sy) || sx <= 0 || fabs(sx - sy) > 0.01) return;
+    CGRect source = CGRectMake(
+        round((popupBounds.origin.x - desktop.origin.x) * sx),
+        round((popupBounds.origin.y - desktop.origin.y) * sy),
+        round(popupBounds.size.width * sx), round(popupBounds.size.height * sy));
+    if (CGRectIsEmpty(source) ||
+        !CGRectContainsRect(CGRectMake(0, 0, FinalCompositeRecord.width,
+            FinalCompositeRecord.height), source)) return;
+    if (!wasEligible || !CGRectEqualToRect(source, layer.popupCompositeSource)) {
+        layer.popupCompositeMinimumTime = mach_absolute_time();
+        layer.popupCompositeSource = source;
+        layer.lastPopupCompositeSequence = 0;
+        layer.popupCompositeReported = NO;
+        // Require a completed frame newer than this geometry observation.
+        // The normal producer/replay path owns freshness and use-count leases;
+        // no TCC result, WindowServer check or GPU completion is fabricated.
+        MacWSRequestFinalCompositeReplay(layer.popupCompositeMinimumTime);
+    }
+    layer.popupCompositeEligible = YES;
+}
+
 static void ReconcileTransientStreams(void) {
     TransientReconcilePending = NO;
     BOOL urgentRetireConfirmation = UrgentTransientRetirePasses > 0;
@@ -3135,7 +3264,7 @@ static void ReconcileTransientStreams(void) {
                     sizeof(MacWSStreamLayerGeometry)];
             uint64_t geometryDisplayTime = mach_absolute_time();
             NSMutableSet<NSNumber *> *seen = [NSMutableSet set];
-            NSMutableDictionary<NSNumber *, NSDictionary<NSNumber *, NSValue *> *>
+            NSMutableDictionary<NSNumber *, NSDictionary<NSNumber *, NSData *> *>
                 *metricsByPID = [NSMutableDictionary dictionary];
             NSUInteger attached = 0;
             NSUInteger count = desktopInfo.count;
@@ -3217,17 +3346,17 @@ static void ReconcileTransientStreams(void) {
                     ? windowName : @"";
                 layer.skyLightLayer = candidateSkyLightLayer;
                 NSNumber *ownerPIDKey = @(layer.ownerPID);
-                NSDictionary<NSNumber *, NSValue *> *processMetrics =
+                NSDictionary<NSNumber *, NSData *> *processMetrics =
                     metricsByPID[ownerPIDKey];
                 if (!processMetrics) {
                     processMetrics = CopyWindowMetrics(layer.ownerPID);
                     metricsByPID[ownerPIDKey] = processMetrics;
                 }
                 MacWSWindowMetricsEntry windowMetrics = {0};
-                NSValue *windowMetricsValue =
+                NSData *windowMetricsValue =
                     processMetrics[@(candidateWindowID)];
                 if (windowMetricsValue)
-                    [windowMetricsValue getValue:&windowMetrics];
+                    [windowMetricsValue getBytes:&windowMetrics length:sizeof(windowMetrics)];
                 layer.windowFlags = windowMetrics.flags &
                     (MacWSStreamWindowVisible |
                      MacWSStreamWindowFocused |
@@ -3392,11 +3521,11 @@ static void ReconcileTransientStreams(void) {
                 (__bridge CFDictionaryRef)baseInfo[(id)kCGWindowBounds],
                 &baseBounds) || CGRectIsEmpty(baseBounds)) continue;
         int32_t ownerPID = [baseInfo[(id)kCGWindowOwnerPID] intValue];
-        NSDictionary<NSNumber *, NSValue *> *processMetrics =
+        NSDictionary<NSNumber *, NSData *> *processMetrics =
             CopyWindowMetrics(ownerPID);
         MacWSWindowMetricsEntry baseMetrics = {0};
-        NSValue *baseMetricsValue = processMetrics[@(client.windowID)];
-        if (baseMetricsValue) [baseMetricsValue getValue:&baseMetrics];
+        NSData *baseMetricsValue = processMetrics[@(client.windowID)];
+        if (baseMetricsValue) [baseMetricsValue getBytes:&baseMetrics length:sizeof(baseMetrics)];
         CGFloat scale = client.windowBackingScale > 0.0
             ? client.windowBackingScale : MainDisplayBackingScale();
         if (!isfinite(scale) || scale < 0.5 || scale > 8.0) continue;
@@ -3410,10 +3539,10 @@ static void ReconcileTransientStreams(void) {
                 [info[(id)kCGWindowNumber] unsignedIntValue];
             NSInteger level = [info[(id)kCGWindowLayer] integerValue];
             MacWSWindowMetricsEntry candidateMetrics = {0};
-            NSValue *candidateMetricsValue =
+            NSData *candidateMetricsValue =
                 processMetrics[@(candidateWindowID)];
             if (candidateMetricsValue)
-                [candidateMetricsValue getValue:&candidateMetrics];
+                [candidateMetricsValue getBytes:&candidateMetrics length:sizeof(candidateMetrics)];
             BOOL logicalTransient = level == 0 &&
                 (candidateMetrics.flags & MacWSStreamWindowTransient) != 0 &&
                 baseMetrics.logicalGroupID != 0 &&
@@ -3495,6 +3624,8 @@ static void ReconcileTransientStreams(void) {
                 MIN((NSInteger)INT32_MAX, compositorLevel));
             layer.destinationBounds = destination;
             layer.missCount = 0;
+            ConfigureNativePopupComposite(layer, client, windowInfo,
+                                          baseBounds, candidateBounds);
             if (isNew || !layer.stream) StartTransientLayer(layer);
         }
 
