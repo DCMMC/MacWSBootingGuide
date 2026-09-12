@@ -9,6 +9,8 @@
 #include <mach/mach_time.h>
 #include <math.h>
 #include <signal.h>
+#include <notify.h>
+#include <objc/message.h>
 
 #import "MacWSCatalystDrawableCompositor.h"
 #import "MacWSCatalystDrawableProbe.h"
@@ -21,6 +23,8 @@
 #include "macws_catalyst_drawable_protocol.h"
 #include "macws_touch_policy.h"
 #include "macws_viewport_math.h"
+#include "macws_window_configuration.h"
+#include "macws_resize_gesture.h"
 
 typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
     MacWSDirectTouchStateIdle = 0,
@@ -269,6 +273,7 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
     UIPanGestureRecognizer *_indirectScrollRecognizer;
     UIPinchGestureRecognizer *_pinchRecognizer;
     UIRotationGestureRecognizer *_rotationRecognizer;
+    UITapGestureRecognizer *_secondaryTapRecognizer;
     MacWSThreeFingerChordGateGestureRecognizer *_threeFingerChordGate;
     UIPanGestureRecognizer *_threeFingerPanRecognizer;
     BOOL _threeFingerSystemGestureActive;
@@ -298,11 +303,19 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
     CGSize _lastRequestedWindowSize;
     CGFloat _lastRequestedDensityScale;
     CGSize _lastObservedTargetWindowLogicalSize;
-    CGSize _windowConfigurationSourceLogicalSize;
-    CFTimeInterval _windowConfigurationIssuedAt;
+    double _windowConfigurationRequestTimestamp;
+    uint32_t _windowConfigurationRequestSequence;
     uint64_t _windowConfigurationSettlementSerial;
+    uint64_t _constrainedWindowSettlementSerial;
+    BOOL _constrainedWindowSettlementPending;
+    dispatch_block_t _deferredConstrainedWindowSettlement;
+    int _nativeResizeGestureToken;
+    BOOL _nativeResizeGestureRegistered;
+    NSString *_nativeResizeGestureScene;
     BOOL _windowConfigurationAwaitingAcknowledgement;
     BOOL _sceneResizeFollowingTargetWindow;
+    uint32_t _sceneResizeFollowWindowID;
+    int32_t _sceneResizeFollowOwnerPID;
     CGSize _sceneResizeTargetWindowLogicalSize;
     CFTimeInterval _sceneResizeFollowDeadline;
     BOOL _fullscreenGestureRouteActive;
@@ -634,16 +647,17 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
     resetZoom.numberOfTapsRequired = 2;
     resetZoom.cancelsTouchesInView = YES;
     [self addGestureRecognizer:resetZoom];
-    UITapGestureRecognizer *secondaryTap = [[UITapGestureRecognizer alloc]
+    _secondaryTapRecognizer = [[UITapGestureRecognizer alloc]
         initWithTarget:self action:@selector(trackpadSecondaryTapped:)];
-    secondaryTap.numberOfTouchesRequired = 2;
-    secondaryTap.cancelsTouchesInView = NO;
-    [secondaryTap requireGestureRecognizerToFail:resetZoom];
-    [self addGestureRecognizer:secondaryTap];
+    _secondaryTapRecognizer.numberOfTouchesRequired = 2;
+    _secondaryTapRecognizer.cancelsTouchesInView = NO;
+    [_secondaryTapRecognizer requireGestureRecognizerToFail:resetZoom];
+    [self addGestureRecognizer:_secondaryTapRecognizer];
     return self;
 }
 
 - (void)dealloc {
+    if (_nativeResizeGestureRegistered) notify_cancel(_nativeResizeGestureToken);
     [NSNotificationCenter.defaultCenter removeObserver:self
         name:MacWSCatalystDrawableDidPresentNotification object:nil];
     [_framePollDisplayLink invalidate];
@@ -654,6 +668,59 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
     for (MacWSSurfaceFrame *frame in _retiredSurfaceFrames)
         [_streamClient releaseFrame:frame];
     [_streamClient invalidate];
+}
+
+- (void)didMoveToWindow {
+    [super didMoveToWindow];
+    UIWindowScene *scene = self.window.windowScene;
+    SEL identifier = NSSelectorFromString(@"_sceneIdentifier");
+    NSString *sceneID = [scene respondsToSelector:identifier]
+        ? ((id (*)(id, SEL))objc_msgSend)(scene, identifier) : nil;
+    if ([_nativeResizeGestureScene isEqualToString:sceneID]) return;
+    if (_nativeResizeGestureRegistered) notify_cancel(_nativeResizeGestureToken);
+    _nativeResizeGestureRegistered = NO;
+    _nativeResizeGestureScene = [sceneID copy];
+    if (!sceneID.length) return;
+    NSString *name = [@MACWS_RESIZE_GESTURE_NOTIFICATION_PREFIX stringByAppendingString:sceneID];
+    __weak typeof(self) weakSelf = self;
+    uint32_t status = notify_register_dispatch(name.UTF8String,
+        &_nativeResizeGestureToken, dispatch_get_main_queue(), ^(int token) {
+            typeof(self) strongSelf = weakSelf;
+            if (!strongSelf || !strongSelf->_nativeResizeGestureRegistered ||
+                token != strongSelf->_nativeResizeGestureToken) return;
+            BOOL active = strongSelf.nativeWindowResizeGestureActive;
+            MacWSLog(@"native-resize-gesture scene=%@ window=%u active=%@",
+                strongSelf->_nativeResizeGestureScene, strongSelf.targetWindowID,
+                active ? @"YES" : @"NO");
+            if (active) {
+                [strongSelf cancelSceneResizeFollowingTargetWindow];
+            } else {
+                // Let the end response's last UIKit bounds commit first.
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 32 * NSEC_PER_MSEC),
+                    dispatch_get_main_queue(), ^{
+                        [weakSelf completeConstrainedWindowSettlementIfIdle];
+                    });
+            }
+        });
+    _nativeResizeGestureRegistered = status == NOTIFY_STATUS_OK;
+    if (!_nativeResizeGestureRegistered)
+        MacWSLog(@"native-resize-gesture registration-failed scene=%@ status=%u", sceneID, status);
+}
+
+- (BOOL)nativeWindowResizeGestureActive {
+    uint64_t state = 0;
+    if (!_nativeResizeGestureRegistered ||
+        notify_get_state(_nativeResizeGestureToken, &state) != NOTIFY_STATUS_OK ||
+        !MacWSResizeGestureIsActive(state)) return NO;
+    pid_t writer = (pid_t)MacWSResizeGestureWriter(state);
+    return kill(writer, 0) == 0 || errno == EPERM;
+}
+
+- (void)completeConstrainedWindowSettlementIfIdle {
+    if (self.nativeWindowResizeGestureActive) return;
+    dispatch_block_t settlement = _deferredConstrainedWindowSettlement;
+    _deferredConstrainedWindowSettlement = nil;
+    if (settlement) settlement();
 }
 
 - (void)catalystDrawableDidPresent:(NSNotification *)notification {
@@ -812,6 +879,15 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
 }
 
 - (void)configureStreamMode:(MacWSStreamMode)mode windowID:(uint32_t)windowID {
+    // Subscription setup can run in viewDidAppear/sceneWillEnterForeground
+    // after willConnect has already issued the native Scene transaction. It
+    // does not change that transaction's owner when its exact target is the
+    // same. Never let a transport reconnect cancel pre-visible sizing.
+    BOOL preserveSceneFollow = _sceneResizeFollowingTargetWindow &&
+        mode == MacWSStreamModeWindow && windowID != 0 &&
+        windowID == _sceneResizeFollowWindowID &&
+        self.targetPID == _sceneResizeFollowOwnerPID &&
+        CACurrentMediaTime() <= _sceneResizeFollowDeadline;
     // A UIKit scene/mode transition can cancel its recognizers after the
     // DisplayStream subscription has already changed.  Close the native Dock
     // phase stream while its latched endpoint is still valid; clearing these
@@ -820,14 +896,22 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
     [self cancelActiveThreeFingerSystemGestureAtTimestamp:
         CACurrentMediaTime()];
     _windowConfigurationSettlementSerial++;
+    _constrainedWindowSettlementSerial++;
+    _constrainedWindowSettlementPending = NO;
+    _deferredConstrainedWindowSettlement = nil;
     _windowConfigurationAwaitingAcknowledgement = NO;
+    _windowConfigurationRequestTimestamp = 0.0;
+    _windowConfigurationRequestSequence = 0;
+    _windowConfigurationAcknowledgementsAvailable = NO;
     _lastRequestedWindowSize = CGSizeZero;
-    _lastObservedTargetWindowLogicalSize = CGSizeZero;
-    _windowConfigurationSourceLogicalSize = CGSizeZero;
-    _windowConfigurationIssuedAt = 0.0;
-    _sceneResizeFollowingTargetWindow = NO;
-    _sceneResizeTargetWindowLogicalSize = CGSizeZero;
-    _sceneResizeFollowDeadline = 0.0;
+    if (!preserveSceneFollow) {
+        _lastObservedTargetWindowLogicalSize = CGSizeZero;
+        [self cancelSceneResizeFollowingTargetWindow];
+    } else {
+        MacWSLog(@"window-configuration scene-follow retained-on-subscribe window=%u pid=%d target-logical=%.1fx%.1f",
+            windowID, self.targetPID, _sceneResizeTargetWindowLogicalSize.width,
+            _sceneResizeTargetWindowLogicalSize.height);
+    }
     _fullscreenGestureRouteActive = NO;
     _fullscreenGestureRouteContactID = 0;
     _fullscreenGestureRoutePID = 0;
@@ -882,6 +966,10 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
 }
 
 - (void)suspendStream {
+    [self cancelSceneResizeFollowingTargetWindow];
+    _constrainedWindowSettlementSerial++;
+    _constrainedWindowSettlementPending = NO;
+    _deferredConstrainedWindowSettlement = nil;
     [self cancelActiveThreeFingerSystemGestureAtTimestamp:
         CACurrentMediaTime()];
     _framePollDisplayLink.paused = YES;
@@ -945,17 +1033,20 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
 - (CGFloat)effectiveDensityScale {
     // Density describes the macOS source's logical geometry in the UIKit
     // Scene; it must not change when the presentation drawable is deliberately
-    // lower resolution. Derive it from the authoritative source frame and
-    // backing scale. On the target iPad source=2388x1668, backing=2 and
-    // bounds=1389x970 preserve the existing ~1.16 mapping.
-    CGFloat backingScale = _surfaceFrame.descriptor.backingScale;
-    if (!isfinite(backingScale) || backingScale < 0.5) backingScale = 2.0;
-    if (_streamClient.mode == MacWSStreamModeWindow) {
-        UIScreen *screen = self.window.windowScene.screen ?: UIScreen.mainScreen;
-        return MacWSStableWindowDensity(
-            backingScale, screen.scale,
+    // lower resolution.
+    if (self.targetWindowID != 0) {
+        // AppKit logical window sizes and UIWindowScene sizes are already in
+        // points. Runtime logs showed UIKit changing the new Scene's render
+        // scale from 1.0 to an intermediate value after attachment; applying
+        // backing/display scale here changed one 1086x687 AppKit window from
+        // a 2389x1563 request to 1314x883. Keep pixel scale exclusively in the
+        // drawable path and make native geometry depend only on the selected
+        // macPad density mode.
+        return MacWSLogicalWindowDensity(
             MacWSDensityModeFactor(self.displayDensity));
     }
+    CGFloat backingScale = _surfaceFrame.descriptor.backingScale;
+    if (!isfinite(backingScale) || backingScale < 0.5) backingScale = 2.0;
     CGFloat sourceWidth = [self currentFrameWidth];
     CGFloat sourceHeight = [self currentFrameHeight];
     CGFloat scaleX = self.bounds.size.width > 0 && sourceWidth > 0
@@ -987,6 +1078,7 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
 
 - (void)setTargetPID:(int32_t)targetPID {
     if (_targetPID == targetPID) return;
+    [self cancelSceneResizeFollowingTargetWindow];
     int32_t previousTargetPID = _targetPID;
     _lastKeyboardFrameWidth = 0;
     _lastKeyboardFrameHeight = 0;
@@ -1041,10 +1133,7 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
 }
 
 - (void)setDisplayDensity:(MacWSHostDisplayDensity)displayDensity {
-    if (displayDensity != MacWSHostDisplayDensityTouchComfort &&
-        displayDensity != MacWSHostDisplayDensityKeyboard &&
-        displayDensity != MacWSHostDisplayDensityComfort) return;
-    _displayDensity = displayDensity;
+    _displayDensity = MacWSNormalizedDisplayDensity(displayDensity);
     _lastRequestedWindowSize = CGSizeZero;
     [self resetViewportZoom];
     [self geometryDidChange];
@@ -1105,29 +1194,89 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
     if (!isfinite(logicalSize.width) || !isfinite(logicalSize.height) ||
         logicalSize.width <= 0.0 || logicalSize.height <= 0.0) return;
     _lastObservedTargetWindowLogicalSize = logicalSize;
-    if (!_windowConfigurationAwaitingAcknowledgement) return;
-    CGSize requested = _pendingRequestedWindowSize;
-    BOOL exact = fabs(logicalSize.width - requested.width) < 1.0 &&
-        fabs(logicalSize.height - requested.height) < 1.0;
-    BOOL changedFromSource =
-        fabs(logicalSize.width -
-             _windowConfigurationSourceLogicalSize.width) >= 0.75 ||
-        fabs(logicalSize.height -
-             _windowConfigurationSourceLogicalSize.height) >= 0.75;
-    if (!exact && self.targetWindowResizable && !changedFromSource) return;
+    // Catalog generations and ConfigureWindow deliveries are independent.
+    // Runtime-confirmed at MacWSHost.log 1789154729.441: the catalog's
+    // 648x613 was labelled as the result of a still-moving 736x634 request,
+    // started a reverse Scene resize and cancelled its newer queued request.
+    // Legacy producers can prove only same-size convergence; disagreement
+    // carries no causal evidence of a constraint.
+    if (self.windowConfigurationAcknowledgementsAvailable ||
+        !_windowConfigurationAwaitingAcknowledgement ||
+        !MacWSWindowConfigurationSizesMatch(
+            logicalSize.width, logicalSize.height,
+            _lastRequestedWindowSize.width, _lastRequestedWindowSize.height,
+            0.75) || self.windowConfigurationHasQueuedRequest) return;
     _windowConfigurationAwaitingAcknowledgement = NO;
     _windowConfigurationSettlementSerial++;
-    if (!exact) {
-        MacWSLog(@"window-configuration constrained window=%u pid=%d requested=%.1fx%.1f applied=%.1fx%.1f source=%.1fx%.1f resizable=%@",
-                 self.targetWindowID, self.targetPID,
-                 requested.width, requested.height,
-                 logicalSize.width, logicalSize.height,
-                 _windowConfigurationSourceLogicalSize.width,
-                 _windowConfigurationSourceLogicalSize.height,
-                 self.targetWindowResizable ? @"YES" : @"NO");
-        [self.statusDelegate metalView:self
-            windowConfigurationWasConstrainedToLogicalSize:logicalSize
-                                              requestedSize:requested];
+    _windowConfigurationRequestSequence = 0;
+}
+
+- (void)observeWindowConfigurationWithTimestamp:(double)timestamp
+                                sampleSequence:(uint32_t)sampleSequence
+                                 requestedSize:(CGSize)requestedSize
+                                   appliedSize:(CGSize)appliedSize {
+    if (!_windowConfigurationAwaitingAcknowledgement) return;
+    MacWSWindowConfigurationAckResult result =
+        MacWSClassifyWindowConfigurationAcknowledgement(
+            _windowConfigurationRequestTimestamp,
+            _windowConfigurationRequestSequence,
+            _lastRequestedWindowSize.width, _lastRequestedWindowSize.height,
+            _lastRequestedDensityScale,
+            _pendingRequestedWindowSize.width, _pendingRequestedWindowSize.height,
+            _pendingRequestedDensityScale,
+            timestamp, sampleSequence, requestedSize.width, requestedSize.height,
+            appliedSize.width, appliedSize.height);
+    if (result == MacWSWindowConfigurationAckUnrelated) return;
+    _windowConfigurationAwaitingAcknowledgement = NO;
+    _windowConfigurationSettlementSerial++;
+    _windowConfigurationRequestSequence = 0;
+    MacWSLog(@"window-configuration ack window=%u pid=%d sequence=%u request-time=%.6f requested=%.1fx%.1f applied=%.1fx%.1f queued=%.1fx%.1f result=%@",
+             self.targetWindowID, self.targetPID, sampleSequence, timestamp,
+             requestedSize.width, requestedSize.height,
+             appliedSize.width, appliedSize.height,
+             _pendingRequestedWindowSize.width, _pendingRequestedWindowSize.height,
+             result == MacWSWindowConfigurationAckSuperseded ? @"superseded" :
+                 (result == MacWSWindowConfigurationAckApplied ? @"applied" :
+                    @"constrained"));
+    if (result == MacWSWindowConfigurationAckSuperseded) {
+        [self scheduleWindowConfiguration];
+    } else if (result == MacWSWindowConfigurationAckConstrained) {
+        // Runtime-confirmed at MacWSHost.log 1789179563.847-.866: a
+        // Terminal cell-rounded ACK arrived between native corner-drag
+        // updates. Reversing the Scene immediately armed reciprocal-configure
+        // suppression and discarded the rest of the still-moving gesture.
+        // Coalesce only reverse settlement; forward delivery stays live.
+        uint64_t serial = ++_constrainedWindowSettlementSerial;
+        uint64_t transaction = _windowConfigurationSettlementSerial;
+        uint32_t windowID = self.targetWindowID;
+        int32_t ownerPID = self.targetPID;
+        CGSize bounds = self.bounds.size;
+        CGFloat density = self.effectiveDensityScale;
+        _constrainedWindowSettlementPending = YES;
+        __weak typeof(self) weakSelf = self;
+        _deferredConstrainedWindowSettlement = ^{
+            typeof(self) self = weakSelf;
+            if (!self) return;
+            if (serial != self->_constrainedWindowSettlementSerial) return;
+            self->_constrainedWindowSettlementPending = NO;
+            if (!MacWSWindowConfigurationSettlementIsCurrent(
+                    transaction, self->_windowConfigurationSettlementSerial,
+                    windowID, self.targetWindowID, ownerPID, self.targetPID,
+                    bounds.width, bounds.height,
+                    self.bounds.size.width, self.bounds.size.height,
+                    density, self.effectiveDensityScale,
+                    self->_windowConfigurationAwaitingAcknowledgement ||
+                        self.windowConfigurationHasQueuedRequest ||
+                        self->_sceneResizeFollowingTargetWindow)) return;
+            [self.statusDelegate metalView:self
+                windowConfigurationWasConstrainedToLogicalSize:appliedSize
+                                                  requestedSize:requestedSize];
+        };
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 120 * NSEC_PER_MSEC),
+                       dispatch_get_main_queue(), ^{
+            if (serial != self->_constrainedWindowSettlementSerial) return;
+            [self completeConstrainedWindowSettlementIfIdle];
+        });
     }
 }
 
@@ -1135,10 +1284,29 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
     return _windowConfigurationAwaitingAcknowledgement;
 }
 
+- (BOOL)windowConfigurationAwaitingSettlement {
+    return _constrainedWindowSettlementPending;
+}
+
+- (BOOL)windowConfigurationHasQueuedRequest {
+    return _windowConfigurationDispatchPending &&
+        (!MacWSWindowConfigurationSizesMatch(
+            _pendingRequestedWindowSize.width, _pendingRequestedWindowSize.height,
+            _lastRequestedWindowSize.width, _lastRequestedWindowSize.height,
+            0.25) || fabs(_pendingRequestedDensityScale -
+                          _lastRequestedDensityScale) >= 0.001);
+}
+
+- (BOOL)sceneResizeFollowingTargetWindow {
+    return _sceneResizeFollowingTargetWindow;
+}
+
 - (void)beginSceneResizeFollowingTargetWindowLogicalSize:(CGSize)logicalSize {
     if (!isfinite(logicalSize.width) || !isfinite(logicalSize.height) ||
         logicalSize.width <= 0.0 || logicalSize.height <= 0.0) return;
     _sceneResizeFollowingTargetWindow = YES;
+    _sceneResizeFollowWindowID = self.targetWindowID;
+    _sceneResizeFollowOwnerPID = self.targetPID;
     _sceneResizeTargetWindowLogicalSize = logicalSize;
     // SpringBoard's app-layout transaction is asynchronous and its existing
     // postcondition witness is sampled at 1.5 seconds.  Suppress only the
@@ -1147,6 +1315,7 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
     _sceneResizeFollowDeadline = CACurrentMediaTime() + 1.8;
     _windowConfigurationSettlementSerial++;
     _windowConfigurationAwaitingAcknowledgement = NO;
+    _windowConfigurationRequestSequence = 0;
     MacWSLog(@"window-configuration scene-follow armed window=%u pid=%d target-logical=%.1fx%.1f",
              self.targetWindowID, self.targetPID,
              logicalSize.width, logicalSize.height);
@@ -1154,6 +1323,8 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
 
 - (void)cancelSceneResizeFollowingTargetWindow {
     _sceneResizeFollowingTargetWindow = NO;
+    _sceneResizeFollowWindowID = 0;
+    _sceneResizeFollowOwnerPID = 0;
     _sceneResizeTargetWindowLogicalSize = CGSizeZero;
     _sceneResizeFollowDeadline = 0.0;
 }
@@ -1173,13 +1344,13 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
     self.userInteractionEnabled = _macWSInputEnabled && !_windowTooSmall;
     if (_windowTooSmall) {
         NSString *densityName = self.displayDensity ==
-            MacWSHostDisplayDensityKeyboard ? @"更多空间" :
-            (self.displayDensity == MacWSHostDisplayDensityComfort
-                ? @"放大 +10%" : @"像素匹配 Retina");
+            MacWSHostDisplayDensityComfort150 ? @"舒适放大 150%" :
+            (self.displayDensity == MacWSHostDisplayDensityComfort125
+                ? @"舒适放大 125%" : @"像素匹配 Retina");
         _tooSmallLabel.text = [NSString stringWithFormat:
             @"窗口太小\n\n此 macOS 应用至少需要 %.0f × %.0f 点\n"
              "当前 %@ 模式需要约 %.0f × %.0f iPad 点\n\n"
-             "请放大 iPadOS 窗口，或切换到更多空间模式。",
+             "请放大 iPadOS 窗口，或切换到像素匹配模式。",
             self.minimumLogicalSize.width,
             self.minimumLogicalSize.height,
             densityName, requiredWidth, requiredHeight];
@@ -1189,44 +1360,72 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
 }
 
 - (void)scheduleWindowConfiguration {
+    // A too-small Scene still has to reach AppKit. Its real min/max/content
+    // constraints are the authority that produces the applied-size reply;
+    // the controller then moves the iPadOS Scene back to that native size.
+    // Returning merely because the warning overlay is visible strands the
+    // two window managers at different geometries indefinitely.
     if (self.targetWindowID == 0 || self.targetPID <= 1 ||
-        _windowTooSmall || self.bounds.size.width < 64 ||
+        self.bounds.size.width < 64 ||
         self.bounds.size.height < 64) return;
     CGFloat density = self.effectiveDensityScale;
-    CGSize requested = {
+    CGSize visibleLogicalSize = {
         self.bounds.size.width / density,
         self.bounds.size.height / density,
     };
+    CGSize requested = visibleLogicalSize;
+    // Per-axis AppKit policy is stronger than a transient Scene geometry.
+    // Keep a content-driven/fixed axis on the last native window dimension;
+    // the unfixed axis still follows the user's dense Stage Manager gesture.
+    // This also prevents a missed SpringBoard gesture association from ever
+    // deforming the AppKit window while the native Scene springs back.
+    if (self.targetWindowFixedWidth &&
+        _lastObservedTargetWindowLogicalSize.width > 0.0)
+        requested.width = _lastObservedTargetWindowLogicalSize.width;
+    if (self.targetWindowFixedHeight &&
+        _lastObservedTargetWindowLogicalSize.height > 0.0)
+        requested.height = _lastObservedTargetWindowLogicalSize.height;
     if (_sceneResizeFollowingTargetWindow) {
         CFTimeInterval now = CACurrentMediaTime();
+        // Runtime-confirmed Get Info collapse, 1789182049.530/.613:
+        // "scene-follow reached" preceded UIKit's real height update at
+        // .711. `requested` above had already replaced the fixed height with
+        // the AppKit target, so it could not witness Scene completion. Compare
+        // unmodified UIKit content bounds, with only Scene edge rounding.
+        // Dense proposals are exact now, not the historical 10-point grid.
+        BOOL reached = MacWSWindowSceneContentMatchesTarget(
+            self.bounds.size.width, self.bounds.size.height, density,
+            _sceneResizeTargetWindowLogicalSize.width,
+            _sceneResizeTargetWindowLogicalSize.height);
+        if (reached) {
+            // Record the geometry that AppKit itself selected so the next
+            // layout pass does not echo it back as a new configure request.
+            _lastRequestedWindowSize = requested;
+            _lastRequestedDensityScale = density;
+            MacWSLog(@"window-configuration scene-follow reached window=%u pid=%d logical=%.1fx%.1f after-deadline=%@",
+                     self.targetWindowID, self.targetPID,
+                     visibleLogicalSize.width, visibleLogicalSize.height,
+                     now > _sceneResizeFollowDeadline ? @"YES" : @"NO");
+            [self cancelSceneResizeFollowingTargetWindow];
+            return;
+        }
         if (now <= _sceneResizeFollowDeadline) {
-            BOOL reached =
-                fabs(requested.width -
-                     _sceneResizeTargetWindowLogicalSize.width) < 1.5 &&
-                fabs(requested.height -
-                     _sceneResizeTargetWindowLogicalSize.height) < 1.5;
-            if (reached) {
-                // Record the geometry that AppKit itself selected so the
-                // next layout pass does not echo it back as a new configure
-                // request. This closes the former UIKit/AppKit resize loop.
-                _lastRequestedWindowSize = requested;
-                _lastRequestedDensityScale = density;
-                MacWSLog(@"window-configuration scene-follow reached window=%u pid=%d logical=%.1fx%.1f",
-                         self.targetWindowID, self.targetPID,
-                         requested.width, requested.height);
-                [self cancelSceneResizeFollowingTargetWindow];
-            }
             return;
         }
         MacWSLog(@"window-configuration scene-follow expired window=%u pid=%d target-logical=%.1fx%.1f current-logical=%.1fx%.1f",
                  self.targetWindowID, self.targetPID,
                  _sceneResizeTargetWindowLogicalSize.width,
                  _sceneResizeTargetWindowLogicalSize.height,
-                 requested.width, requested.height);
+                 visibleLogicalSize.width, visibleLogicalSize.height);
         [self cancelSceneResizeFollowingTargetWindow];
     }
     _pendingRequestedWindowSize = requested;
     _pendingRequestedDensityScale = density;
+    if (MacWSWindowConfigurationSizesMatch(
+            requested.width, requested.height,
+            _lastRequestedWindowSize.width, _lastRequestedWindowSize.height,
+            0.25) && fabs(density - _lastRequestedDensityScale) < 0.001)
+        return;
     if (_windowConfigurationDispatchPending) return;
     _windowConfigurationDispatchPending = YES;
     // Stage Manager can report geometry on every display refresh.  Coalesce
@@ -1237,19 +1436,28 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 33 * NSEC_PER_MSEC),
                    dispatch_get_main_queue(), ^{
         self->_windowConfigurationDispatchPending = NO;
-        if (self->_windowTooSmall || self.targetPID <= 1 ||
-            self.targetWindowID == 0) return;
+        if (self.targetPID <= 1 || self.targetWindowID == 0) return;
+        // AppKit may publish its authoritative geometry after this 33-ms
+        // Scene->AppKit configure was queued but before it executes. Recheck
+        // the ownership boundary here: sending the stale, stock Scene size
+        // would resize the native window and supersede the reverse sync that
+        // has just been armed. Runtime-confirmed for Finder Get Info at
+        // MacWSHost.log 1789067847.504-1789067847.622.
+        if (self->_sceneResizeFollowingTargetWindow) {
+            MacWSLog(@"window-configuration queued-request-superseded window=%u pid=%d target-logical=%.1fx%.1f",
+                     self.targetWindowID, self.targetPID,
+                     self->_sceneResizeTargetWindowLogicalSize.width,
+                     self->_sceneResizeTargetWindowLogicalSize.height);
+            return;
+        }
         CGSize requested = self->_pendingRequestedWindowSize;
         CGFloat density = self->_pendingRequestedDensityScale;
-        if (fabs(requested.width - self->_lastRequestedWindowSize.width) < 1.0 &&
-            fabs(requested.height - self->_lastRequestedWindowSize.height) < 1.0 &&
+        if (fabs(requested.width - self->_lastRequestedWindowSize.width) < 0.25 &&
+            fabs(requested.height - self->_lastRequestedWindowSize.height) < 0.25 &&
             fabs(density - self->_lastRequestedDensityScale) < 0.001) return;
         self->_lastRequestedWindowSize = requested;
         self->_lastRequestedDensityScale = density;
         self->_windowConfigurationAwaitingAcknowledgement = YES;
-        self->_windowConfigurationSourceLogicalSize =
-            self->_lastObservedTargetWindowLogicalSize;
-        self->_windowConfigurationIssuedAt = CACurrentMediaTime();
         MacWSInputRecord record = {
             .magic = MACWS_INPUT_MAGIC,
             .version = MACWS_INPUT_VERSION,
@@ -1266,6 +1474,9 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
             .flags = MacWSInputFlagConfigureAnchorTopRight,
             .sampleSequence = ++self->_inputSampleSequence,
         };
+        self->_windowConfigurationRequestTimestamp = record.timestamp;
+        self->_windowConfigurationRequestSequence = record.sampleSequence;
+        uint64_t settlementSerial = ++self->_windowConfigurationSettlementSerial;
         [self.statusDelegate metalView:self emittedInput:record];
         // Electron restores its persisted NSWindow frame after the first
         // DisplayStream/Scene transaction. A single datagram can therefore be
@@ -1273,45 +1484,16 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
         // frame invariant at three bounded settlement points. A new Scene size,
         // density, target, or suspension changes the serial and cancels these
         // retries; this is not a periodic poll and does not touch WindowServer.
-        uint64_t settlementSerial = ++self->_windowConfigurationSettlementSerial;
-        // AppKit may legitimately keep a fixed/max-sized window unchanged.
-        // In that case no new IOSurface geometry exists to acknowledge the
-        // request. After the receiver has had one bounded main-loop interval,
-        // accept the latest catalog geometry as the application's answer and
-        // let the controller resize the native Scene to that result.
+        // Ask once for a current metrics/ACK snapshot if the event was lost.
+        // Elapsed time never upgrades an unrelated old catalog into an ACK.
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
                                      220 * NSEC_PER_MSEC),
                        dispatch_get_main_queue(), ^{
             if (self->_windowConfigurationSettlementSerial !=
                     settlementSerial ||
-                !self->_windowConfigurationAwaitingAcknowledgement ||
-                self->_windowConfigurationIssuedAt <= 0.0 ||
-                CACurrentMediaTime() - self->_windowConfigurationIssuedAt <
-                    0.20 ||
-                self->_lastObservedTargetWindowLogicalSize.width <= 0.0 ||
-                self->_lastObservedTargetWindowLogicalSize.height <= 0.0)
+                !self->_windowConfigurationAwaitingAcknowledgement)
                 return;
-            [self observeTargetWindowLogicalSize:
-                self->_lastObservedTargetWindowLogicalSize];
-            if (self->_windowConfigurationAwaitingAcknowledgement &&
-                self->_lastObservedTargetWindowLogicalSize.width > 0.0 &&
-                self->_lastObservedTargetWindowLogicalSize.height > 0.0) {
-                // The catalog can be unchanged precisely because AppKit
-                // rejected motion on both axes. This delayed sample belongs
-                // to the just-issued request even though its dimensions equal
-                // the source, so complete it explicitly.
-                CGSize applied =
-                    self->_lastObservedTargetWindowLogicalSize;
-                self->_windowConfigurationAwaitingAcknowledgement = NO;
-                self->_windowConfigurationSettlementSerial++;
-                MacWSLog(@"window-configuration fixed-result window=%u pid=%d requested=%.1fx%.1f applied=%.1fx%.1f",
-                         self.targetWindowID, self.targetPID,
-                         requested.width, requested.height,
-                         applied.width, applied.height);
-                [self.statusDelegate metalView:self
-                    windowConfigurationWasConstrainedToLogicalSize:applied
-                                                      requestedSize:requested];
-            }
+            [self->_streamClient requestWindowList];
         });
         const int64_t retryNanoseconds[] = {
             350 * NSEC_PER_MSEC,
@@ -1327,18 +1509,19 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
                 if (self->_windowConfigurationSettlementSerial !=
                         settlementSerial ||
                     !self->_windowConfigurationAwaitingAcknowledgement ||
-                    self->_windowTooSmall || self.targetPID <= 1 ||
+                    self.targetPID <= 1 ||
                     self.targetWindowID == 0 ||
+                    self.targetPID != record.targetPID ||
+                    self.targetWindowID != MacWSInputWindowIDForScene(record.sceneID) ||
                     fabs(self->_pendingRequestedWindowSize.width -
-                         requested.width) >= 1.0 ||
+                         requested.width) >= 0.25 ||
                     fabs(self->_pendingRequestedWindowSize.height -
-                         requested.height) >= 1.0 ||
+                         requested.height) >= 0.25 ||
                     fabs(self->_pendingRequestedDensityScale - density) >=
                          0.001) return;
-                MacWSInputRecord retry = record;
-                retry.timestamp = CACurrentMediaTime();
-                retry.sampleSequence = ++self->_inputSampleSequence;
-                [self.statusDelegate metalView:self emittedInput:retry];
+                // A retry is the same configuration transaction. Preserve
+                // its correlation key so a late original ACK still matches.
+                [self.statusDelegate metalView:self emittedInput:record];
             });
         }
     });
@@ -1359,8 +1542,8 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
 }
 
 - (void)updateDrawableResolution {
-    CGFloat logicalWidth = ceil(self.bounds.size.width);
-    CGFloat logicalHeight = ceil(self.bounds.size.height);
+    CGFloat logicalWidth = self.bounds.size.width;
+    CGFloat logicalHeight = self.bounds.size.height;
     if (!isfinite(logicalWidth) || !isfinite(logicalHeight) ||
         logicalWidth < 1.0 || logicalHeight < 1.0) return;
 
@@ -1379,43 +1562,50 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
     BOOL sourceNativeAvailable = !performanceResolution &&
         _surfaceFrame != nil && sourceWidth > 0 && sourceHeight > 0;
 
-    CGSize target = CGSizeMake(logicalWidth, logicalHeight);
+    CGSize target = CGSizeMake(ceil(logicalWidth), ceil(logicalHeight));
     NSString *policy = performanceResolution
         ? @"performance-logical-one-to-one"
         : @"logical-one-to-one-awaiting-source";
+    UIScreen *screen = self.window.windowScene.screen ?: UIScreen.mainScreen;
+    CGFloat displayScale = screen.scale;
+    if (!isfinite(displayScale) || displayScale < 0.5 || displayScale > 8.0)
+        displayScale = 1.0;
+    CGFloat sourceBackingScale = _surfaceFrame.descriptor.backingScale;
+    if (!isfinite(sourceBackingScale) || sourceBackingScale < 0.5 ||
+        sourceBackingScale > 8.0) sourceBackingScale = 2.0;
+    CGFloat density = self.effectiveDensityScale;
     if (sourceNativeAvailable) {
-        // Do not allocate more presentation pixels than the UIKit Scene can
-        // physically display. The normal desktop is 2388x1668 inside a
-        // 2778x1940 Scene, so this preserves every producer pixel exactly.
-        // A future oversized/external-display source is fitted once here
-        // instead of asking iPadOS to downsample another oversized drawable.
-        UIScreen *screen = self.window.windowScene.screen ?: UIScreen.mainScreen;
-        CGFloat displayScale = screen.scale;
-        if (!isfinite(displayScale) || displayScale < 1.0)
-            displayScale = self.contentScaleFactor;
-        if (!isfinite(displayScale) || displayScale < 1.0)
-            displayScale = 1.0;
-        CGFloat maximumWidth = logicalWidth * displayScale;
-        CGFloat maximumHeight = logicalHeight * displayScale;
-        CGFloat fit = fmin(1.0, fmin(maximumWidth / sourceWidth,
-                                    maximumHeight / sourceHeight));
-        if (!isfinite(fit) || fit <= 0.0) fit = 1.0;
-        target = CGSizeMake(round(sourceWidth * fit),
-                            round(sourceHeight * fit));
-        policy = self.presentationResolution ==
-                MacWSHostPresentationResolutionSourceNative
-            ? @"source-native-forced" : @"source-native-auto";
+        // Runtime-confirmed in MacWSHost.log at 1789153123.890: unchanged
+        // bounds=987x582/source=1806x1084 repeatedly produced 1693x1016,
+        // 1663x998, 1634x981, 1605x964. MTKView's contentScaleFactor followed
+        // the previous drawable width / view width, feeding each reduction
+        // into the next source fit. A first frame also stayed at half its
+        // Retina resolution (1876x1116 -> 938x558 at 1789153112.985).
+        // Use the screen's independent scale and preserve the Scene aspect
+        // ratio so a native source has the same pixel budget on every pass.
+        MacWSPresentationDrawableSize pixels = {0};
+        if (MacWSComputePresentationDrawableSize(
+                logicalWidth, logicalHeight, sourceWidth, sourceHeight,
+                sourceBackingScale, density, displayScale,
+                _streamClient.mode == MacWSStreamModeWindow, &pixels)) {
+            target = CGSizeMake(pixels.width, pixels.height);
+            policy = self.presentationResolution ==
+                    MacWSHostPresentationResolutionSourceNative
+                ? @"source-native-forced" : @"source-native-auto";
+        }
     }
     CGSize previous = self.drawableSize;
     if (fabs(previous.width - target.width) < 0.5 &&
         fabs(previous.height - target.height) < 0.5) return;
     self.drawableSize = target;
-    MacWSLog(@"host-drawable-policy bounds=%.0fx%.0f previous=%.0fx%.0f "
-             "source=%ux%u drawable=%.0fx%.0f policy=%@ "
+    MacWSLog(@"host-drawable-policy window=%u bounds=%.2fx%.2f previous=%.0fx%.0f "
+             "source=%ux%u drawable=%.0fx%.0f display-scale=%.3f "
+             "backing=%.3f density=%.3f policy=%@ "
              "fullscreen-canvas=%@",
-             self.bounds.size.width, self.bounds.size.height,
+             self.targetWindowID, self.bounds.size.width, self.bounds.size.height,
              previous.width, previous.height, sourceWidth, sourceHeight,
-             target.width, target.height, policy,
+             target.width, target.height, displayScale, sourceBackingScale,
+             density, policy,
              validatedFullscreenCanvas ? @"YES" : @"NO");
 }
 
@@ -1423,6 +1613,12 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
     // Geometry changes invalidate the view-to-surface transform immediately;
     // do not leave an old down/scroll sequence alive across rotation or a
     // Stage Manager resize.
+    if (_directTouch && MacWSHostTouchDiagnosticsEnabled()) {
+        MacWSLog(@"direct-touch lifecycle=geometry-reset window=%u contact=%u state=%u bounds=%.1fx%.1f",
+            self.targetWindowID, (uint32_t)_directTouch.hash,
+            (unsigned)_directTouchState, self.bounds.size.width,
+            self.bounds.size.height);
+    }
     if (_directTouch && _directTouchState == MacWSDirectTouchStateDragging) {
         [self emitKind:MacWSInputKindTouchCancel touch:_directTouch
                  point:[_directTouch locationInView:self]];
@@ -1463,6 +1659,11 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
 
 - (void)setMacWSInputEnabled:(BOOL)enabled reason:(NSString *)reason {
     if (!enabled && _macWSInputEnabled) {
+        if (_directTouch && MacWSHostTouchDiagnosticsEnabled()) {
+            MacWSLog(@"direct-touch lifecycle=input-disabled window=%u contact=%u state=%u reason=%@",
+                self.targetWindowID, (uint32_t)_directTouch.hash,
+                (unsigned)_directTouchState, reason ?: @"unknown");
+        }
         if (_directTouch && _directTouchState == MacWSDirectTouchStateDragging) {
             [self emitKind:MacWSInputKindTouchCancel touch:_directTouch
                      point:[_directTouch locationInView:self]];
@@ -2147,21 +2348,37 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
         _reportedFullscreenCanvasWindowID = 0;
         _reportedFullscreenCanvasPixels = CGRectZero;
     }
-    // At 1x, preserve the complete macOS window. A Scene aspect mismatch may
-    // add small margins, but must never crop title bars, traffic lights, or
-    // resize edges. This invariant also applies while AppKit is producing the
-    // replacement IOSurface during a Stage Manager or orientation resize: an
-    // old correctly proportioned frame may letterbox briefly, but is never
-    // stretched. Deliberate 1.5x/2x zoom uses the crop/pan path below.
+    // Window mode is not a video fit operation.  Keep its selected native
+    // density invariant while UIKit and AppKit publish adjacent geometry
+    // generations.  A temporarily larger Scene letterboxes the unchanged
+    // surface; a temporarily smaller Scene clips it.  Neither case shrinks or
+    // enlarges the application's pixels.  The controller concurrently asks
+    // iPadOS to settle on the matching native Scene size.  Fullscreen remains
+    // a fitted desktop, and deliberate 1.5x/2x zoom uses the crop/pan path.
     if (_viewportZoom <= 1.001 && frameWidth > 0 && frameHeight > 0 &&
         viewWidth > 0 && viewHeight > 0) {
-        CGFloat scale = MIN(viewWidth / frameWidth,
-                            viewHeight / frameHeight);
-        CGFloat fittedWidth = frameWidth * scale;
-        CGFloat fittedHeight = frameHeight * scale;
-        _contentRect = CGRectMake((viewWidth - fittedWidth) * 0.5,
-                                  (viewHeight - fittedHeight) * 0.5,
-                                  fittedWidth, fittedHeight);
+        MacWSNativePresentationRect nativeRect = {0};
+        BOOL nativeWindow = _streamClient.mode == MacWSStreamModeWindow;
+        CGFloat backingScale = _surfaceFrame.descriptor.backingScale;
+        if (!isfinite(backingScale) || backingScale < 0.5 ||
+            backingScale > 8.0) backingScale = 2.0;
+        BOOL hasNativeRect = nativeWindow &&
+            MacWSComputeNativeWindowPresentationRect(
+                frameWidth, frameHeight, backingScale,
+                self.effectiveDensityScale, viewWidth, viewHeight,
+                &nativeRect);
+        if (hasNativeRect) {
+            _contentRect = CGRectMake(nativeRect.x, nativeRect.y,
+                                      nativeRect.width, nativeRect.height);
+        } else {
+            CGFloat scale = MIN(viewWidth / frameWidth,
+                                viewHeight / frameHeight);
+            CGFloat fittedWidth = frameWidth * scale;
+            CGFloat fittedHeight = frameHeight * scale;
+            _contentRect = CGRectMake((viewWidth - fittedWidth) * 0.5,
+                                      (viewHeight - fittedHeight) * 0.5,
+                                      fittedWidth, fittedHeight);
+        }
         _visibleSourceRect = CGRectMake(0, 0, 1, 1);
         _viewportCenter = CGPointMake(0.5, 0.5);
         _viewportZoom = 1.0;
@@ -4013,7 +4230,8 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
       framePoint:(CGPoint)framePoint
         pressure:(float)pressure
        contactID:(uint32_t)contactID
-       timestamp:(NSTimeInterval)timestamp {
+       timestamp:(NSTimeInterval)timestamp
+          source:(MacWSInputSource)source {
     if (!self.isMacWSInputEnabled) return;
     MacWSInputRecord record = {
         .magic = MACWS_INPUT_MAGIC,
@@ -4028,10 +4246,20 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
         .frameWidth = [self currentFrameWidth],
         .frameHeight = [self currentFrameHeight],
         .targetPID = self.targetPID,
-        .source = MacWSInputSourceFinger,
+        .source = source,
         .sampleSequence = ++_inputSampleSequence,
     };
     [self.statusDelegate metalView:self emittedInput:record];
+}
+
+- (void)emitKind:(MacWSInputKind)kind
+      framePoint:(CGPoint)framePoint
+        pressure:(float)pressure
+       contactID:(uint32_t)contactID
+       timestamp:(NSTimeInterval)timestamp {
+    [self emitKind:kind framePoint:framePoint pressure:pressure
+         contactID:contactID timestamp:timestamp
+            source:MacWSInputSourceFinger];
 }
 
 - (BOOL)beginInteropDragProbeAtViewPoint:(CGPoint)viewPoint {
@@ -4051,9 +4279,11 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
         ((++_directTouchSerial) & 0xffu); // "DRG"
     NSTimeInterval now = CACurrentMediaTime();
     [self emitKind:MacWSInputKindTouchDown framePoint:startFrame pressure:1.0f
-         contactID:_interopDragProbeContactID timestamp:now];
+         contactID:_interopDragProbeContactID timestamp:now
+            source:MacWSInputSourceInteropDragProbe];
     [self emitKind:MacWSInputKindTouchMove framePoint:movedFrame pressure:1.0f
-         contactID:_interopDragProbeContactID timestamp:now + 0.001];
+         contactID:_interopDragProbeContactID timestamp:now + 0.001
+            source:MacWSInputSourceInteropDragProbe];
     return YES;
 }
 
@@ -4061,9 +4291,21 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
     if (!_interopDragProbeActive) return;
     [self emitKind:cancelled ? MacWSInputKindTouchCancel : MacWSInputKindTouchUp
           framePoint:_interopDragProbeFramePoint pressure:0.0f
-           contactID:_interopDragProbeContactID timestamp:CACurrentMediaTime()];
+           contactID:_interopDragProbeContactID timestamp:CACurrentMediaTime()
+              source:MacWSInputSourceInteropDragProbe];
     _interopDragProbeActive = NO;
     _interopDragProbeContactID = 0;
+}
+
+- (void)requireSecondaryTapToFailGestureRecognizer:
+        (UIGestureRecognizer *)gestureRecognizer {
+    if (!gestureRecognizer || !_secondaryTapRecognizer) return;
+    // UIKit's failure dependency is the state-machine boundary we need:
+    // lifting both fingers before the hold duration fails LongPress and then
+    // permits SecondaryTap; reaching the hold duration recognizes LongPress
+    // and permanently fails SecondaryTap for that same touch sequence.
+    [_secondaryTapRecognizer
+        requireGestureRecognizerToFail:gestureRecognizer];
 }
 
 - (void)performInteropPasteAtViewPoint:(CGPoint)viewPoint {
@@ -4255,6 +4497,7 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
     // fresh configuration transaction.
     _windowConfigurationSettlementSerial++;
     _windowConfigurationAwaitingAcknowledgement = NO;
+    _windowConfigurationRequestSequence = 0;
     uint64_t serial = ++_directTouchSerial;
     [_directTouchFeedback prepare];
     _directTouchIndicator.center = _directTouchStartPoint;
@@ -4343,6 +4586,14 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
             _directGestureBlocked = YES;
         } else if (!_directGestureBlocked && !_directTouch && touch) {
             [self beginDirectTouchCandidate:touch];
+            if (MacWSHostDiagnosticsEnabled() ||
+                MacWSHostTouchDiagnosticsEnabled()) {
+                CGPoint point = [touch locationInView:self];
+                MacWSLog(@"direct-touch lifecycle=began window=%u contact=%u point=(%.1f,%.1f) recognizers=%@",
+                    self.targetWindowID, (uint32_t)touch.hash,
+                    point.x, point.y,
+                    [self.gestureRecognizers valueForKey:@"state"]);
+            }
             if (_directTouchUsesPrimaryDrag) {
                 // Spatial canvases map one finger to the native primary-drag
                 // lifecycle immediately. Waiting for MacWS's document-scroll
@@ -4465,6 +4716,12 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
                 _directTouchState = MacWSDirectTouchStateLongPressArmed;
                 [self setDirectTouchHeld:YES dragging:NO animated:YES];
                 [_directTouchFeedback impactOccurred];
+                if (MacWSHostDiagnosticsEnabled() ||
+                    MacWSHostTouchDiagnosticsEnabled()) {
+                    MacWSLog(@"direct-touch lifecycle=armed-by-hardware-time window=%u contact=%u elapsed=%.3f travel=%.1f",
+                        self.targetWindowID, (uint32_t)_directTouch.hash,
+                        elapsed, travel);
+                }
             } else if (_directTouchState ==
                            MacWSDirectTouchStateLongPressArmed &&
                        travel >= MACWS_DIRECT_GESTURE_THRESHOLD_POINTS) {
@@ -4480,6 +4737,12 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
                 }
                 [self emitKind:MacWSInputKindTouchMove touch:_directTouch
                          point:point];
+                if (MacWSHostDiagnosticsEnabled() ||
+                    MacWSHostTouchDiagnosticsEnabled()) {
+                    MacWSLog(@"direct-touch lifecycle=dragging window=%u contact=%u elapsed=%.3f travel=%.1f",
+                        self.targetWindowID, (uint32_t)_directTouch.hash,
+                        elapsed, travel);
+                }
             } else if (_directTouchState == MacWSDirectTouchStateScrolling) {
                 CGPoint framePoint = CGPointZero;
                 if ([self framePointForViewPoint:point output:&framePoint]) {
@@ -4584,6 +4847,13 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
         }
     } else if (self.inputMode == MacWSHostInputModeDirect) {
         if (_directTouch && [touches containsObject:_directTouch]) {
+            if (MacWSHostDiagnosticsEnabled() ||
+                MacWSHostTouchDiagnosticsEnabled()) {
+                MacWSLog(@"direct-touch lifecycle=ended window=%u contact=%u state=%u recognizers=%@",
+                    self.targetWindowID, (uint32_t)_directTouch.hash,
+                    (unsigned)_directTouchState,
+                    [self.gestureRecognizers valueForKey:@"state"]);
+            }
             CGPoint point = [_directTouch locationInView:self];
             NSTimeInterval elapsed =
                 _directTouch.timestamp - _directTouchStartTimestamp;
@@ -4606,6 +4876,13 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
                              touch:_directTouch point:point];
                     [_directTouchFeedback impactOccurred];
                 } else if (decision == MacWSTouchCandidateDecisionTap) {
+                    // Report the already-classified physical tap directly.
+                    // A second one-finger UITapGestureRecognizer used only to
+                    // remember this point stayed Possible throughout a long
+                    // press and participated in UIKit arbitration before the
+                    // raw touch could become an AppKit file drag.
+                    [self.statusDelegate metalView:self
+                        completedDirectTapAtViewPoint:point];
                     BOOL doubleTap = _directTouch.tapCount >= 2 ||
                         MacWSIsDirectDoubleTap(
                             _lastDirectTapTimestamp, _directTouch.timestamp,
@@ -4775,6 +5052,13 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
             [self emitTouches:touches kind:MacWSInputKindTouchCancel];
     } else if (self.inputMode == MacWSHostInputModeDirect) {
         if (_directTouch && [touches containsObject:_directTouch]) {
+            if (MacWSHostDiagnosticsEnabled() ||
+                MacWSHostTouchDiagnosticsEnabled()) {
+                MacWSLog(@"direct-touch lifecycle=cancelled window=%u contact=%u state=%u recognizers=%@",
+                    self.targetWindowID, (uint32_t)_directTouch.hash,
+                    (unsigned)_directTouchState,
+                    [self.gestureRecognizers valueForKey:@"state"]);
+            }
             if (_directTouchState == MacWSDirectTouchStateDragging) {
                 [self emitKind:MacWSInputKindTouchCancel touch:_directTouch
                          point:[_directTouch locationInView:self]];
@@ -5840,6 +6124,7 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
 - (void)streamClient:(MacWSStreamClient *)client
       receivedWindows:(NSArray<MacWSStreamWindow *> *)windows {
     (void)client;
+    ++_windowCatalogRevision;
     _latestWindows = [windows copy];
     NSMutableSet<NSNumber *> *spatialCanvasPIDs = [NSMutableSet set];
     NSMutableSet<NSNumber *> *fullscreenCanvasPIDs =
@@ -6067,7 +6352,9 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
         _lastKeyboardFrameHeight = frame.descriptor.contentHeight;
     }
     _streamConnected = YES;
-    if (_windowConfigurationAwaitingAcknowledgement &&
+    if (!self.windowConfigurationAcknowledgementsAvailable &&
+        _windowConfigurationAwaitingAcknowledgement &&
+        !self.windowConfigurationHasQueuedRequest &&
         self.targetWindowID != 0 &&
         frame.descriptor.windowID == self.targetWindowID &&
         frame.descriptor.backingScale > 0.0f) {
@@ -6075,13 +6362,14 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
             frame.descriptor.contentWidth / frame.descriptor.backingScale,
             frame.descriptor.contentHeight / frame.descriptor.backingScale,
         };
-        if (fabs(applied.width - _pendingRequestedWindowSize.width) < 1.0 &&
-            fabs(applied.height - _pendingRequestedWindowSize.height) < 1.0) {
-            // The DisplayStream IOSurface is the visible downstream
-            // postcondition of AppKit accepting ConfigureWindow. Stop all
-            // remaining retries as soon as that exact size lands.
+        if (fabs(applied.width - _lastRequestedWindowSize.width) < 0.75 &&
+            fabs(applied.height - _lastRequestedWindowSize.height) < 0.75) {
+            // Compatibility with an old producer: a matching IOSurface can
+            // establish convergence, but a different size is not a rejection
+            // of this request. New producers use the explicit configure ACK.
             _windowConfigurationAwaitingAcknowledgement = NO;
             _windowConfigurationSettlementSerial++;
+            _windowConfigurationRequestSequence = 0;
         }
     }
     if (!previous) {

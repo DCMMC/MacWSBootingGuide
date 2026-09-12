@@ -79,9 +79,7 @@ NSUInteger MacWSIOSurfaceReadOnlyTextureAlignment(
 }
 
 CGFloat MacWSDensityModeFactor(MacWSHostDisplayDensity density) {
-    if (density == MacWSHostDisplayDensityKeyboard) return 0.85;
-    if (density == MacWSHostDisplayDensityComfort) return 1.10;
-    return 1.0;
+    return MacWSDisplayDensityFactor(density);
 }
 
 BOOL MacWSSendInputRecord(const MacWSInputRecord *record, int *errorOut) {

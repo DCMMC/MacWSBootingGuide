@@ -7685,7 +7685,7 @@ static BOOL macws_vnc_pointer_proxy_record_valid(
         (record->flags & MacWSInputFlagGlobalSystemSurface) == 0 ||
         MacWSInputWindowIDForScene(record->sceneID) != 0 ||
         record->source == MacWSInputSourceVNC ||
-        record->source > MacWSInputSourceVNC ||
+        record->source > MacWSInputSourceMax ||
         record->frameWidth == 0 || record->frameHeight == 0 ||
         !isfinite(record->x) || !isfinite(record->y) ||
         record->x < 0.0f || record->y < 0.0f ||

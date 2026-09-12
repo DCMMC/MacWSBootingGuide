@@ -3,23 +3,32 @@
 @import Darwin;
 
 #import <objc/message.h>
+#import <objc/runtime.h>
 
 #include <dlfcn.h>
 #include <fcntl.h>
 #include <math.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #include <unistd.h>
+#include <notify.h>
+#include "../include/macws_resize_gesture.h"
 
 // Source-confirmed against TrollPad 1.3 and RE-confirmed against the target
 // iPadOS 16.3.1 SpringBoard: SBSwitcherChamoisLayoutAttributes stores the
-// width/height candidate arrays consumed by
-// _nearestGridSizeForSize:gridWidths:gridHeights:bounds:.  Keep the system's
-// original maximum and every original candidate, then add 10-point
-// intermediates beginning at TrollPad's source-confirmed 150-point floor.
-// Final Scene geometry still goes through SpringBoard's ordinary nearest-grid
-// and bounds validation; no UIWindow transform or validation bypass is
-// involved.  The lower floor is needed for utility panels whose real AppKit
-// content size is smaller than iPadOS's stock Stage Manager presets.
+// width/height candidate arrays consumed by SBDisplayItemLayoutGrid.  Keep the
+// system's original maximum and every original candidate, add modest 10-point
+// fallback intermediates beginning at TrollPad's source-confirmed 150-point
+// floor, and add the exact size proposed by the current Host transaction.
+//
+// The grid getters are expanded only while the real
+// SBItemResizeGestureSwitcherModifier is synchronously resolving the selected
+// com.macwsguide.host item.  Every setter stores Apple's untouched arrays and
+// every non-Host lookup returns them untouched, so ordinary iPadOS apps retain
+// their stock size presets. Final Scene geometry still goes through
+// SpringBoard's nearest-grid, bounds and transition validation; no UIWindow
+// transform or validation bypass is involved.
 
 static const char *const MacWSDenseGridDisabled =
     "/var/mobile/Library/Preferences/com.macwsguide.dense-grid.disabled";
@@ -29,6 +38,8 @@ static CFStringRef const MacWSRequestFullscreenNotification =
     CFSTR("com.macwsguide.windowing.request-fullscreen");
 static CFStringRef const MacWSRequestResizeNotification =
     CFSTR("com.macwsguide.windowing.request-resize");
+static CFStringRef const MacWSRequestInitialSizeNotification =
+    CFSTR("com.macwsguide.windowing.request-initial-size");
 static const char *const MacWSWindowingLog =
     "/var/mobile/Library/Logs/MacWSWindowing.log";
 static NSString *const MacWSResizeRequestDirectory =
@@ -37,8 +48,57 @@ static NSString *const MacWSFullscreenRequestPrefix =
     @"com.macwsguide.windowing.fullscreen-request.";
 static NSString *const MacWSResizeRequestPrefix =
     @"com.macwsguide.windowing.resize-request.";
+static NSString *const MacWSInitialSizeRequestPrefix =
+    @"com.macwsguide.windowing.initial-size-request.";
 static NSMutableSet<NSString *> *MacWSFullscreenRequestsInFlight;
 static NSMutableSet<NSString *> *MacWSResizeRequestsInFlight;
+// Scene resize requests can be produced faster than SpringBoard completes an
+// app-layout transition.  Keep one latest nonce per exact FBS Scene so an old
+// retry or an arbitrary directory enumeration order can never overwrite a
+// newer AppKit geometry.
+static NSMutableDictionary<NSString *, NSString *> *
+    MacWSLatestResizeNonceByScene;
+// Exact per-Scene AppKit sizing policy published by MacWSHost. This remains
+// inside SpringBoard so the real Stage Manager resize gesture can quantize or
+// spring back before it submits geometry to the application. Keys are FBS
+// Scene identifiers, never bundle-wide policy.
+static NSMutableDictionary<NSString *, NSDictionary *> *
+    MacWSResizePolicyByScene;
+// Last authoritative exact size for each Host Scene. SpringBoard may create a
+// replacement SBAppLayout whose attributes have already been re-quantized
+// while adding/removing another window; keeping the prior per-Scene value
+// prevents that derived layout from becoming the new source of truth. The
+// value is updated only by a Host resize request, a real Host resize gesture,
+// or the first observed model after this SpringBoard generation starts.
+static NSMutableDictionary<NSString *, NSValue *> *
+    MacWSStableModelSizeByScene;
+// SpringBoard's gesture modifier and layout-grid calls are synchronous on its
+// main thread.  This unsafe reference is live only inside handleGestureEvent:
+// and is restored before that method returns.
+static __unsafe_unretained id MacWSActiveResizeGestureModifier;
+static __unsafe_unretained NSDictionary *MacWSActiveDenseGridPolicy;
+// Exact proposal for the currently executing Host-only layout-grid lookup.
+// Adding this one width and height to Apple's candidates makes the interaction
+// effectively continuous without materializing a million-entry 1pt Cartesian
+// grid. It is saved/restored on the same synchronous SpringBoard main-thread
+// stack as the policy and is never populated for a stock application.
+static CGSize MacWSActiveDenseGridProposal;
+static NSUInteger MacWSDenseGridScopeDepth;
+// A frame calculation may first calculate the entire stage, then recurse
+// through a different (lower) selector for each item. A synchronous call stack
+// is therefore NOT an item-identity boundary. The group scope carries no item
+// policy; only the lower per-item frame scope may apply a Scene's fixed axes.
+// RE-confirmed: SpringBoard 20D67 auto-layout at 0x1c78b50d0 computes the stage
+// maximum at 0x1c78b527c and calls the per-item method at 0x1c78b5408/590c.
+static NSUInteger MacWSGroupLayoutScopeDepth;
+static __unsafe_unretained id MacWSGroupResizeGestureModifier;
+static NSUInteger MacWSItemLayoutScopeDepth;
+static NSString *MacWSActiveLayoutSceneIdentifier;
+static NSUInteger MacWSInitialLayoutScopeDepth;
+static BOOL MacWSInitialGridObserved;
+static char MacWSLayoutGridLastHostScopeAssociationKey;
+static char MacWSLayoutGridHostPolicyAssociationKey;
+static char MacWSResizeGestureNotificationKey;
 
 // RE-confirmed via SpringBoard 16.3.1
 // -[SBItemResizeGestureSwitcherModifier
@@ -101,9 +161,302 @@ static NSInteger MacWSMessageIntegerWithObject(id receiver, SEL selector,
         receiver, selector, object);
 }
 
+// Runtime-confirmed on the target SpringBoard (2026-09-10):
+// SBItemResizeGestureSwitcherModifier owns `_currentAppLayout` at +120 and
+// `_selectedLayoutRole` at +128, and exposes -selectedAppLayout. Resolve the
+// item through the layout's real role map so multi-window/multi-item layouts
+// do not inherit another item's sizing policy.
+static id MacWSResizeModifierSelectedItem(id modifier) {
+    if (!modifier) return nil;
+    id appLayout = MacWSMessageObject(
+        modifier, NSSelectorFromString(@"selectedAppLayout"));
+    Class modifierClass = object_getClass(modifier);
+    Ivar roleIvar = modifierClass
+        ? class_getInstanceVariable(modifierClass, "_selectedLayoutRole")
+        : NULL;
+    if (!appLayout || !roleIvar) return nil;
+    NSInteger selectedRole = *(NSInteger *)(
+        (uint8_t *)(__bridge void *)modifier + ivar_getOffset(roleIvar));
+    NSArray *items = MacWSMessageObject(
+        appLayout, NSSelectorFromString(@"allItems"));
+    SEL roleSelector = NSSelectorFromString(@"layoutRoleForItem:");
+    for (id item in items) {
+        if (MacWSMessageIntegerWithObject(
+                appLayout, roleSelector, item) != selectedRole) continue;
+        return item;
+    }
+    return nil;
+}
+
+static BOOL MacWSResizeModifierTargetsHost(id modifier) {
+    id item = MacWSResizeModifierSelectedItem(modifier);
+    NSString *bundleIdentifier = MacWSMessageObject(
+        item, NSSelectorFromString(@"bundleIdentifier"));
+    return [bundleIdentifier isEqualToString:@"com.macwsguide.host"];
+}
+
+static NSDictionary *MacWSResizePolicyForModifier(id modifier) {
+    id item = MacWSResizeModifierSelectedItem(modifier);
+    NSString *bundleIdentifier = MacWSMessageObject(
+        item, NSSelectorFromString(@"bundleIdentifier"));
+    if (![bundleIdentifier isEqualToString:@"com.macwsguide.host"])
+        return nil;
+    NSString *sceneIdentifier = MacWSMessageObject(
+        item, NSSelectorFromString(@"uniqueIdentifier"));
+    return sceneIdentifier.length ? MacWSResizePolicyByScene[sceneIdentifier]
+                                  : nil;
+}
+
+static void MacWSPublishResizeGestureState(id modifier, BOOL active) {
+    NSDictionary *registration = objc_getAssociatedObject(
+        modifier, &MacWSResizeGestureNotificationKey);
+    if (active && registration) return;
+    if (!active && !registration) return;
+    if (!registration) {
+        id item = MacWSResizeModifierSelectedItem(modifier);
+        if (![MacWSMessageObject(item, NSSelectorFromString(@"bundleIdentifier"))
+                isEqualToString:@"com.macwsguide.host"]) return;
+        NSString *scene = MacWSMessageObject(item, NSSelectorFromString(@"uniqueIdentifier"));
+        if (!scene.length) return;
+        NSString *name = [@MACWS_RESIZE_GESTURE_NOTIFICATION_PREFIX stringByAppendingString:scene];
+        int token = 0;
+        uint32_t status = notify_register_check(name.UTF8String, &token);
+        if (status != NOTIFY_STATUS_OK) {
+            MacWSWindowingLogLine([NSString stringWithFormat:
+                @"resize-gesture registration-failed scene=%@ status=%u", scene, status]);
+            return;
+        }
+        registration = @{@"name": name, @"scene": scene, @"token": @(token)};
+        objc_setAssociatedObject(modifier, &MacWSResizeGestureNotificationKey,
+            registration, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    int token = [registration[@"token"] intValue];
+    uint32_t status = notify_set_state(token, MacWSResizeGestureState(getpid(), active));
+    if (status == NOTIFY_STATUS_OK)
+        status = notify_post([registration[@"name"] UTF8String]);
+    MacWSWindowingLogLine([NSString stringWithFormat:
+        @"resize-gesture scene=%@ active=%@ writer=%d status=%u",
+        registration[@"scene"], active ? @"YES" : @"NO", getpid(), status]);
+    if (!active) {
+        notify_cancel(token);
+        objc_setAssociatedObject(modifier, &MacWSResizeGestureNotificationKey,
+            nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+}
+
+static id MacWSResizeModifierLayoutGrid(id modifier) {
+    if (!modifier) return nil;
+    Ivar gridIvar = class_getInstanceVariable(
+        object_getClass(modifier), "_layoutGrid");
+    return gridIvar ? object_getIvar(modifier, gridIvar) : nil;
+}
+
+// RE-confirmed via the target SpringBoard text at image offsets
+// 0x31bbac..0x31be00: -[SBDisplayItemLayoutAttributesCalculator
+// frameForLayoutRole:inAppLayout:containerOrientation:windowScene:] receives
+// the queried layout role in x2 and the immutable SBAppLayout in x3, then
+// synchronously calls the frame/grid calculator at 0x31bd9c. Resolve the item
+// with that exact role instead of treating any Host item in a multi-item
+// layout as the new Scene.
+static id MacWSAppLayoutItemForRole(id appLayout, NSInteger layoutRole) {
+    NSArray *items = MacWSMessageObject(
+        appLayout, NSSelectorFromString(@"allItems"));
+    SEL roleSelector = NSSelectorFromString(@"layoutRoleForItem:");
+    if (![items isKindOfClass:NSArray.class] ||
+        ![appLayout respondsToSelector:roleSelector]) return nil;
+    for (id item in items) {
+        if (MacWSMessageIntegerWithObject(
+                appLayout, roleSelector, item) == layoutRole)
+            return item;
+    }
+    return nil;
+}
+
 static BOOL MacWSMessageBool(id receiver, SEL selector) {
     if (!receiver || ![receiver respondsToSelector:selector]) return NO;
     return ((BOOL (*)(id, SEL))objc_msgSend)(receiver, selector);
+}
+
+static MacWSDisplayItemAttributedSize MacWSAttributedSizeForAttributes(
+        id attributes, SEL selector) {
+    MacWSDisplayItemAttributedSize value = {0};
+    if ([attributes respondsToSelector:selector]) {
+        value = ((MacWSDisplayItemAttributedSize (*)(id, SEL))objc_msgSend)(
+            attributes, selector);
+    }
+    return value;
+}
+
+static BOOL MacWSAttributedSizeIsUnspecified(
+        MacWSDisplayItemAttributedSize value) {
+    for (NSUInteger index = 0; index < 7; index++) {
+        if (value.words[index] != 0) return NO;
+    }
+    return YES;
+}
+
+static BOOL MacWSStableModelSize(NSString *sceneIdentifier, CGSize *sizeOut) {
+    if (!sceneIdentifier.length || !sizeOut) return NO;
+    NSValue *value = MacWSStableModelSizeByScene[sceneIdentifier];
+    if (!value) return NO;
+    CGSize size = value.CGSizeValue;
+    if (!isfinite(size.width) || !isfinite(size.height) ||
+        size.width < 150.0 || size.height < 150.0 ||
+        size.width > 4096.0 || size.height > 4096.0) return NO;
+    *sizeOut = size;
+    return YES;
+}
+
+static void MacWSSetStableModelSize(NSString *sceneIdentifier, CGSize size) {
+    if (!sceneIdentifier.length ||
+        !isfinite(size.width) || !isfinite(size.height) ||
+        size.width < 150.0 || size.height < 150.0 ||
+        size.width > 4096.0 || size.height > 4096.0) return;
+    if (!MacWSStableModelSizeByScene)
+        MacWSStableModelSizeByScene = [NSMutableDictionary dictionary];
+    MacWSStableModelSizeByScene[sceneIdentifier] = [NSValue valueWithCGSize:size];
+}
+
+// Runtime-confirmed at MacWSWindowing.log 1789059115.823 and again during
+// the v38 multi-Scene trace at 1789142611.835: the immutable
+// SBDisplayItemLayoutAttributes object retains the existing Scene's exact
+// 445x573 model size even while the native role-2 frame calculation tries to
+// place it at the stock 327x603 grid size.  Ask the object's own decoded-size
+// accessor for that model value; do not infer fields from the opaque
+// SBDisplayItemAttributedSize representation.
+static BOOL MacWSResolvedLayoutAttributesSize(id attributes,
+                                               CGRect containerBounds,
+                                               CGSize defaultWindowSize,
+                                               CGFloat screenEdgePadding,
+                                               CGSize *sizeOut) {
+    if (!attributes || !sizeOut) return NO;
+    SEL sizeSelector = NSSelectorFromString(
+        @"sizeInBounds:defaultSize:screenEdgePadding:");
+    if (CGRectIsEmpty(containerBounds) ||
+        CGSizeEqualToSize(defaultWindowSize, CGSizeZero) ||
+        ![attributes respondsToSelector:sizeSelector]) return NO;
+    CGSize size = ((CGSize (*)(id, SEL, CGRect, CGSize, CGFloat))objc_msgSend)(
+        attributes, sizeSelector, containerBounds, defaultWindowSize,
+        screenEdgePadding);
+    if (!isfinite(size.width) || !isfinite(size.height) ||
+        size.width < 150.0 || size.height < 150.0 ||
+        size.width > 4096.0 || size.height > 4096.0) return NO;
+    *sizeOut = size;
+    return YES;
+}
+
+static NSString *MacWSMethodInventory(Class cls, NSArray<NSString *> *needles) {
+    if (!cls) return @"class-missing";
+    unsigned int count = 0;
+    Method *methods = class_copyMethodList(cls, &count);
+    NSMutableArray<NSString *> *names = [NSMutableArray array];
+    for (unsigned int index = 0; index < count; index++) {
+        NSString *name = NSStringFromSelector(method_getName(methods[index]));
+        BOOL matches = NO;
+        for (NSString *needle in needles) {
+            if ([name rangeOfString:needle options:NSCaseInsensitiveSearch]
+                    .location != NSNotFound) {
+                matches = YES;
+                break;
+            }
+        }
+        if (matches) [names addObject:[NSString stringWithFormat:@"%@:%s",
+            name, method_getTypeEncoding(methods[index]) ?: "?"]];
+    }
+    free(methods);
+    return [names componentsJoinedByString:@" | "];
+}
+
+static NSDictionary *MacWSClaimInitialSizePolicy(id displayItem,
+                                                  BOOL allowNewClaim,
+                                                  NSString **pathOut) {
+    NSString *bundleIdentifier = MacWSMessageObject(
+        displayItem, NSSelectorFromString(@"bundleIdentifier"));
+    NSString *sceneIdentifier = MacWSMessageObject(
+        displayItem, NSSelectorFromString(@"uniqueIdentifier"));
+    if (![bundleIdentifier isEqualToString:@"com.macwsguide.host"] ||
+        sceneIdentifier.length == 0)
+        return nil;
+
+    NSDictionary *existing = MacWSResizePolicyByScene[sceneIdentifier];
+    NSTimeInterval existingAge = NSDate.date.timeIntervalSince1970 -
+        [existing[@"initial_claimed_at"] doubleValue];
+    if (existing && isfinite(existingAge) && existingAge >= 0.0 &&
+        existingAge <= 3.0)
+        return existing;
+    if (!allowNewClaim) return nil;
+
+    NSArray<NSString *> *names = [[NSFileManager defaultManager]
+        contentsOfDirectoryAtPath:MacWSResizeRequestDirectory error:nil];
+    NSDictionary *winner = nil;
+    NSString *winnerPath = nil;
+    NSTimeInterval winnerIssued = DBL_MAX;
+    NSTimeInterval now = NSDate.date.timeIntervalSince1970;
+    for (NSString *name in names) {
+        if (![name hasPrefix:MacWSInitialSizeRequestPrefix] ||
+            ![name hasSuffix:@".plist"]) continue;
+        NSString *path = [MacWSResizeRequestDirectory
+            stringByAppendingPathComponent:name];
+        NSDictionary *request =
+            [NSDictionary dictionaryWithContentsOfFile:path];
+        NSTimeInterval issued = [request[@"issued_at"] doubleValue];
+        NSTimeInterval age = now - issued;
+        CGFloat width = [request[@"target_width"] doubleValue];
+        CGFloat height = [request[@"target_height"] doubleValue];
+        CGFloat minimumWidth = [request[@"minimum_width"] doubleValue];
+        CGFloat minimumHeight = [request[@"minimum_height"] doubleValue];
+        CGFloat maximumWidth = [request[@"maximum_width"] doubleValue];
+        CGFloat maximumHeight = [request[@"maximum_height"] doubleValue];
+        BOOL valid = [request isKindOfClass:NSDictionary.class] &&
+            [request[@"bundle_identifier"]
+                isEqualToString:@"com.macwsguide.host"] &&
+            [request[@"activation_nonce"] isKindOfClass:NSString.class] &&
+            [request[@"activation_nonce"] length] > 0 &&
+            isfinite(age) && age >= -2.0 && age <= 10.0 &&
+            isfinite(width) && isfinite(height) &&
+            isfinite(minimumWidth) && isfinite(minimumHeight) &&
+            width >= 150.0 && height >= 150.0 &&
+            width <= 4096.0 && height <= 4096.0 &&
+            minimumWidth >= 150.0 && minimumHeight >= 150.0 &&
+            minimumWidth <= width && minimumHeight <= height &&
+            isfinite(maximumWidth) && isfinite(maximumHeight) &&
+            maximumWidth >= 0.0 && maximumHeight >= 0.0 &&
+            maximumWidth <= 4096.0 && maximumHeight <= 4096.0 &&
+            (maximumWidth == 0.0 || maximumWidth >= minimumWidth) &&
+            (maximumHeight == 0.0 || maximumHeight >= minimumHeight);
+        if (!valid) {
+            // A malformed or expired activation request must never attach to a
+            // later Host Scene merely because the bundle identifier matches.
+            [[NSFileManager defaultManager] removeItemAtPath:path error:nil];
+            MacWSWindowingLogLine([NSString stringWithFormat:
+                @"initial-size discarded path=%@ age=%.3f",
+                name, age]);
+            continue;
+        }
+        // THEORY, bounded by the runtime postcondition: activation calls are
+        // issued on Host's main queue, so the oldest unconsumed request should
+        // correspond to SpringBoard's next new Host display item.  A mismatch
+        // is detected from the concrete Scene bounds and falls back to the
+        // exact-scene transaction rather than being treated as success.
+        if (!winner || issued < winnerIssued) {
+            winner = request;
+            winnerPath = path;
+            winnerIssued = issued;
+        }
+    }
+    if (!winner) return nil;
+
+    NSMutableDictionary *policy = [winner mutableCopy];
+    policy[@"scene_identifier"] = sceneIdentifier;
+    policy[@"initial_claimed_at"] = @(now);
+    if (!MacWSResizePolicyByScene)
+        MacWSResizePolicyByScene = [NSMutableDictionary dictionary];
+    MacWSResizePolicyByScene[sceneIdentifier] = policy;
+    MacWSSetStableModelSize(sceneIdentifier, CGSizeMake(
+        [policy[@"target_width"] doubleValue],
+        [policy[@"target_height"] doubleValue]));
+    if (pathOut) *pathOut = winnerPath;
+    return policy;
 }
 
 static void MacWSMessageToggleMaximization(id receiver) {
@@ -449,52 +802,217 @@ static void MacWSFinishResizeRequest(NSString *path, NSString *message) {
     [MacWSResizeRequestsInFlight removeObject:path];
 }
 
+static void MacWSApplyResizeRequest(NSDictionary *request, NSString *path,
+                                    NSUInteger attempt);
+
+static NSArray *MacWSAppLayoutItemIdentifiers(id layout) {
+    NSMutableArray *identifiers = [NSMutableArray array];
+    for (id item in MacWSMessageObject(layout, NSSelectorFromString(@"allItems"))) {
+        id identifier = MacWSMessageObject(item, NSSelectorFromString(@"uniqueIdentifier"));
+        if ([identifier isKindOfClass:NSString.class])
+            [identifiers addObject:identifier];
+    }
+    return identifiers;
+}
+
+static BOOL MacWSResizePreservesAppLayoutSiblings(id originalLayout,
+                                                 id resizedLayout,
+                                                 id resizedItem) {
+    NSArray *originalItems = MacWSMessageObject(
+        originalLayout, NSSelectorFromString(@"allItems"));
+    NSArray *resizedItems = MacWSMessageObject(
+        resizedLayout, NSSelectorFromString(@"allItems"));
+    if (!originalItems.count || originalItems.count != resizedItems.count ||
+        ![[NSSet setWithArray:originalItems]
+            isEqualToSet:[NSSet setWithArray:resizedItems]]) return NO;
+    for (id item in originalItems) {
+        if (MacWSMessageIntegerWithObject(originalLayout,
+                NSSelectorFromString(@"layoutRoleForItem:"), item) !=
+            MacWSMessageIntegerWithObject(resizedLayout,
+                NSSelectorFromString(@"layoutRoleForItem:"), item)) return NO;
+        if ([item isEqual:resizedItem]) continue;
+        id originalAttributes = ((id (*)(id, SEL, id))objc_msgSend)(
+            originalLayout, NSSelectorFromString(@"layoutAttributesForItem:"), item);
+        id resizedAttributes = ((id (*)(id, SEL, id))objc_msgSend)(
+            resizedLayout, NSSelectorFromString(@"layoutAttributesForItem:"), item);
+        if (![originalAttributes isEqual:resizedAttributes]) return NO;
+    }
+    return YES;
+}
+
 static void MacWSVerifyResizePostcondition(id coordinator,
+                                           id contentController,
+                                           id switcherController,
+                                           NSArray *expectedStageItems,
                                            NSString *bundleIdentifier,
                                            NSString *sceneIdentifier,
-                                           BOOL expectedWindowedRole) {
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 1200 * NSEC_PER_MSEC),
+                                           CGSize expectedSize,
+                                           BOOL expectedWindowedRole,
+                                           NSDictionary *request,
+                                           NSString *path,
+                                           NSUInteger transactionAttempt,
+                                           NSUInteger sample) {
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 100 * NSEC_PER_MSEC),
                    dispatch_get_main_queue(), ^{
-        NSArray *appLayouts = MacWSMessageObject(
-            coordinator, NSSelectorFromString(@"recentAppLayouts"));
-        id actualLayout = nil;
-        id actualItem = nil;
-        for (id layout in appLayouts) {
-            for (id item in MacWSMessageObject(
-                     layout, NSSelectorFromString(@"allItems"))) {
-                NSString *candidateBundle = MacWSMessageObject(
-                    item, NSSelectorFromString(@"bundleIdentifier"));
-                NSString *candidateIdentifier = MacWSMessageObject(
-                    item, NSSelectorFromString(@"uniqueIdentifier"));
-                if ([candidateBundle isEqualToString:bundleIdentifier] &&
-                    [candidateIdentifier isEqualToString:sceneIdentifier]) {
-                    actualLayout = layout;
-                    actualItem = item;
-                    break;
-                }
-            }
-            if (actualItem) break;
+        NSString *latestNonce =
+            MacWSLatestResizeNonceByScene[sceneIdentifier];
+        if (![latestNonce isEqualToString:request[@"nonce"]]) {
+            MacWSFinishResizeRequest(path, [NSString stringWithFormat:
+                @"resize-postcondition scene=%@ landed=NO reason=superseded",
+                sceneIdentifier]);
+            return;
         }
-        NSInteger actualRole = MacWSMessageIntegerWithObject(
-            actualLayout, NSSelectorFromString(@"layoutRoleForItem:"),
-            actualItem);
-        NSInteger actualCenter = MacWSMessageInteger(
-            actualLayout, NSSelectorFromString(@"centerConfiguration"));
-        NSInteger actualEnvironment = MacWSMessageInteger(
-            actualLayout, NSSelectorFromString(@"environment"));
+        id chamoisAttributes = MacWSMessageObject(
+            contentController,
+            NSSelectorFromString(@"chamoisLayoutAttributes"));
+        CGRect containerBounds = MacWSMessageRect(
+            contentController, NSSelectorFromString(@"containerViewBounds"));
+        CGSize defaultWindowSize = MacWSMessageSize(
+            chamoisAttributes, NSSelectorFromString(@"defaultWindowSize"));
+        CGFloat screenEdgePadding = MacWSMessageFloat(
+            chamoisAttributes, NSSelectorFromString(@"screenEdgePadding"));
+        SEL sizeSelector = NSSelectorFromString(
+            @"sizeInBounds:defaultSize:screenEdgePadding:");
+        BOOL sizeAPIReady = !CGRectIsEmpty(containerBounds) &&
+            !CGSizeEqualToSize(defaultWindowSize, CGSizeZero);
         NSInteger *centerRoleAddress = (NSInteger *)dlsym(
             RTLD_DEFAULT, "SBLayoutRoleCenter");
-        BOOL landed = actualLayout && actualItem;
+        NSMutableArray *candidateLayouts = [NSMutableArray array];
+        id currentLayout = MacWSMessageObject(
+            switcherController, NSSelectorFromString(@"_currentMainAppLayout"));
+        if (!expectedWindowedRole) {
+            // Observe the actual current stage, not whichever stale recent
+            // or leaf model happens to match the requested dimensions.
+            if (!MacWSAppLayoutExactSceneItem(currentLayout, bundleIdentifier,
+                                             sceneIdentifier)) {
+                MacWSFinishResizeRequest(path, [NSString stringWithFormat:
+                    @"resize-postcondition scene=%@ landed=NO reason=left-current-stage current-items=%@",
+                    sceneIdentifier, MacWSAppLayoutItemIdentifiers(currentLayout)]);
+                return;
+            }
+            [candidateLayouts addObject:currentLayout];
+        } else {
+        for (NSString *selectorName in @[
+                 @"leafAppLayoutForKeyboardFocusedScene",
+                 @"keyboardFocusedAppLayout"]) {
+            id candidate = MacWSMessageObject(
+                contentController, NSSelectorFromString(selectorName));
+            if (candidate && ![candidateLayouts containsObject:candidate])
+                [candidateLayouts addObject:candidate];
+        }
+        NSArray *appLayouts = MacWSMessageObject(
+            coordinator, NSSelectorFromString(@"recentAppLayouts"));
+        for (id candidate in appLayouts) {
+            if (candidate && ![candidateLayouts containsObject:candidate])
+                [candidateLayouts addObject:candidate];
+        }
+        }
+        id actualLayout = nil;
+        id actualItem = nil;
+        NSInteger actualRole = 0;
+        NSInteger actualCenter = 0;
+        NSInteger actualEnvironment = 0;
+        CGSize actualSize = CGSizeZero;
+        BOOL sizeAvailable = NO;
+        NSInteger bestScore = NSIntegerMin;
+        for (id candidateLayout in candidateLayouts) {
+            id candidateItem = MacWSAppLayoutExactSceneItem(
+                candidateLayout, bundleIdentifier, sceneIdentifier);
+            if (!candidateItem) continue;
+            NSInteger candidateRole = MacWSMessageIntegerWithObject(
+                candidateLayout, NSSelectorFromString(@"layoutRoleForItem:"),
+                candidateItem);
+            NSInteger candidateCenter = MacWSMessageInteger(
+                candidateLayout, NSSelectorFromString(@"centerConfiguration"));
+            NSInteger candidateEnvironment = MacWSMessageInteger(
+                candidateLayout, NSSelectorFromString(@"environment"));
+            id candidateAttributes = ((id (*)(id, SEL, id))objc_msgSend)(
+                candidateLayout,
+                NSSelectorFromString(@"layoutAttributesForItem:"),
+                candidateItem);
+            BOOL candidateSizeAvailable = sizeAPIReady &&
+                [candidateAttributes respondsToSelector:sizeSelector];
+            CGSize candidateSize = CGSizeZero;
+            if (candidateSizeAvailable) {
+                // Runtime-confirmed at MacWSWindowing.log 1789059115.823:
+                // SBDisplayItemLayoutAttributes implements this decoded
+                // model-size accessor paired with the modifier API above.
+                candidateSize = ((CGSize (*)(id, SEL, CGRect, CGSize,
+                                              CGFloat))objc_msgSend)(
+                    candidateAttributes, sizeSelector, containerBounds,
+                    defaultWindowSize, screenEdgePadding);
+            }
+            BOOL candidateRoleLanded = !expectedWindowedRole ||
+                (centerRoleAddress && candidateRole == *centerRoleAddress &&
+                 candidateCenter == 1 && candidateEnvironment == 3);
+            BOOL candidateSizeLanded = candidateSizeAvailable &&
+                fabs(candidateSize.width - expectedSize.width) <= 1.5 &&
+                fabs(candidateSize.height - expectedSize.height) <= 1.5;
+            NSInteger score = (candidateRoleLanded ? 4 : 0) +
+                (candidateSizeLanded ? 8 : 0);
+            if (!actualItem || score > bestScore) {
+                bestScore = score;
+                actualLayout = candidateLayout;
+                actualItem = candidateItem;
+                actualRole = candidateRole;
+                actualCenter = candidateCenter;
+                actualEnvironment = candidateEnvironment;
+                actualSize = candidateSize;
+                sizeAvailable = candidateSizeAvailable;
+            }
+        }
+        BOOL roleLanded = actualLayout && actualItem;
         if (expectedWindowedRole) {
-            landed = landed && centerRoleAddress &&
+            roleLanded = roleLanded && centerRoleAddress &&
                 actualRole == *centerRoleAddress && actualCenter == 1 &&
                 actualEnvironment == 3;
         }
+        BOOL sizeLanded = sizeAvailable &&
+            fabs(actualSize.width - expectedSize.width) <= 1.5 &&
+            fabs(actualSize.height - expectedSize.height) <= 1.5;
+        NSArray *actualStageItems = MacWSAppLayoutItemIdentifiers(currentLayout);
+        BOOL stageMembersPreserved = !expectedStageItems.count ||
+            [[NSSet setWithArray:expectedStageItems]
+                isEqualToSet:[NSSet setWithArray:actualStageItems]];
+        BOOL landed = roleLanded && sizeLanded && stageMembersPreserved;
+        if (!landed && sample < 9) {
+            MacWSVerifyResizePostcondition(
+                coordinator, contentController, switcherController,
+                expectedStageItems, bundleIdentifier,
+                sceneIdentifier, expectedSize, expectedWindowedRole,
+                request, path, transactionAttempt, sample + 1);
+            return;
+        }
         MacWSWindowingLogLine([NSString stringWithFormat:
-            @"resize-postcondition scene=%@ landed=%@ role=%ld center=%ld environment=%ld expected-windowed=%@",
-            sceneIdentifier, landed ? @"YES" : @"NO", (long)actualRole,
+            @"resize-postcondition scene=%@ landed=%@ role-landed=%@ size-landed=%@ role=%ld center=%ld environment=%ld expected-windowed=%@ expected=%.1fx%.1f actual=%.1fx%.1f size-api=%@ samples=%lu transaction-attempt=%lu stage-members-preserved=%@ current-items=%@ visual-acceptance=UNVERIFIED",
+            sceneIdentifier, landed ? @"YES" : @"NO",
+            roleLanded ? @"YES" : @"NO",
+            sizeLanded ? @"YES" : @"NO", (long)actualRole,
             (long)actualCenter, (long)actualEnvironment,
-            expectedWindowedRole ? @"YES" : @"NO"]);
+            expectedWindowedRole ? @"YES" : @"NO",
+            expectedSize.width, expectedSize.height,
+            actualSize.width, actualSize.height,
+            sizeAvailable ? @"YES" : @"NO",
+            (unsigned long)(sample + 1),
+            (unsigned long)(transactionAttempt + 1),
+            stageMembersPreserved ? @"YES" : @"NO",
+            [actualStageItems componentsJoinedByString:@","]]);
+        // Membership can also change because the user closes/moves a window.
+        // Never reconstruct an earlier stage in an attempt to "repair" it.
+        if (!landed && stageMembersPreserved && transactionAttempt < 2) {
+            MacWSWindowingLogLine([NSString stringWithFormat:
+                @"resize-corrective-resubmit scene=%@ expected=%.1fx%.1f actual=%.1fx%.1f next-attempt=%lu",
+                sceneIdentifier, expectedSize.width, expectedSize.height,
+                actualSize.width, actualSize.height,
+                (unsigned long)(transactionAttempt + 2)]);
+            MacWSApplyResizeRequest(request, path, transactionAttempt + 1);
+            return;
+        }
+        MacWSFinishResizeRequest(path, landed ? nil : [NSString stringWithFormat:
+            @"resize-failed scene=%@ reason=%@ expected=%.1fx%.1f actual=%.1fx%.1f",
+            sceneIdentifier, stageMembersPreserved ? @"postcondition-not-landed" :
+                @"stage-membership-changed", expectedSize.width, expectedSize.height,
+            actualSize.width, actualSize.height]);
     });
 }
 
@@ -539,13 +1057,29 @@ static void MacWSApplyResizeRequest(NSDictionary *request, NSString *path,
     NSString *sceneIdentifier = request[@"scene_identifier"];
     CGFloat width = [request[@"width"] doubleValue];
     CGFloat height = [request[@"height"] doubleValue];
+    CGFloat minimumWidth = [request[@"minimum_width"] doubleValue];
+    CGFloat minimumHeight = [request[@"minimum_height"] doubleValue];
+    CGFloat maximumWidth = [request[@"maximum_width"] doubleValue];
+    CGFloat maximumHeight = [request[@"maximum_height"] doubleValue];
+    BOOL fixedWidth = [request[@"fixed_width"] boolValue];
+    BOOL fixedHeight = [request[@"fixed_height"] boolValue];
     BOOL requestWindowedRole = [request[@"windowed_role"] boolValue];
+    NSString *nonce = request[@"nonce"];
     NSTimeInterval issuedAt = [request[@"issued_at"] doubleValue];
     NSTimeInterval age = NSDate.date.timeIntervalSince1970 - issuedAt;
     if (![bundleIdentifier isEqualToString:@"com.macwsguide.host"] ||
         ![sceneIdentifier isKindOfClass:NSString.class] ||
+        ![nonce isKindOfClass:NSString.class] || nonce.length == 0 ||
         sceneIdentifier.length == 0 || !isfinite(width) || !isfinite(height) ||
         width < 150.0 || height < 150.0 || width > 4096.0 || height > 4096.0 ||
+        !isfinite(minimumWidth) || !isfinite(minimumHeight) ||
+        minimumWidth < 150.0 || minimumHeight < 150.0 ||
+        minimumWidth > width || minimumHeight > height ||
+        !isfinite(maximumWidth) || !isfinite(maximumHeight) ||
+        maximumWidth < 0.0 || maximumHeight < 0.0 ||
+        maximumWidth > 4096.0 || maximumHeight > 4096.0 ||
+        (maximumWidth > 0.0 && maximumWidth < minimumWidth) ||
+        (maximumHeight > 0.0 && maximumHeight < minimumHeight) ||
         !isfinite(age) || age < -2.0 || age > 15.0) {
         MacWSFinishResizeRequest(path, [NSString stringWithFormat:
             @"resize-rejected path=%@ scene=%@ size=%.1fx%.1f age=%.3f",
@@ -553,7 +1087,64 @@ static void MacWSApplyResizeRequest(NSDictionary *request, NSString *path,
             age]);
         return;
     }
-
+    BOOL policyOnly = [request[@"policy_only"] boolValue];
+    NSString *latestNonce = MacWSLatestResizeNonceByScene[sceneIdentifier];
+    if (!policyOnly && ![latestNonce isEqualToString:nonce]) {
+        MacWSFinishResizeRequest(path, [NSString stringWithFormat:
+            @"resize-superseded scene=%@ nonce=%@ latest=%@ attempt=%lu",
+            sceneIdentifier, nonce, latestNonce ?: @"none",
+            (unsigned long)(attempt + 1)]);
+        return;
+    }
+    if (!MacWSResizePolicyByScene)
+        MacWSResizePolicyByScene = [NSMutableDictionary dictionary];
+    NSDictionary *currentPolicy = MacWSResizePolicyByScene[sceneIdentifier];
+    BOOL newerPolicyExists =
+        [currentPolicy[@"issued_at"] doubleValue] > issuedAt;
+    if (!policyOnly && newerPolicyExists) {
+        // A geometry transaction can outlive a newer metadata notification.
+        // Keep its independent nonce/request, but never reinstate obsolete
+        // limits when its delayed lookup or postcondition retries run.
+        minimumWidth = [currentPolicy[@"minimum_width"] doubleValue];
+        minimumHeight = [currentPolicy[@"minimum_height"] doubleValue];
+        maximumWidth = [currentPolicy[@"maximum_width"] doubleValue];
+        maximumHeight = [currentPolicy[@"maximum_height"] doubleValue];
+        fixedWidth = [currentPolicy[@"fixed_width"] boolValue];
+        fixedHeight = [currentPolicy[@"fixed_height"] boolValue];
+        if (fixedWidth) width = [currentPolicy[@"target_width"] doubleValue];
+        if (fixedHeight) height = [currentPolicy[@"target_height"] doubleValue];
+    }
+    width = MAX(width, minimumWidth);
+    height = MAX(height, minimumHeight);
+    if (maximumWidth > 0.0) width = MIN(width, maximumWidth);
+    if (maximumHeight > 0.0) height = MIN(height, maximumHeight);
+    NSDictionary *resizePolicy = @{
+        @"scene_identifier": sceneIdentifier,
+        @"issued_at": @(issuedAt),
+        @"target_width": @(width),
+        @"target_height": @(height),
+        @"minimum_width": @(minimumWidth),
+        @"minimum_height": @(minimumHeight),
+        @"maximum_width": @(maximumWidth),
+        @"maximum_height": @(maximumHeight),
+        @"fixed_width": @(fixedWidth),
+        @"fixed_height": @(fixedHeight),
+    };
+    if (!newerPolicyExists)
+        MacWSResizePolicyByScene[sceneIdentifier] = resizePolicy;
+    if (policyOnly) {
+        // A newly learned AppKit bound need not trigger a layout transition
+        // when the displayed size is already correct. Do not mutate the
+        // stable model or activate/reorder any sibling Scene for metadata.
+        MacWSWindowingLogLine([NSString stringWithFormat:
+            @"resize-policy-only scene=%@ minimum=%.1fx%.1f maximum=%.1fx%.1f fixed=%@x%@ applied=%@",
+            sceneIdentifier, minimumWidth, minimumHeight,
+            maximumWidth, maximumHeight, fixedWidth ? @"YES" : @"NO",
+            fixedHeight ? @"YES" : @"NO",
+            newerPolicyExists ? @"NO-older-policy" : @"YES"]);
+        MacWSFinishResizeRequest(path, nil);
+        return;
+    }
     UIApplication *application = UIApplication.sharedApplication;
     id windowSceneManager = MacWSMessageObject(
         application, NSSelectorFromString(@"windowSceneManager"));
@@ -575,21 +1166,120 @@ static void MacWSApplyResizeRequest(NSDictionary *request, NSString *path,
         coordinator, NSSelectorFromString(@"recentAppLayouts"));
     id targetLayout = nil;
     id targetItem = nil;
-    for (id layout in appLayouts) {
-        for (id item in MacWSMessageObject(
-                 layout, NSSelectorFromString(@"allItems"))) {
-            NSString *candidateBundle = MacWSMessageObject(
-                item, NSSelectorFromString(@"bundleIdentifier"));
-            NSString *candidateIdentifier = MacWSMessageObject(
-                item, NSSelectorFromString(@"uniqueIdentifier"));
-            if ([candidateBundle isEqualToString:bundleIdentifier] &&
-                [candidateIdentifier isEqualToString:sceneIdentifier]) {
-                targetLayout = layout;
-                targetItem = item;
+    NSString *layoutSource = nil;
+    if (!requestWindowedRole) {
+        // RE-confirmed, SpringBoard 20D67: _currentMainAppLayout at
+        // 0x1c79163cc returns _currentLayoutState.appLayout (the whole stage).
+        // A leaf is NOT interchangeable: _leafAppLayoutForItem:role: at
+        // 0x1c7a36730/750 constructs one-item dictionaries. Sending that
+        // leaf through the non-gesture workspace transition replaces the
+        // group's entity set with that single item, dismissing its siblings.
+        // Never activate a background stage merely to follow AppKit geometry.
+        targetLayout = MacWSMessageObject(switcherController,
+            NSSelectorFromString(@"_currentMainAppLayout"));
+        targetItem = MacWSAppLayoutExactSceneItem(
+            targetLayout, bundleIdentifier, sceneIdentifier);
+        layoutSource = @"current-stage";
+        if (targetLayout && !targetItem) {
+            // UIKit's foreground callback may precede SpringBoard publishing
+            // the new current group. Recheck that authoritative group with
+            // the SAME geometry nonce, without activating any stage. This
+            // also bounds work for a genuinely background scene at two seconds.
+            if (attempt < 20) {
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                             100 * NSEC_PER_MSEC),
+                               dispatch_get_main_queue(), ^{
+                    MacWSApplyResizeRequest(request, path, attempt + 1);
+                });
+                return;
+            }
+            MacWSFinishResizeRequest(path, [NSString stringWithFormat:
+                @"resize-deferred scene=%@ reason=not-current-stage current-items=%@ policy-retained=YES",
+                sceneIdentifier, MacWSAppLayoutItemIdentifiers(targetLayout)]);
+            return;
+        }
+    }
+
+    NSInteger *preferredCenterRoleAddress = (NSInteger *)dlsym(
+        RTLD_DEFAULT, "SBLayoutRoleCenter");
+    if (requestWindowedRole && preferredCenterRoleAddress) {
+        for (id candidateLayout in appLayouts) {
+            id candidateItem = MacWSAppLayoutExactSceneItem(
+                candidateLayout, bundleIdentifier, sceneIdentifier);
+            if (!candidateItem) continue;
+            NSInteger candidateRole = MacWSMessageIntegerWithObject(
+                candidateLayout, NSSelectorFromString(@"layoutRoleForItem:"),
+                candidateItem);
+            NSInteger candidateCenter = MacWSMessageInteger(
+                candidateLayout, NSSelectorFromString(@"centerConfiguration"));
+            NSInteger candidateEnvironment = MacWSMessageInteger(
+                candidateLayout, NSSelectorFromString(@"environment"));
+            NSInteger candidateConfiguration = MacWSMessageInteger(
+                candidateLayout, NSSelectorFromString(@"configuration"));
+            MacWSWindowingLogLine([NSString stringWithFormat:
+                @"resize-layout-candidate scene=%@ role=%ld center=%ld environment=%ld configuration=%ld preferred-center=%@",
+                sceneIdentifier, (long)candidateRole,
+                (long)candidateCenter, (long)candidateEnvironment,
+                (long)candidateConfiguration,
+                (candidateRole == *preferredCenterRoleAddress &&
+                 candidateCenter == 1 && candidateEnvironment == 3)
+                    ? @"YES" : @"NO"]);
+            if (candidateRole == *preferredCenterRoleAddress &&
+                candidateCenter == 1 && candidateEnvironment == 3) {
+                targetLayout = candidateLayout;
+                targetItem = candidateItem;
+                layoutSource = @"explicit-windowed-center";
                 break;
             }
         }
+    }
+
+    // These legacy fallbacks are ONLY for explicit full-screen/windowed
+    // role conversion, not for resizing a member of the currently shown stage.
+    if (requestWindowedRole) {
+    // Runtime-confirmed via MacWSWindowing.log at 1789057220.059: the former
+    // "first recent layout containing this item" search selected a stale
+    // Primary/center=0/environment=1 model for a live 331x411 Stage Manager
+    // Scene.  Resizing that model produced a 327x603 intermediate Scene even
+    // though the fixed-axis policy later converged to 330x410.  Prefer the
+    // switcher's current keyboard-focused model when it owns this exact FBS
+    // Scene; it is the same authoritative route already used by the working
+    // maximization transaction.
+    for (NSString *selectorName in @[
+             @"leafAppLayoutForKeyboardFocusedScene",
+             @"keyboardFocusedAppLayout"]) {
         if (targetItem) break;
+        id candidateLayout = MacWSMessageObject(
+            contentController, NSSelectorFromString(selectorName));
+        id candidateItem = MacWSAppLayoutExactSceneItem(
+            candidateLayout, bundleIdentifier, sceneIdentifier);
+        if (candidateItem) {
+            targetLayout = candidateLayout;
+            targetItem = candidateItem;
+            layoutSource = selectorName;
+            break;
+        }
+    }
+    if (!targetItem) {
+        id candidateLayout = MacWSMessageObject(
+            switcherController, NSSelectorFromString(@"_currentMainAppLayout"));
+        id candidateItem = MacWSAppLayoutExactSceneItem(
+            candidateLayout, bundleIdentifier, sceneIdentifier);
+        if (candidateItem) {
+            targetLayout = candidateLayout;
+            targetItem = candidateItem;
+            layoutSource = @"explicit-windowed-current";
+        }
+    }
+    for (id layout in appLayouts) {
+        if (targetItem) break;
+        id item = MacWSAppLayoutExactSceneItem(
+            layout, bundleIdentifier, sceneIdentifier);
+        if (!item) continue;
+        targetLayout = layout;
+        targetItem = item;
+        layoutSource = @"explicit-windowed-recent";
+    }
     }
 
     if (!switcherController || !contentController || !coordinator ||
@@ -610,6 +1300,9 @@ static void MacWSApplyResizeRequest(NSDictionary *request, NSString *path,
             coordinator ? @"YES" : @"NO"]);
         return;
     }
+
+    NSArray *expectedStageItems = requestWindowedRole ? nil :
+        MacWSAppLayoutItemIdentifiers(targetLayout);
 
     MacWSInferAttributedSizeFn inferAttributedSize =
         (MacWSInferAttributedSizeFn)dlsym(
@@ -692,7 +1385,7 @@ static void MacWSApplyResizeRequest(NSDictionary *request, NSString *path,
         : nil;
     SEL bringFrontSelector = NSSelectorFromString(
         @"appLayoutByBringingItemToFront:inAppLayout:");
-    if (resizedLayout &&
+    if (requestWindowedRole && resizedLayout &&
         [contentController respondsToSelector:bringFrontSelector]) {
         resizedLayout = ((id (*)(id, SEL, id, id))objc_msgSend)(
             contentController, bringFrontSelector, targetItem, resizedLayout);
@@ -811,6 +1504,20 @@ static void MacWSApplyResizeRequest(NSDictionary *request, NSString *path,
         }
     }
 
+    // The immutable AppLayout clone preserves every member and every other
+    // member's layout attributes (RE: 0x1c7a376cc..0x1c7a37714). Verify that
+    // contract before handing the complete group to the workspace builder.
+    // In particular, ordinary size synchronization must not change siblings'
+    // lastInteractionTime by bringing the resized item to the front.
+    if (!requestWindowedRole && !MacWSResizePreservesAppLayoutSiblings(
+            targetLayout, resizedLayout, targetItem)) {
+        MacWSFinishResizeRequest(path, [NSString stringWithFormat:
+            @"resize-failed scene=%@ reason=stage-clone-contract source-items=%@ target-items=%@",
+            sceneIdentifier, expectedStageItems,
+            MacWSAppLayoutItemIdentifiers(resizedLayout)]);
+        return;
+    }
+
     Class requestClass = NSClassFromString(
         @"SBMutableSwitcherTransitionRequest");
     id transitionRequest = resizedLayout
@@ -821,14 +1528,35 @@ static void MacWSApplyResizeRequest(NSDictionary *request, NSString *path,
         : nil;
     if ([transitionRequest respondsToSelector:
             NSSelectorFromString(@"setSceneUpdatesOnly:")]) {
+        // RE-confirmed at 0x1c79e67fc..0x1c79e6828: this property is consumed
+        // ONLY on the gestureInitiated path. Our non-gesture request always
+        // goes through SBMainWorkspace, so YES never protected siblings.
+        // Preserve the complete current AppLayout instead of claiming a
+        // fabricated gesture session or a scene-only workspace transaction.
         ((void (*)(id, SEL, BOOL))objc_msgSend)(
             transitionRequest,
-            NSSelectorFromString(@"setSceneUpdatesOnly:"), NO);
+            NSSelectorFromString(@"setSceneUpdatesOnly:"),
+            NO);
+    }
+    // Runtime-confirmed from the target iPadOS 16.3.1 class metadata at
+    // MacWSWindowing.log 1789059115.826: SBSwitcherTransitionRequest exposes
+    // the real -setAnimationDisabled: property.  AppKit has already completed
+    // its own window animation when this reverse synchronization begins, so a
+    // second ~1.45 s Stage Manager animation only exposes a mismatched Scene
+    // and IOSurface.  Submit the same validated SBMainWorkspace transaction
+    // without that redundant animation; no layout or size validation is
+    // bypassed.
+    if ([transitionRequest respondsToSelector:
+            NSSelectorFromString(@"setAnimationDisabled:")]) {
+        ((void (*)(id, SEL, BOOL))objc_msgSend)(
+            transitionRequest,
+            NSSelectorFromString(@"setAnimationDisabled:"), YES);
     }
     // 0x33 is the system keyboard/top-affordance transition source used by
     // -[SBMedusaDecoratedDeviceApplicationSceneViewController
     // performSwitcherKeyboardShortcutAction:] at 0x1c7add284.
-    if ([transitionRequest respondsToSelector:NSSelectorFromString(@"setSource:")]) {
+    if (requestWindowedRole &&
+        [transitionRequest respondsToSelector:NSSelectorFromString(@"setSource:")]) {
         ((void (*)(id, SEL, NSInteger))objc_msgSend)(
             transitionRequest, NSSelectorFromString(@"setSource:"), 0x33);
     }
@@ -842,25 +1570,47 @@ static void MacWSApplyResizeRequest(NSDictionary *request, NSString *path,
         return;
     }
 
-    ((void (*)(id, SEL, id, id, BOOL))objc_msgSend)(
-        coordinator, performSelector, contentController, transitionRequest,
-        NO);
-    MacWSVerifyResizePostcondition(coordinator, bundleIdentifier,
-                                  sceneIdentifier, requestWindowedRole);
-    MacWSFinishResizeRequest(path, [NSString stringWithFormat:
-        @"resize-submitted scene=%@ requested=%.1fx%.1f effective=%.1fx%.1f normalized-fullscreen-size=%@ bounds=%@ default=%.1fx%.1f supported=0x%lx policy=%lu windowed-role=%@ source-role=%ld source-center=%ld target-center=%ld target-environment=%ld source=0x33 route=SBMainWorkspace",
+    // The request was identity-validated above as an exact MacWSHost Scene.
+    // Keep any synchronous grid lookup made by SpringBoard's transition
+    // builder in the same narrow scope as interactive Host resizing. The
+    // counter is main-thread-only and is restored before this function can
+    // process another app/layout request.
+    NSDictionary *previousPolicy = MacWSActiveDenseGridPolicy;
+    MacWSSetStableModelSize(sceneIdentifier, effectiveRequestedSize);
+    MacWSActiveDenseGridPolicy = resizePolicy;
+    MacWSDenseGridScopeDepth++;
+    @try {
+        ((void (*)(id, SEL, id, id, BOOL))objc_msgSend)(
+            coordinator, performSelector, contentController,
+            transitionRequest, NO);
+    } @finally {
+        MacWSDenseGridScopeDepth--;
+        MacWSActiveDenseGridPolicy = previousPolicy;
+    }
+    MacWSWindowingLogLine([NSString stringWithFormat:
+        @"resize-submitted scene=%@ requested=%.1fx%.1f effective=%.1fx%.1f minimum=%.1fx%.1f fixed=%@x%@ normalized-fullscreen-size=%@ bounds=%@ default=%.1fx%.1f supported=0x%lx policy=%lu windowed-role=%@ scene-updates-only=NO source-role=%ld source-center=%ld target-center=%ld target-environment=%ld source=0x%lx route=SBMainWorkspace layout-source=%@ stage-items=%@",
         sceneIdentifier, width, height, effectiveRequestedSize.width,
-        effectiveRequestedSize.height,
+        effectiveRequestedSize.height, minimumWidth, minimumHeight,
+        fixedWidth ? @"YES" : @"NO",
+        fixedHeight ? @"YES" : @"NO",
         normalizedFullscreenSize ? @"YES" : @"NO",
         NSStringFromCGRect(containerBounds),
         defaultWindowSize.width, defaultWindowSize.height,
         (unsigned long)supportedPolicies, (unsigned long)sizingPolicy,
-        requestWindowedRole ? @"YES" : @"NO", (long)sourceRole,
+        requestWindowedRole ? @"YES" : @"NO",
+        (long)sourceRole,
         (long)sourceCenterConfiguration,
         (long)MacWSMessageInteger(
             resizedLayout, NSSelectorFromString(@"centerConfiguration")),
         (long)MacWSMessageInteger(
-            resizedLayout, NSSelectorFromString(@"environment"))]);
+            resizedLayout, NSSelectorFromString(@"environment")),
+        (unsigned long)(requestWindowedRole ? 0x33 : 0), layoutSource,
+        MacWSAppLayoutItemIdentifiers(resizedLayout)]);
+    MacWSVerifyResizePostcondition(
+        coordinator, contentController, switcherController, expectedStageItems,
+        bundleIdentifier, sceneIdentifier,
+        effectiveRequestedSize, requestWindowedRole, request, path, attempt,
+        0);
 }
 
 static void MacWSHandleResizeRequest(
@@ -872,23 +1622,115 @@ static void MacWSHandleResizeRequest(
     dispatch_async(dispatch_get_main_queue(), ^{
         NSArray<NSString *> *names = [[NSFileManager defaultManager]
             contentsOfDirectoryAtPath:MacWSResizeRequestDirectory error:nil];
+        NSMutableDictionary<NSString *, NSDictionary *> *latestByScene =
+            [NSMutableDictionary dictionary];
+        NSMutableDictionary<NSString *, NSString *> *pathByScene =
+            [NSMutableDictionary dictionary];
         for (NSString *name in names) {
             if (![name hasPrefix:MacWSResizeRequestPrefix] ||
                 ![name hasSuffix:@".plist"]) continue;
             NSString *path = [MacWSResizeRequestDirectory
                 stringByAppendingPathComponent:name];
-            if ([MacWSResizeRequestsInFlight containsObject:path]) continue;
             NSDictionary *request = [NSDictionary dictionaryWithContentsOfFile:path];
             if (![request isKindOfClass:NSDictionary.class]) {
                 [[NSFileManager defaultManager] removeItemAtPath:path error:nil];
                 continue;
             }
-            if (!MacWSResizeRequestsInFlight)
-                MacWSResizeRequestsInFlight = [NSMutableSet set];
-            [MacWSResizeRequestsInFlight addObject:path];
-            MacWSApplyResizeRequest(request, path, 0);
+            NSString *scene = request[@"scene_identifier"];
+            NSString *nonce = request[@"nonce"];
+            NSTimeInterval issued = [request[@"issued_at"] doubleValue];
+            if (![scene isKindOfClass:NSString.class] || scene.length == 0 ||
+                ![nonce isKindOfClass:NSString.class] || nonce.length == 0 ||
+                !isfinite(issued)) {
+                MacWSFinishResizeRequest(path,
+                    [NSString stringWithFormat:
+                        @"resize-rejected path=%@ reason=identity-invalid",
+                        name]);
+                continue;
+            }
+            if ([request[@"policy_only"] boolValue]) {
+                // Metadata has no geometry-queue ownership. Validate/apply
+                // it now, before selecting/coalescing geometry winners, and
+                // consume only this file. It must not replace a geometry
+                // nonce or remove a pending/in-flight resize for this Scene.
+                MacWSApplyResizeRequest(request, path, 0);
+                continue;
+            }
+            NSDictionary *current = latestByScene[scene];
+            NSTimeInterval currentIssued =
+                [current[@"issued_at"] doubleValue];
+            if (!current || issued > currentIssued ||
+                (issued == currentIssued &&
+                 [name compare:pathByScene[scene].lastPathComponent] ==
+                    NSOrderedDescending)) {
+                latestByScene[scene] = request;
+                pathByScene[scene] = path;
+            }
+        }
+
+        if (!MacWSLatestResizeNonceByScene)
+            MacWSLatestResizeNonceByScene = [NSMutableDictionary dictionary];
+        for (NSString *scene in latestByScene) {
+            MacWSLatestResizeNonceByScene[scene] =
+                latestByScene[scene][@"nonce"];
+        }
+
+        // Remove every queued predecessor before submitting the winners. An
+        // already-running layout lookup remains harmless: its next retry
+        // checks the same latest-nonce map and terminates as superseded.
+        for (NSString *name in names) {
+            if (![name hasPrefix:MacWSResizeRequestPrefix] ||
+                ![name hasSuffix:@".plist"]) continue;
+            NSString *path = [MacWSResizeRequestDirectory
+                stringByAppendingPathComponent:name];
+            NSDictionary *request =
+                [NSDictionary dictionaryWithContentsOfFile:path];
+            if ([request[@"policy_only"] boolValue]) continue;
+            NSString *scene = request[@"scene_identifier"];
+            NSString *winnerPath = scene ? pathByScene[scene] : nil;
+            if (winnerPath && ![winnerPath isEqualToString:path]) {
+                MacWSFinishResizeRequest(path, [NSString stringWithFormat:
+                    @"resize-superseded scene=%@ path=%@ winner=%@",
+                    scene, name, winnerPath.lastPathComponent]);
+            }
+        }
+        for (NSString *scene in latestByScene) {
+            NSString *path = pathByScene[scene];
+            NSDictionary *request = latestByScene[scene];
+            NSString *nonce = request[@"nonce"];
+            // AppKit can publish several adjacent sizes during one utility-
+            // panel animation. SpringBoard's performTransition call is not an
+            // interactive update API, so submitting every intermediate model
+            // lets older transitions land after newer ones. Debounce only
+            // this AppKit -> Scene direction; the ordinary Scene -> AppKit
+            // resize stream remains continuous.
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                         80 * NSEC_PER_MSEC),
+                           dispatch_get_main_queue(), ^{
+                if (![MacWSLatestResizeNonceByScene[scene]
+                        isEqualToString:nonce] ||
+                    ![[NSFileManager defaultManager]
+                        fileExistsAtPath:path] ||
+                    [MacWSResizeRequestsInFlight containsObject:path]) return;
+                if (!MacWSResizeRequestsInFlight)
+                    MacWSResizeRequestsInFlight = [NSMutableSet set];
+                [MacWSResizeRequestsInFlight addObject:path];
+                MacWSApplyResizeRequest(request, path, 0);
+            });
         }
     });
+}
+
+static void MacWSHandleInitialSizeRequest(
+    __unused CFNotificationCenterRef center,
+    __unused void *observer,
+    __unused CFStringRef name,
+    __unused const void *object,
+    __unused CFDictionaryRef userInfo) {
+    // The activation hook claims and validates the file synchronously so the
+    // request cannot lose a race with FrontBoard.  This notification is only
+    // a wake/readiness witness; it performs no layout transaction by itself.
+    MacWSWindowingLogLine(@"initial-size notification received route=claim-at-app-layout-construction");
 }
 
 static void MacWSWriteDenseGridWitness(const char *axis, NSUInteger original,
@@ -900,7 +1742,8 @@ static void MacWSWriteDenseGridWitness(const char *axis, NSUInteger original,
              axis);
     int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
     if (fd < 0) return;
-    dprintf(fd, "version=2 pid=%d axis=%s step=10 original=%lu expanded=%lu "
+    dprintf(fd, "version=3 pid=%d axis=%s fallback-step=10 "
+                "exact-proposal=1 original=%lu expanded=%lu "
                 "minimum=%.3f maximum=%.3f\n",
             getpid(), axis, (unsigned long)original, (unsigned long)expanded,
             minimum, maximum);
@@ -932,6 +1775,28 @@ static NSArray<NSNumber *> *MacWSDenseCandidates(NSArray<NSNumber *> *source,
          value += step) {
         [values addObject:@(value)];
     }
+    // Preserve the exact AppKit boundary alongside the dense convenience
+    // steps. This is scoped to one validated Host Scene on SpringBoard's main
+    // thread, so no other iPadOS application receives these candidates.
+    BOOL widthAxis = strstr(axis, "width") != NULL;
+    double proposed = widthAxis ? MacWSActiveDenseGridProposal.width
+                                : MacWSActiveDenseGridProposal.height;
+    if (isfinite(proposed) && proposed >= nativeWindowFloor &&
+        proposed <= maximum)
+        [values addObject:@(proposed)];
+    NSString *minimumKey = widthAxis ? @"minimum_width" : @"minimum_height";
+    NSString *maximumKey = widthAxis ? @"maximum_width" : @"maximum_height";
+    NSString *targetKey = widthAxis ? @"target_width" : @"target_height";
+    for (NSString *key in @[minimumKey, maximumKey, targetKey]) {
+        double value = [MacWSActiveDenseGridPolicy[key] doubleValue];
+        if (isfinite(value) && value >= nativeWindowFloor && value <= maximum)
+            [values addObject:@(value)];
+    }
+    double policyMaximum = [MacWSActiveDenseGridPolicy[maximumKey] doubleValue];
+    if (isfinite(policyMaximum) && policyMaximum >= nativeWindowFloor) {
+        for (NSNumber *value in [values allObjects])
+            if (value.doubleValue > policyMaximum) [values removeObject:value];
+    }
     NSArray<NSNumber *> *ordered = [values.allObjects
         sortedArrayUsingComparator:^NSComparisonResult(NSNumber *lhs,
                                                         NSNumber *rhs) {
@@ -940,21 +1805,647 @@ static NSArray<NSNumber *> *MacWSDenseCandidates(NSArray<NSNumber *> *source,
     if (ordered.count > source.count)
         MacWSWriteDenseGridWitness(axis, source.count, ordered.count,
                                    nativeWindowFloor, maximum);
-    return ordered.count >= source.count ? ordered : source;
+    return ordered.count ? ordered : source;
 }
+
+%hook SBDisplayItemLayoutAttributesCalculator
+- (id)_appLayoutByPerformingAutoLayoutIfNeededInAppLayout:(id)appLayout
+        containerOrientation:(NSInteger)containerOrientation
+     chamoisLayoutAttributes:(id)chamoisLayoutAttributes
+          floatingDockHeight:(CGFloat)floatingDockHeight
+                 screenScale:(CGFloat)screenScale
+                draggingItem:(id)draggingItem
+overlappingModelBeforeDragging:(id)overlappingModelBeforeDragging
+                      bounds:(CGRect)bounds
+          prefersStripHidden:(BOOL)prefersStripHidden
+           prefersDockHidden:(BOOL)prefersDockHidden {
+    // RE-confirmed in the target cache: this method's first grid call
+    // (0x1c78b527c) calculates the stage-wide maximum, then its item loop
+    // clamps every window against that value (0x1c78b54b8..54d8).
+    // A fixed About policy here made that maximum 301x378 for ALL items.
+    // Temporarily clear every inherited ownership source. Internal per-item
+    // calls enter the lower frame hook below and bind their own identities.
+    id previousModifier = MacWSActiveResizeGestureModifier;
+    id previousGroupModifier = MacWSGroupResizeGestureModifier;
+    NSDictionary *previousPolicy = MacWSActiveDenseGridPolicy;
+    CGSize previousProposal = MacWSActiveDenseGridProposal;
+    NSUInteger previousDenseDepth = MacWSDenseGridScopeDepth;
+    NSUInteger previousItemDepth = MacWSItemLayoutScopeDepth;
+    NSUInteger previousInitialDepth = MacWSInitialLayoutScopeDepth;
+    NSString *previousScene = MacWSActiveLayoutSceneIdentifier;
+    BOOL previousInitialGridObserved = MacWSInitialGridObserved;
+    MacWSActiveResizeGestureModifier = nil;
+    MacWSGroupResizeGestureModifier = previousModifier ?: previousGroupModifier;
+    MacWSActiveDenseGridPolicy = nil;
+    MacWSActiveDenseGridProposal = CGSizeZero;
+    MacWSDenseGridScopeDepth = 0;
+    MacWSItemLayoutScopeDepth = 0;
+    MacWSInitialLayoutScopeDepth = 0;
+    MacWSActiveLayoutSceneIdentifier = nil;
+    MacWSInitialGridObserved = NO;
+    MacWSGroupLayoutScopeDepth++;
+    @try {
+        return %orig(appLayout, containerOrientation, chamoisLayoutAttributes,
+                     floatingDockHeight, screenScale, draggingItem,
+                     overlappingModelBeforeDragging, bounds,
+                     prefersStripHidden, prefersDockHidden);
+    } @finally {
+        MacWSGroupLayoutScopeDepth--;
+        MacWSInitialGridObserved = previousInitialGridObserved;
+        MacWSActiveLayoutSceneIdentifier = previousScene;
+        MacWSInitialLayoutScopeDepth = previousInitialDepth;
+        MacWSItemLayoutScopeDepth = previousItemDepth;
+        MacWSDenseGridScopeDepth = previousDenseDepth;
+        MacWSActiveDenseGridProposal = previousProposal;
+        MacWSActiveDenseGridPolicy = previousPolicy;
+        MacWSActiveResizeGestureModifier = previousModifier;
+        MacWSGroupResizeGestureModifier = previousGroupModifier;
+    }
+}
+
+- (CGRect)_frameForLayoutRole:(NSInteger)layoutRole
+                 inAppLayout:(id)appLayout
+             containerBounds:(CGRect)containerBounds
+        containerOrientation:(NSInteger)containerOrientation
+     chamoisLayoutAttributes:(id)chamoisLayoutAttributes
+          floatingDockHeight:(CGFloat)floatingDockHeight
+                 screenScale:(CGFloat)screenScale
+ isChamoisWindowingUIEnabled:(BOOL)isChamoisWindowingUIEnabled
+          prefersStripHidden:(BOOL)prefersStripHidden
+           prefersDockHidden:(BOOL)prefersDockHidden
+              skipAutoLayout:(BOOL)skipAutoLayout {
+    // RE-confirmed IMP 0x1c78b3e30, exact type encoding in
+    // docs/evidence/windowing-stage-wide-limit-policy-leak-20260912.md.
+    // Both the public convenience method AND the auto-layout item loop use
+    // this selector. The upper windowScene: method misses the internal loop.
+    id item = MacWSAppLayoutItemForRole(appLayout, layoutRole);
+    NSString *bundle = MacWSMessageObject(
+        item, NSSelectorFromString(@"bundleIdentifier"));
+    NSString *scene = MacWSMessageObject(
+        item, NSSelectorFromString(@"uniqueIdentifier"));
+    BOOL host = isChamoisWindowingUIEnabled &&
+        [bundle isEqualToString:@"com.macwsguide.host"] && scene.length > 0;
+    id attributes = item && [appLayout respondsToSelector:
+        NSSelectorFromString(@"layoutAttributesForItem:")]
+        ? ((id (*)(id, SEL, id))objc_msgSend)(
+              appLayout, NSSelectorFromString(@"layoutAttributesForItem:"), item)
+        : nil;
+    MacWSDisplayItemAttributedSize attributedSize =
+        MacWSAttributedSizeForAttributes(
+            attributes, NSSelectorFromString(@"attributedSize"));
+    NSString *initialPath = nil;
+    NSDictionary *initialPolicy = host
+        ? MacWSClaimInitialSizePolicy(
+              item, attributes && MacWSAttributedSizeIsUnspecified(attributedSize),
+              &initialPath)
+        : nil;
+    if (initialPath.length) {
+        // Claim consumption precedes recursive item calculation; another new
+        // Scene cannot bind the same FIFO activation request on this stack.
+        [[NSFileManager defaultManager] removeItemAtPath:initialPath error:nil];
+    }
+
+    id previousModifier = MacWSActiveResizeGestureModifier;
+    id gestureModifier = previousModifier ?: MacWSGroupResizeGestureModifier;
+    id previousGroupModifier = MacWSGroupResizeGestureModifier;
+    id selectedItem = MacWSResizeModifierSelectedItem(gestureModifier);
+    NSString *selectedScene = MacWSMessageObject(
+        selectedItem, NSSelectorFromString(@"uniqueIdentifier"));
+    BOOL selectedGestureItem = host &&
+        [selectedScene isEqualToString:scene];
+    NSDictionary *itemPolicy = nil;
+    CGSize modelSize = CGSizeZero;
+    BOOL exactModel = NO;
+    if (host) {
+        if (selectedGestureItem && !initialPolicy) {
+            // The selected gesture's live proposal owns this item. Siblings
+            // never inherit its minimum/fixed-axis policy.
+            itemPolicy = MacWSResizePolicyForModifier(gestureModifier);
+        } else if (initialPolicy) {
+            itemPolicy = initialPolicy;
+            modelSize = CGSizeMake(
+                [initialPolicy[@"target_width"] doubleValue],
+                [initialPolicy[@"target_height"] doubleValue]);
+            exactModel = YES;
+        } else {
+            exactModel = MacWSStableModelSize(scene, &modelSize);
+            if (!exactModel &&
+                !MacWSAttributedSizeIsUnspecified(attributedSize)) {
+                CGSize defaultSize = MacWSMessageSize(
+                    chamoisLayoutAttributes,
+                    NSSelectorFromString(@"defaultWindowSize"));
+                CGFloat padding = MacWSMessageFloat(
+                    chamoisLayoutAttributes,
+                    NSSelectorFromString(@"screenEdgePadding"));
+                exactModel = MacWSResolvedLayoutAttributesSize(
+                    attributes, containerBounds, defaultSize, padding, &modelSize);
+                if (exactModel) MacWSSetStableModelSize(scene, modelSize);
+            }
+            if (exactModel) {
+                itemPolicy = @{
+                    @"scene_identifier": scene,
+                    @"target_width": @(modelSize.width),
+                    @"target_height": @(modelSize.height),
+                    @"minimum_width": @150.0,
+                    @"minimum_height": @150.0,
+                    @"fixed_width": @YES,
+                    @"fixed_height": @YES,
+                };
+            }
+        }
+        if (!itemPolicy) itemPolicy = @{
+            @"scene_identifier": scene, @"macws_host": @YES,
+        };
+    }
+
+    NSDictionary *previousPolicy = MacWSActiveDenseGridPolicy;
+    CGSize previousProposal = MacWSActiveDenseGridProposal;
+    NSUInteger previousDenseDepth = MacWSDenseGridScopeDepth;
+    NSUInteger previousItemDepth = MacWSItemLayoutScopeDepth;
+    NSUInteger previousInitialDepth = MacWSInitialLayoutScopeDepth;
+    NSString *previousScene = MacWSActiveLayoutSceneIdentifier;
+    BOOL previousInitialGridObserved = MacWSInitialGridObserved;
+    // Set rather than increment: a stock item inside a Host transaction must
+    // have a fully stock scope, including any cached-grid association.
+    MacWSActiveResizeGestureModifier = selectedGestureItem ? gestureModifier : nil;
+    // Preserve provenance separately while a sibling temporarily clears the
+    // active policy. Its auto-layout may recurse back into the selected item.
+    MacWSGroupResizeGestureModifier = gestureModifier;
+    MacWSActiveDenseGridPolicy = itemPolicy;
+    MacWSActiveDenseGridProposal = exactModel ? modelSize : CGSizeZero;
+    MacWSDenseGridScopeDepth = host ? 1 : 0;
+    MacWSItemLayoutScopeDepth = previousItemDepth + 1;
+    MacWSInitialLayoutScopeDepth = initialPolicy ? 1 : 0;
+    MacWSActiveLayoutSceneIdentifier = host ? scene : nil;
+    MacWSInitialGridObserved = NO;
+    CGRect frame = CGRectZero;
+    BOOL initialGridObserved = NO;
+    @try {
+        frame = %orig(layoutRole, appLayout, containerBounds,
+                      containerOrientation, chamoisLayoutAttributes,
+                      floatingDockHeight, screenScale, isChamoisWindowingUIEnabled,
+                      prefersStripHidden, prefersDockHidden, skipAutoLayout);
+        initialGridObserved = MacWSInitialGridObserved;
+    } @finally {
+        MacWSInitialGridObserved = previousInitialGridObserved;
+        MacWSActiveLayoutSceneIdentifier = previousScene;
+        MacWSInitialLayoutScopeDepth = previousInitialDepth;
+        MacWSItemLayoutScopeDepth = previousItemDepth;
+        MacWSDenseGridScopeDepth = previousDenseDepth;
+        MacWSActiveDenseGridProposal = previousProposal;
+        MacWSActiveDenseGridPolicy = previousPolicy;
+        MacWSActiveResizeGestureModifier = previousModifier;
+        MacWSGroupResizeGestureModifier = previousGroupModifier;
+    }
+    // Diagnostic witnesses report this calculation, not visual acceptance.
+    // Actual Scene display frames and the iPadOS screenshot are checked apart.
+    if (host) {
+        static NSMutableDictionary<NSString *, NSValue *> *lastFrames;
+        if (!lastFrames) lastFrames = [NSMutableDictionary dictionary];
+        NSString *key = [NSString stringWithFormat:@"%@/%ld/%d", scene,
+                         (long)layoutRole, skipAutoLayout];
+        NSValue *previous = lastFrames[key];
+        BOOL changed = !previous || !CGRectEqualToRect(previous.CGRectValue, frame);
+        if (changed || initialPath.length) {
+            lastFrames[key] = [NSValue valueWithCGRect:frame];
+            MacWSWindowingLogLine([NSString stringWithFormat:
+                @"item-layout-frame scene=%@ role=%ld group-depth=%lu skip-auto=%@ initial=%@ gesture=%@ model=%@ frame=%@ initial-grid=%@",
+                scene, (long)layoutRole, (unsigned long)MacWSGroupLayoutScopeDepth,
+                skipAutoLayout ? @"YES" : @"NO", initialPolicy ? @"YES" : @"NO",
+                selectedGestureItem ? @"YES" : @"NO",
+                exactModel ? NSStringFromCGSize(modelSize) : @"live",
+                NSStringFromCGRect(frame), initialGridObserved ? @"YES" : @"NO"]);
+        }
+    }
+    return frame;
+}
+%end
 
 %hook SBSwitcherChamoisLayoutAttributes
 - (void)setGridWidths:(NSArray<NSNumber *> *)widths {
-    %orig(MacWSDenseCandidates(widths, "width"));
+    // Never persist MacWS policy into SpringBoard's shared Chamois model.
+    %orig(widths);
 }
 - (void)setGridHeights:(NSArray<NSNumber *> *)heights {
-    %orig(MacWSDenseCandidates(heights, "height"));
+    %orig(heights);
 }
 - (NSArray<NSNumber *> *)gridWidths {
-    return MacWSDenseCandidates(%orig, "width-getter");
+    NSArray<NSNumber *> *original = %orig;
+    return MacWSDenseGridScopeDepth > 0
+        ? MacWSDenseCandidates(original, "host-width") : original;
 }
 - (NSArray<NSNumber *> *)gridHeights {
-    return MacWSDenseCandidates(%orig, "height-getter");
+    NSArray<NSNumber *> *original = %orig;
+    return MacWSDenseGridScopeDepth > 0
+        ? MacWSDenseCandidates(original, "host-height") : original;
+}
+%end
+
+%hook SBItemResizeGestureSwitcherModifier
+- (id)_responseForGestureUpdateAtGestureEnd:(BOOL)ended {
+    // RE-confirmed in SpringBoard 20D67: handleGestureEvent: installs the
+    // selected layout/role at 0x1c79cf108/128, compares event.phase with 3 at
+    // 0x1c79cf294, then passes that exact boolean here at 0x1c79cf2a0.
+    // Observe Apple's lifecycle; do not replace its response or invent an
+    // interactive transition. Only the selected Host Scene has a publisher.
+    BOOL nativeGesture = MacWSActiveResizeGestureModifier == self;
+    if (nativeGesture && !ended) MacWSPublishResizeGestureState(self, YES);
+    @try {
+        return %orig(ended);
+    } @finally {
+        if (nativeGesture && ended) MacWSPublishResizeGestureState(self, NO);
+    }
+}
+- (void)dealloc {
+    // Also retire a cancelled modifier that never produced the ordinary end.
+    MacWSPublishResizeGestureState(self, NO);
+    %orig;
+}
+- (id)_responseForSceneSizeUpdateToSize:(CGSize)size
+                                  center:(CGPoint)center
+                        sceneUpdatesOnly:(BOOL)sceneUpdatesOnly {
+    // RE-confirmed on SpringBoard 20D67 at 0x1c79cfaf4: this is the real
+    // per-item resize response that constructs the attributed size, immutable
+    // AppLayout and transition request.  Constrain only the exact selected
+    // MacWSHost Scene before Apple's original transaction runs.  This covers
+    // the pre-handleGestureEvent grid pass which runtime logs showed was the
+    // one whose unconstrained result actually reached UIKit.
+    NSDictionary *policy = MacWSResizePolicyForModifier(self);
+    id selectedItem = MacWSResizeModifierSelectedItem(self);
+    NSString *selectedBundle = MacWSMessageObject(
+        selectedItem, NSSelectorFromString(@"bundleIdentifier"));
+    NSString *selectedScene = MacWSMessageObject(
+        selectedItem, NSSelectorFromString(@"uniqueIdentifier"));
+    CGSize constrained = size;
+    if (policy) {
+        CGFloat minimumWidth = [policy[@"minimum_width"] doubleValue];
+        CGFloat minimumHeight = [policy[@"minimum_height"] doubleValue];
+        CGFloat maximumWidth = [policy[@"maximum_width"] doubleValue];
+        CGFloat maximumHeight = [policy[@"maximum_height"] doubleValue];
+        constrained.width = [policy[@"fixed_width"] boolValue]
+            ? [policy[@"target_width"] doubleValue]
+            : MAX(constrained.width, minimumWidth);
+        constrained.height = [policy[@"fixed_height"] boolValue]
+            ? [policy[@"target_height"] doubleValue]
+            : MAX(constrained.height, minimumHeight);
+        if (maximumWidth > 0.0)
+            constrained.width = MIN(constrained.width, maximumWidth);
+        if (maximumHeight > 0.0)
+            constrained.height = MIN(constrained.height, maximumHeight);
+        if (fabs(constrained.width - size.width) > 0.5 ||
+            fabs(constrained.height - size.height) > 0.5) {
+            MacWSWindowingLogLine([NSString stringWithFormat:
+                @"resize-response constrained scene=%@ proposed=%.1fx%.1f result=%.1fx%.1f fixed=%@x%@",
+                policy[@"scene_identifier"], size.width, size.height,
+                constrained.width, constrained.height,
+                [policy[@"fixed_width"] boolValue] ? @"YES" : @"NO",
+                [policy[@"fixed_height"] boolValue] ? @"YES" : @"NO"]);
+        }
+    }
+    // This selector is also invoked by SpringBoard's restore/reflow
+    // transitions without a finger being down. Runtime-confirmed immediately
+    // after the v43 SpringBoard restart at 1789151974.244-.1977.234: those
+    // calls proposed -139x507, 150x446, 798.5x438 and 860x459 for the same
+    // restored About Finder Scene. Treating every response as user intent
+    // poisoned the Scene's authoritative size. A real resize response is
+    // synchronously nested inside our handleGestureEvent: scope; AppKit-led
+    // programmatic changes update the same map in MacWSApplyResizeRequest.
+    BOOL realGestureResponse = MacWSActiveResizeGestureModifier == self;
+    if ([selectedBundle isEqualToString:@"com.macwsguide.host"] &&
+        realGestureResponse) {
+        // This method is the RE-confirmed transaction constructor for the
+        // selected resize item. Its constrained proposal is authoritative,
+        // including intermediate values while the finger is moving; the last
+        // event naturally leaves the committed size in this per-Scene slot.
+        MacWSSetStableModelSize(selectedScene, constrained);
+        static CFTimeInterval lastHostResponseWitness;
+        CFTimeInterval now = CFAbsoluteTimeGetCurrent();
+        if (now - lastHostResponseWitness >= 0.08) {
+            lastHostResponseWitness = now;
+            MacWSWindowingLogLine([NSString stringWithFormat:
+                @"resize-response host scene=%@ proposed=%.1fx%.1f constrained=%.1fx%.1f policy=%@",
+                selectedScene ?: @"nil", size.width, size.height,
+                constrained.width, constrained.height,
+                policy ? @"scene-gesture" : @"identity-only-gesture"]);
+        }
+    } else if ([selectedBundle isEqualToString:@"com.macwsguide.host"]) {
+        static CFTimeInterval lastIgnoredTransitionWitness;
+        CFTimeInterval now = CFAbsoluteTimeGetCurrent();
+        if (now - lastIgnoredTransitionWitness >= 0.20) {
+            lastIgnoredTransitionWitness = now;
+            MacWSWindowingLogLine([NSString stringWithFormat:
+                @"resize-response ignored scene=%@ proposed=%.1fx%.1f constrained=%.1fx%.1f source=system-transition",
+                selectedScene ?: @"nil", size.width, size.height,
+                constrained.width, constrained.height]);
+        }
+    }
+    id previous = MacWSActiveResizeGestureModifier;
+    NSDictionary *previousPolicy = MacWSActiveDenseGridPolicy;
+    MacWSActiveResizeGestureModifier = self;
+    MacWSActiveDenseGridPolicy = policy;
+    @try {
+        return %orig(constrained, center, sceneUpdatesOnly);
+    } @finally {
+        MacWSActiveDenseGridPolicy = previousPolicy;
+        MacWSActiveResizeGestureModifier = previous;
+    }
+}
+
+- (id)handleGestureEvent:(id)event {
+    // Runtime metadata from the target proves this is the owning gesture
+    // boundary and that its `_layoutGrid` is per modifier. Keep the owner
+    // visible only while Apple's original handler synchronously resolves the
+    // proposed size.
+    id previous = MacWSActiveResizeGestureModifier;
+    NSDictionary *previousPolicy = MacWSActiveDenseGridPolicy;
+    BOOL host = MacWSResizeModifierTargetsHost(self);
+    NSDictionary *policy = host ? MacWSResizePolicyForModifier(self) : nil;
+    id layoutGrid = MacWSResizeModifierLayoutGrid(self);
+    // `_layoutGrid` is owned by this modifier (runtime metadata: ivar +248).
+    // Associate the exact selected Host Scene with that grid for the complete
+    // asynchronous resize transaction, not merely the synchronous callback.
+    // A modifier reused for a stock app clears the association before Apple's
+    // handler runs, so no dense candidate can leak across applications.
+    if (layoutGrid) {
+        NSDictionary *association = host
+            ? (policy ?: @{@"macws_host": @YES}) : nil;
+        objc_setAssociatedObject(
+            layoutGrid, &MacWSLayoutGridHostPolicyAssociationKey,
+            association, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    MacWSActiveResizeGestureModifier = self;
+    MacWSActiveDenseGridPolicy = policy;
+    @try {
+        return %orig(event);
+    } @finally {
+        MacWSActiveDenseGridPolicy = previousPolicy;
+        MacWSActiveResizeGestureModifier = previous;
+    }
+}
+%end
+
+%hook SBDisplayItemLayoutGrid
+- (CGSize)nearestGridSizeForProposedSize:(CGSize)proposedSize
+                            countOnStage:(NSUInteger)countOnStage
+                                inBounds:(CGRect)bounds
+                      contentOrientation:(NSInteger)contentOrientation
+                   layoutRestrictionInfo:(id)layoutRestrictionInfo
+                             screenScale:(CGFloat)screenScale
+                chamoisLayoutAttributes:(id)chamoisLayoutAttributes {
+    BOOL itemScope = MacWSItemLayoutScopeDepth > 0;
+    BOOL stageLimitScope = MacWSGroupLayoutScopeDepth > 0 && !itemScope;
+    BOOL scopedHostItem = itemScope && MacWSActiveLayoutSceneIdentifier.length > 0;
+    BOOL activeHost = MacWSResizeModifierTargetsHost(
+        MacWSActiveResizeGestureModifier);
+    NSDictionary *associatedPolicy = objc_getAssociatedObject(
+        self, &MacWSLayoutGridHostPolicyAssociationKey);
+    BOOL initialScope = scopedHostItem && MacWSInitialLayoutScopeDepth > 0 &&
+        MacWSActiveDenseGridPolicy != nil;
+    BOOL initialHost = initialScope;
+    // Runtime-confirmed by MacWSWindowing.log at 1789111604.455-.478:
+    // AppKit's programmatic Get Info resize entered the validated
+    // SBMainWorkspace transaction with a 292.6x696.6 target, but this grid
+    // method classified its synchronous lookup as `stock-app` and returned
+    // the stock 327-point width. MacWSApplyResizeRequest already brackets the
+    // exact identity-validated transition with this dense-grid scope; honor
+    // that scope here as a third, deliberately short-lived ownership source.
+    // Without it, UIKit's stock snap feeds a wider size back into AppKit and
+    // creates the repeated 266 -> 298 point Get Info width changes.
+    BOOL programmaticHost = !initialScope && MacWSDenseGridScopeDepth > 0 &&
+        MacWSActiveDenseGridPolicy != nil;
+    // A grid is a reusable calculator, not a Scene. Explicit group/item
+    // ownership takes precedence over a gesture association left on it.
+    BOOL host = !stageLimitScope && (itemScope ? scopedHostItem :
+        (activeHost || associatedPolicy != nil || programmaticHost));
+    NSDictionary *policy = itemScope
+        ? (scopedHostItem ? MacWSActiveDenseGridPolicy : nil)
+        : (stageLimitScope ? nil :
+           ((activeHost || programmaticHost)
+               ? MacWSActiveDenseGridPolicy : associatedPolicy));
+    if (initialHost) MacWSInitialGridObserved = YES;
+    NSNumber *lastScope = objc_getAssociatedObject(
+        self, &MacWSLayoutGridLastHostScopeAssociationKey);
+    BOOL changedScope = lastScope && lastScope.boolValue != host;
+    // SBDisplayItemLayoutGrid owns `_gridCache` (runtime-confirmed at +8).
+    // A cache created for the Host's dense candidates must never be reused by
+    // the next stock app, and a stock cache must not hide Host candidates.
+    if (changedScope || (!lastScope && host)) {
+        SEL clearSelector = NSSelectorFromString(@"clearCachedGrids");
+        if ([(id)self respondsToSelector:clearSelector])
+            ((void (*)(id, SEL))objc_msgSend)((id)self, clearSelector);
+    }
+    if (!lastScope || changedScope) {
+        objc_setAssociatedObject(
+            self, &MacWSLayoutGridLastHostScopeAssociationKey, @(host),
+            OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        MacWSWindowingLogLine([NSString stringWithFormat:
+            @"dense-grid-scope target=%@ proposed=%.1fx%.1f cache-cleared=%@",
+            host ? @"com.macwsguide.host" : @"stock-app",
+            proposedSize.width, proposedSize.height,
+            (changedScope || host) ? @"YES" : @"NO"]);
+    }
+    CGSize constrainedSize = proposedSize;
+    if (policy) {
+        CGFloat minimumWidth = [policy[@"minimum_width"] doubleValue];
+        CGFloat minimumHeight = [policy[@"minimum_height"] doubleValue];
+        CGFloat maximumWidth = [policy[@"maximum_width"] doubleValue];
+        CGFloat maximumHeight = [policy[@"maximum_height"] doubleValue];
+        // During initial layout the published geometry is the requested Scene
+        // size even when the AppKit window remains resizable afterward. Feed
+        // that exact proposal into Apple's ordinary nearest-grid algorithm;
+        // the scoped dense candidate set contains the same target, so system
+        // validation and quantization remain intact without a corrective
+        // post-connection resize.
+        if (initialHost || [policy[@"fixed_width"] boolValue])
+            constrainedSize.width = [policy[@"target_width"] doubleValue];
+        else
+            constrainedSize.width = MAX(constrainedSize.width, minimumWidth);
+        if (initialHost || [policy[@"fixed_height"] boolValue])
+            constrainedSize.height = [policy[@"target_height"] doubleValue];
+        else
+            constrainedSize.height = MAX(constrainedSize.height, minimumHeight);
+        if (maximumWidth > 0.0)
+            constrainedSize.width = MIN(constrainedSize.width, maximumWidth);
+        if (maximumHeight > 0.0)
+            constrainedSize.height = MIN(constrainedSize.height, maximumHeight);
+    }
+    NSDictionary *previousPolicy = MacWSActiveDenseGridPolicy;
+    CGSize previousProposal = MacWSActiveDenseGridProposal;
+    NSArray<NSNumber *> *originalWidths = nil;
+    NSArray<NSNumber *> *originalHeights = nil;
+    NSArray<NSNumber *> *denseWidths = nil;
+    NSArray<NSNumber *> *denseHeights = nil;
+    if (host) {
+        MacWSActiveDenseGridPolicy = policy;
+        MacWSActiveDenseGridProposal = constrainedSize;
+        // The target build caches candidate arrays inside the attributes
+        // object before this method. A scoped getter alone produced expanded
+        // witness files but the actual nearest-size computation still read
+        // that cached stock array. Temporarily install dense arrays on the
+        // exact attributes argument, run Apple's original calculation, then
+        // restore both arrays and invalidate the grid cache on the same main-
+        // thread stack. No stock application can observe this transaction.
+        // A programmatic AppKit->Scene transition can enter this method while
+        // MacWSDenseGridScopeDepth is already nonzero. Calling our scoped
+        // getters in that state returns the expanded arrays and then the old
+        // finally block wrote those arrays back as the supposed originals.
+        // Runtime-confirmed at 1789061605.048: even a `stock-app` lookup then
+        // reported stock=129x84 instead of 8x4. Read the real stored arrays
+        // with the getter scope temporarily disabled, then restore the exact
+        // prior nesting depth before running Apple's calculation.
+        NSUInteger outerDepth = MacWSDenseGridScopeDepth;
+        MacWSDenseGridScopeDepth = 0;
+        @try {
+            originalWidths = MacWSMessageObject(
+                chamoisLayoutAttributes, NSSelectorFromString(@"gridWidths"));
+            originalHeights = MacWSMessageObject(
+                chamoisLayoutAttributes, NSSelectorFromString(@"gridHeights"));
+        } @finally {
+            MacWSDenseGridScopeDepth = outerDepth;
+        }
+        denseWidths = MacWSDenseCandidates(originalWidths, "host-width");
+        denseHeights = MacWSDenseCandidates(originalHeights, "host-height");
+        SEL setWidths = NSSelectorFromString(@"setGridWidths:");
+        SEL setHeights = NSSelectorFromString(@"setGridHeights:");
+        if ([chamoisLayoutAttributes respondsToSelector:setWidths] &&
+            denseWidths)
+            ((void (*)(id, SEL, id))objc_msgSend)(
+                chamoisLayoutAttributes, setWidths, denseWidths);
+        if ([chamoisLayoutAttributes respondsToSelector:setHeights] &&
+            denseHeights)
+            ((void (*)(id, SEL, id))objc_msgSend)(
+                chamoisLayoutAttributes, setHeights, denseHeights);
+        SEL clearSelector = NSSelectorFromString(@"clearCachedGrids");
+        if ([(id)self respondsToSelector:clearSelector])
+            ((void (*)(id, SEL))objc_msgSend)((id)self, clearSelector);
+        MacWSDenseGridScopeDepth++;
+    }
+    CGSize result = CGSizeZero;
+    @try {
+        result = %orig(constrainedSize, countOnStage, bounds,
+                       contentOrientation, layoutRestrictionInfo,
+                       screenScale, chamoisLayoutAttributes);
+    } @finally {
+        if (host) {
+            MacWSDenseGridScopeDepth--;
+            SEL setWidths = NSSelectorFromString(@"setGridWidths:");
+            SEL setHeights = NSSelectorFromString(@"setGridHeights:");
+            if ([chamoisLayoutAttributes respondsToSelector:setWidths] &&
+                originalWidths)
+                ((void (*)(id, SEL, id))objc_msgSend)(
+                    chamoisLayoutAttributes, setWidths, originalWidths);
+            if ([chamoisLayoutAttributes respondsToSelector:setHeights] &&
+                originalHeights)
+                ((void (*)(id, SEL, id))objc_msgSend)(
+                    chamoisLayoutAttributes, setHeights, originalHeights);
+            SEL clearSelector = NSSelectorFromString(@"clearCachedGrids");
+            if ([(id)self respondsToSelector:clearSelector])
+                ((void (*)(id, SEL))objc_msgSend)((id)self, clearSelector);
+            MacWSActiveDenseGridProposal = previousProposal;
+            MacWSActiveDenseGridPolicy = previousPolicy;
+        }
+    }
+    if (stageLimitScope) {
+        static CGSize lastStageProposal;
+        static CGSize lastStageResult;
+        if (!CGSizeEqualToSize(lastStageProposal, proposedSize) ||
+            !CGSizeEqualToSize(lastStageResult, result)) {
+            lastStageProposal = proposedSize;
+            lastStageResult = result;
+            MacWSWindowingLogLine([NSString stringWithFormat:
+                @"stage-layout-limit proposed=%.1fx%.1f result=%.1fx%.1f item-policy=none count=%lu",
+                proposedSize.width, proposedSize.height,
+                result.width, result.height, (unsigned long)countOnStage]);
+        }
+    }
+    if (host) {
+        static CFTimeInterval lastGridResultWitness;
+        CFTimeInterval now = CFAbsoluteTimeGetCurrent();
+        if (now - lastGridResultWitness >= 0.10) {
+            lastGridResultWitness = now;
+            MacWSWindowingLogLine([NSString stringWithFormat:
+                @"dense-grid-result grid=%p proposed=%.1fx%.1f constrained=%.1fx%.1f result=%.1fx%.1f candidates=%lux%lu stock=%lux%lu policy=%@",
+                self, proposedSize.width, proposedSize.height,
+                constrainedSize.width, constrainedSize.height,
+                result.width, result.height,
+                (unsigned long)denseWidths.count,
+                (unsigned long)denseHeights.count,
+                (unsigned long)originalWidths.count,
+                (unsigned long)originalHeights.count,
+                policy[@"scene_identifier"] ?: @"none"]);
+        }
+    }
+    if (policy && (fabs(constrainedSize.width - proposedSize.width) > 0.5 ||
+                   fabs(constrainedSize.height - proposedSize.height) > 0.5)) {
+        static CFTimeInterval lastPolicyWitness;
+        CFTimeInterval now = CFAbsoluteTimeGetCurrent();
+        if (now - lastPolicyWitness >= 0.20) {
+            lastPolicyWitness = now;
+            MacWSWindowingLogLine([NSString stringWithFormat:
+                @"resize-policy springback scene=%@ proposed=%.1fx%.1f constrained=%.1fx%.1f result=%.1fx%.1f fixed=%@x%@",
+                policy[@"scene_identifier"], proposedSize.width,
+                proposedSize.height, constrainedSize.width,
+                constrainedSize.height, result.width, result.height,
+                [policy[@"fixed_width"] boolValue] ? @"YES" : @"NO",
+                [policy[@"fixed_height"] boolValue] ? @"YES" : @"NO"]);
+        }
+    }
+    return result;
+}
+%end
+
+%hook SBSwitcherChamoisSettings
+- (CGSize)_nearestGridSizeForSize:(CGSize)proposedSize
+                        gridWidths:(NSArray<NSNumber *> *)gridWidths
+                       gridHeights:(NSArray<NSNumber *> *)gridHeights
+                            bounds:(CGRect)bounds {
+    if ((MacWSGroupLayoutScopeDepth > 0 && MacWSItemLayoutScopeDepth == 0) ||
+        (MacWSItemLayoutScopeDepth > 0 && !MacWSActiveLayoutSceneIdentifier.length))
+        return %orig(proposedSize, gridWidths, gridHeights, bounds);
+    // RE-confirmed via SpringBoard 20D67 at 0x1c7bd311c: this is the leaf
+    // Chamois quantizer which iterates the supplied width and height arrays.
+    // The wrapper SBDisplayItemLayoutGrid call can return an exact Host size,
+    // but the same gesture performs another leaf quantization before UIKit
+    // receives its final Scene geometry.  Runtime evidence at
+    // 1789135985.534-.5989.589 showed the wrapper returning exact values such
+    // as 962x441 and 1044.5x604 while the Host Scene still landed only on the
+    // stock 1004/891/665/327 widths.  Supply dense arrays at this leaf for the
+    // exact, synchronously selected Host gesture.  Programmatic and initial
+    // transactions retain their already identity-validated short-lived
+    // scopes; every stock application receives Apple's arrays byte-for-byte.
+    BOOL activeHost = MacWSResizeModifierTargetsHost(
+        MacWSActiveResizeGestureModifier);
+    BOOL initialHost = MacWSInitialLayoutScopeDepth > 0 &&
+        MacWSActiveDenseGridPolicy != nil;
+    BOOL programmaticHost = MacWSInitialLayoutScopeDepth == 0 &&
+        MacWSDenseGridScopeDepth > 0 &&
+        MacWSActiveDenseGridPolicy != nil;
+    if (!activeHost && !initialHost && !programmaticHost)
+        return %orig(proposedSize, gridWidths, gridHeights, bounds);
+
+    CGSize previousProposal = MacWSActiveDenseGridProposal;
+    MacWSActiveDenseGridProposal = proposedSize;
+    NSArray<NSNumber *> *denseWidths = MacWSDenseCandidates(
+        gridWidths, "host-leaf-width");
+    NSArray<NSNumber *> *denseHeights = MacWSDenseCandidates(
+        gridHeights, "host-leaf-height");
+    CGSize result = %orig(proposedSize, denseWidths, denseHeights, bounds);
+    MacWSActiveDenseGridProposal = previousProposal;
+
+    static CFTimeInterval lastLeafWitness;
+    CFTimeInterval now = CFAbsoluteTimeGetCurrent();
+    if (now - lastLeafWitness >= 0.10) {
+        lastLeafWitness = now;
+        MacWSWindowingLogLine([NSString stringWithFormat:
+            @"dense-grid-leaf proposed=%.1fx%.1f result=%.1fx%.1f candidates=%lux%lu scope=%@",
+            proposedSize.width, proposedSize.height,
+            result.width, result.height,
+            (unsigned long)denseWidths.count,
+            (unsigned long)denseHeights.count,
+            activeHost ? @"gesture" :
+                (initialHost ? @"initial" : @"programmatic")]);
+    }
+    return result;
 }
 %end
 
@@ -972,18 +2463,76 @@ static void MacWSInstallRequestObservers(void *context) {
             center, NULL, MacWSHandleResizeRequest,
             MacWSRequestResizeNotification, NULL,
             CFNotificationSuspensionBehaviorDeliverImmediately);
+        CFNotificationCenterAddObserver(
+            center, NULL, MacWSHandleInitialSizeRequest,
+            MacWSRequestInitialSizeNotification, NULL,
+            CFNotificationSuspensionBehaviorDeliverImmediately);
+
+        Class coordinatorClass = NSClassFromString(
+            @"SBMainSwitcherControllerCoordinator");
+        SEL initialSelector = NSSelectorFromString(
+            @"addCenterRoleAppLayoutForDisplayItem:windowScene:completion:");
+        Method initialMethod = coordinatorClass
+            ? class_getInstanceMethod(coordinatorClass, initialSelector) : NULL;
+        Class chamoisSettingsClass = NSClassFromString(
+            @"SBSwitcherChamoisSettings");
+        SEL leafGridSelector = NSSelectorFromString(
+            @"_nearestGridSizeForSize:gridWidths:gridHeights:bounds:");
+        Method leafGridMethod = chamoisSettingsClass
+            ? class_getInstanceMethod(chamoisSettingsClass, leafGridSelector)
+            : NULL;
+        MacWSWindowingLogLine([NSString stringWithFormat:
+            @"initial-size method-metadata class=%@ selector=%@ encoding=%s leaf-class=%@ leaf-selector=%@ leaf-encoding=%s",
+            coordinatorClass ? @"YES" : @"NO",
+            initialMethod ? @"YES" : @"NO",
+            initialMethod ? method_getTypeEncoding(initialMethod) : "missing",
+            chamoisSettingsClass ? @"YES" : @"NO",
+            leafGridMethod ? @"YES" : @"NO",
+            leafGridMethod ? method_getTypeEncoding(leafGridMethod) :
+                "missing"]);
+        Class transitionRequestClass = NSClassFromString(
+            @"SBMutableSwitcherTransitionRequest");
+        MacWSWindowingLogLine([NSString stringWithFormat:
+            @"initial-size method-inventory transition-instance=[%@] transition-class=[%@] coordinator=[%@]",
+            MacWSMethodInventory(transitionRequestClass,
+                @[@"app", @"layout", @"activate", @"scene"]),
+            MacWSMethodInventory(object_getClass(transitionRequestClass),
+                @[@"app", @"layout", @"activate", @"scene"]),
+            MacWSMethodInventory(coordinatorClass,
+                @[@"center", @"layout", @"transition"])]);
+        MacWSWindowingLogLine([NSString stringWithFormat:
+            @"initial-size sizing-inventory attributes=[%@] grid=[%@] settings=[%@] app-layout=[%@]",
+            MacWSMethodInventory(NSClassFromString(
+                @"SBDisplayItemLayoutAttributes"),
+                @[@"size", @"center", @"frame", @"grid", @"policy"]),
+            MacWSMethodInventory(NSClassFromString(@"SBDisplayItemLayoutGrid"),
+                @[@"size", @"grid", @"cache", @"attribute"]),
+            MacWSMethodInventory(chamoisSettingsClass,
+                @[@"size", @"grid", @"attribute", @"layout"]),
+            MacWSMethodInventory(NSClassFromString(@"SBAppLayout"),
+                @[@"item", @"role", @"attribute", @"layout"])]);
 
         // This file is a readiness witness, not merely an image-load witness:
-        // publish it only after both Darwin observers are installed.
+        // publish it only after all Darwin observers and the initial-layout
+        // hook's target method are present.
         int fd = open(MacWSDenseGridLoaded,
                       O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
         if (fd >= 0) {
-            dprintf(fd, "version=16 pid=%d step=10 minimum=150 "
+            dprintf(fd, "version=51 pid=%d sizing=exact-live-proposal "
+                    "resize-gesture=exact-scene-native-end-notification "
+                        "fallback-step=10 minimum=150 "
                         "observers=main-queue-after-dyld "
+                        "grid=exact-host-leaf-quantizer-and-programmatic-scope "
+                        "grid-storage=scoped-original-arrays-no-writeback "
+                        "constraints=exact-scene-response-appkit-springback "
                         "fullscreen=exact-scene-activate-then-maximization-toggle-action-17 "
-                        "resize=app-layout-transaction "
+                        "resize=whole-current-stage-membership-animation-disabled "
+                        "initial=preactivation-lower-per-item-calculator "
+                        "initial-size-protocol=1 "
+                        "group=stage-limit-without-item-policy "
+                        "diagnostics=per-item-frame-and-stage-limit "
                         "exit=system-maximization-unzoom "
-                        "postcondition=host-scene-screen-geometry\n",
+                        "postcondition=current-stage-membership-and-model-size-not-visual\n",
                         getpid());
             close(fd);
         }

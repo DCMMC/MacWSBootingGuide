@@ -21,6 +21,8 @@ typedef NS_ENUM(NSUInteger, MacWSHostPresentationResolution) {
 - (void)metalView:(nullable MacWSMetalView *)view
       emittedInput:(MacWSInputRecord)record;
 - (void)metalView:(MacWSMetalView *)view
+    completedDirectTapAtViewPoint:(CGPoint)viewPoint;
+- (void)metalView:(MacWSMetalView *)view
   receivedWindows:(NSArray<MacWSStreamWindow *> *)windows;
 - (void)metalView:(MacWSMetalView *)view
     windowConfigurationWasConstrainedToLogicalSize:(CGSize)appliedSize
@@ -46,7 +48,11 @@ typedef NS_ENUM(NSUInteger, MacWSHostPresentationResolution) {
 @property(nonatomic) MacWSHostPresentationResolution presentationResolution;
 @property(nonatomic) CGFloat fixedZoomScale;
 @property(nonatomic) CGSize minimumLogicalSize;
+@property(nonatomic) CGSize maximumLogicalSize;
+@property(nonatomic) BOOL windowConfigurationAcknowledgementsAvailable;
 @property(nonatomic) BOOL targetWindowResizable;
+@property(nonatomic) BOOL targetWindowFixedWidth;
+@property(nonatomic) BOOL targetWindowFixedHeight;
 @property(nonatomic) BOOL softwareKeyboardActive;
 // A native iPadOS drag and a macOS long-press/right-click begin with the same
 // physical gesture. The controller arms this explicitly for one cross-App
@@ -56,8 +62,14 @@ typedef NS_ENUM(NSUInteger, MacWSHostPresentationResolution) {
 @property(nonatomic, readonly) BOOL hasDirectSurfaceFrame;
 @property(nonatomic, readonly) BOOL hasFinalCompositeFrame;
 @property(nonatomic, readonly) BOOL streamServiceConnected;
+// Advances only for a received native catalog, not local layer-order refresh.
+@property(nonatomic, readonly) uint64_t windowCatalogRevision;
 @property(nonatomic, readonly) CGFloat effectiveDensityScale;
 @property(nonatomic, readonly) BOOL windowConfigurationAwaitingAcknowledgement;
+@property(nonatomic, readonly) BOOL windowConfigurationAwaitingSettlement;
+@property(nonatomic, readonly) BOOL nativeWindowResizeGestureActive;
+@property(nonatomic, readonly) BOOL windowConfigurationHasQueuedRequest;
+@property(nonatomic, readonly) BOOL sceneResizeFollowingTargetWindow;
 @property(nonatomic, readonly) MacWSPerformanceMonitor *performanceMonitor;
 - (void)setMacWSInputEnabled:(BOOL)enabled
                       reason:(nullable NSString *)reason;
@@ -69,6 +81,10 @@ typedef NS_ENUM(NSUInteger, MacWSHostPresentationResolution) {
 - (void)resetViewportZoom;
 - (void)geometryDidChange;
 - (void)observeTargetWindowLogicalSize:(CGSize)logicalSize;
+- (void)observeWindowConfigurationWithTimestamp:(double)timestamp
+                                sampleSequence:(uint32_t)sampleSequence
+                                 requestedSize:(CGSize)requestedSize
+                                   appliedSize:(CGSize)appliedSize;
 - (void)beginSceneResizeFollowingTargetWindowLogicalSize:(CGSize)logicalSize;
 - (void)cancelSceneResizeFollowingTargetWindow;
 - (void)suspendStream;
@@ -79,6 +95,11 @@ typedef NS_ENUM(NSUInteger, MacWSHostPresentationResolution) {
 // matching finish always releases the synthetic primary-button transaction.
 - (BOOL)beginInteropDragProbeAtViewPoint:(CGPoint)viewPoint;
 - (void)finishInteropDragProbeCancelled:(BOOL)cancelled;
+// The two-finger context click and the controller's two-finger export hold
+// share one physical chord.  Make the short tap wait for the hold recognizer
+// to fail so one chord can commit to exactly one semantic action.
+- (void)requireSecondaryTapToFailGestureRecognizer:
+    (UIGestureRecognizer *)gestureRecognizer;
 // A UIKit drop is committed to the exact visible macOS point, then routed
 // through the target application's enabled Command-V menu action after
 // macwsinteropd acknowledges the full pasteboard archive.

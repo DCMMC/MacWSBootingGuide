@@ -8,9 +8,14 @@
 #include <CommonCrypto/CommonDigest.h>
 #include <dirent.h>
 #include <dlfcn.h>
+#include <errno.h>
+#include <fcntl.h>
 #include <stdatomic.h>
+#include <sys/stat.h>
+#include <unistd.h>
 #include <xpc/xpc.h>
 
+#include "macws_control_protocol.h"
 #include "macws_interop_protocol.h"
 
 static NSString *const MacWSImportsHostRoot =
@@ -332,6 +337,165 @@ static NSURL *MacWSStageDragProviderURL(NSURL *sourceURL, NSError **error) {
     return destination;
 }
 
+static BOOL MacWSProviderPOSIXFallbackSourcePath(NSString *path) {
+    if (!MacWSAbsoluteArchivePath(path)) return NO;
+    NSString *standard = path.stringByStandardizingPath;
+    // Runtime-confirmed in MacWSHost.log on 2026-09-10: Notes vends its real
+    // callback-scoped attachment below one of these two container roots, and
+    // NSFileManager can stat it even though its coordinated destination copy
+    // fails with NSCocoaErrorDomain 513. Keep the unsandboxed POSIX fallback
+    // restricted to iOS app/group containers; other URLs continue through
+    // Foundation and their security-scoped extension only.
+    for (NSString *root in @[@"/private/var/mobile/Containers",
+                              @"/var/mobile/Containers"]) {
+        if ([standard hasPrefix:[root stringByAppendingString:@"/"]])
+            return YES;
+    }
+    return NO;
+}
+
+static BOOL MacWSProviderPOSIXCopyRegularFile(NSURL *sourceURL,
+                                              NSURL *destinationURL,
+                                              NSError **error) {
+    NSString *sourcePath = sourceURL.path.stringByStandardizingPath;
+    NSString *destinationPath =
+        destinationURL.path.stringByStandardizingPath;
+    NSString *destinationRoot =
+        [MacWSImportsHostRoot.stringByStandardizingPath
+            stringByAppendingString:@"/"];
+    if (!MacWSProviderPOSIXFallbackSourcePath(sourcePath) ||
+        ![destinationPath hasPrefix:destinationRoot]) {
+        if (error) *error = MacWSError(24,
+            @"项目文件不在受支持的 iOS 提供器目录中");
+        return NO;
+    }
+
+    int sourceFD = open(sourcePath.fileSystemRepresentation,
+                        O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (sourceFD < 0) {
+        if (error) *error = [NSError errorWithDomain:NSPOSIXErrorDomain
+            code:errno userInfo:@{NSFilePathErrorKey: sourcePath}];
+        return NO;
+    }
+    struct stat sourceStat = {0};
+    if (fstat(sourceFD, &sourceStat) != 0 || !S_ISREG(sourceStat.st_mode) ||
+        sourceStat.st_size < 0) {
+        int savedErrno = errno ?: EINVAL;
+        close(sourceFD);
+        if (error) *error = [NSError errorWithDomain:NSPOSIXErrorDomain
+            code:savedErrno userInfo:@{NSFilePathErrorKey: sourcePath}];
+        return NO;
+    }
+
+    int destinationFD = open(destinationPath.fileSystemRepresentation,
+        O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
+    if (destinationFD < 0) {
+        int savedErrno = errno;
+        close(sourceFD);
+        if (error) *error = [NSError errorWithDomain:NSPOSIXErrorDomain
+            code:savedErrno userInfo:@{NSFilePathErrorKey: destinationPath}];
+        return NO;
+    }
+
+    BOOL copied = YES;
+    int savedErrno = 0;
+    uint8_t buffer[128 * 1024];
+    for (;;) {
+        ssize_t count = read(sourceFD, buffer, sizeof(buffer));
+        if (count == 0) break;
+        if (count < 0) {
+            if (errno == EINTR) continue;
+            copied = NO;
+            savedErrno = errno;
+            break;
+        }
+        ssize_t offset = 0;
+        while (offset < count) {
+            ssize_t written = write(destinationFD, buffer + offset,
+                                    (size_t)(count - offset));
+            if (written < 0 && errno == EINTR) continue;
+            if (written <= 0) {
+                copied = NO;
+                savedErrno = written < 0 ? errno : EIO;
+                break;
+            }
+            offset += written;
+        }
+        if (!copied) break;
+    }
+    if (copied && fsync(destinationFD) != 0) {
+        copied = NO;
+        savedErrno = errno;
+    }
+    close(destinationFD);
+    close(sourceFD);
+    if (!copied) {
+        unlink(destinationPath.fileSystemRepresentation);
+        if (error) *error = [NSError errorWithDomain:NSPOSIXErrorDomain
+            code:(savedErrno ?: EIO)
+            userInfo:@{NSFilePathErrorKey: destinationPath}];
+    }
+    return copied;
+}
+
+static BOOL MacWSProviderRootStageRegularFile(NSURL *sourceURL,
+                                              NSURL *destinationURL,
+                                              NSError **error) {
+    NSString *sourcePath = sourceURL.path.stringByStandardizingPath;
+    NSString *destinationPath =
+        destinationURL.path.stringByStandardizingPath;
+    if (!MacWSProviderPOSIXFallbackSourcePath(sourcePath)) return NO;
+
+    xpc_connection_t (*createMach)(const char *, dispatch_queue_t, uint64_t) =
+        dlsym(RTLD_DEFAULT, "xpc_connection_create_mach_service");
+    if (!createMach) {
+        if (error) *error = MacWSError(26, @"root 暂存服务不可用");
+        return NO;
+    }
+    dispatch_queue_t queue = dispatch_queue_create(
+        "com.macwsguide.host.provider-root-stage", DISPATCH_QUEUE_SERIAL);
+    xpc_connection_t connection = createMach(
+        MACWS_CONTROL_SERVICE, queue, 0);
+    if (!connection) {
+        if (error) *error = MacWSError(26, @"无法连接 root 暂存服务");
+        return NO;
+    }
+    // xpc_connection_resume() requires every non-listener connection to have
+    // an event handler, even when the only application message uses the
+    // synchronous reply API below.  The two Notes drops captured in
+    // MacWSHost-2026-09-11-013232/013239.ips both trap in
+    // _xpc_connection_activate_if_needed -> xpc_connection_resume with
+    // _xpc_api_misuse before hostd can receive the request.  Install the
+    // required handler at the connection lifecycle boundary; synchronous
+    // reply/error interpretation remains below.
+    xpc_connection_set_event_handler(connection, ^(xpc_object_t event) {
+        (void)event;
+    });
+    xpc_connection_resume(connection);
+    xpc_object_t request = xpc_dictionary_create(NULL, NULL, 0);
+    xpc_dictionary_set_string(request, MACWS_CONTROL_KEY_OP,
+                              MACWS_CONTROL_OP_STAGE_PROVIDER_FILE);
+    xpc_dictionary_set_string(request,
+        MACWS_CONTROL_KEY_PROVIDER_SOURCE_PATH,
+        sourcePath.fileSystemRepresentation);
+    xpc_dictionary_set_string(request,
+        MACWS_CONTROL_KEY_PROVIDER_DESTINATION_PATH,
+        destinationPath.fileSystemRepresentation);
+    xpc_object_t reply = xpc_connection_send_message_with_reply_sync(
+        connection, request);
+    BOOL copied = reply && xpc_get_type(reply) == XPC_TYPE_DICTIONARY &&
+        xpc_dictionary_get_bool(reply, "ok");
+    if (!copied && error) {
+        const char *message = reply && xpc_get_type(reply) == XPC_TYPE_DICTIONARY
+            ? xpc_dictionary_get_string(reply, "message") : NULL;
+        NSString *description = message
+            ? [NSString stringWithUTF8String:message] : @"root 暂存服务没有响应";
+        *error = MacWSError(26, description ?: @"root 暂存服务失败");
+    }
+    xpc_connection_cancel(connection);
+    return copied;
+}
+
 static BOOL MacWSStageProviderURL(NSURL *url, NSString *suggestedName,
                                   NSString *type, NSUInteger index,
                                   NSString **chrootPath, NSError **error) {
@@ -351,11 +515,38 @@ static BOOL MacWSStageProviderURL(NSURL *url, NSString *suggestedName,
     NSURL *destination = [NSURL fileURLWithPath:
         [batch stringByAppendingPathComponent:name]];
     BOOL scoped = [url startAccessingSecurityScopedResource];
+    NSError *foundationError = nil;
     BOOL copied = [NSFileManager.defaultManager copyItemAtURL:url
                                                         toURL:destination
-                                                        error:error];
+                                                        error:&foundationError];
+    NSError *fallbackError = nil;
+    if (!copied && MacWSProviderPOSIXFallbackSourcePath(url.path)) {
+        // The destination may exist partially after a failed coordinated
+        // copy. Remove only this freshly generated batch member before using
+        // O_EXCL for the streaming fallback.
+        unlink(destination.path.fileSystemRepresentation);
+        copied = MacWSProviderPOSIXCopyRegularFile(url, destination,
+                                                   &fallbackError);
+        MacWSLog(@"interop-provider-posix-stage source=%@ destination=%@ accepted=%@ foundation-error=%@ fallback-error=%@",
+            url.path, destination.path, copied ? @"YES" : @"NO",
+            foundationError ?: @"nil", fallbackError ?: @"nil");
+    }
+    NSError *rootStageError = nil;
+    if (!copied && MacWSProviderPOSIXFallbackSourcePath(url.path)) {
+        unlink(destination.path.fileSystemRepresentation);
+        copied = MacWSProviderRootStageRegularFile(
+            url, destination, &rootStageError);
+        MacWSLog(@"interop-provider-root-stage source=%@ destination=%@ accepted=%@ error=%@",
+            url.path, destination.path, copied ? @"YES" : @"NO",
+            rootStageError ?: @"nil");
+    }
     if (scoped) [url stopAccessingSecurityScopedResource];
-    if (!copied) return NO;
+    if (!copied) {
+        if (error) *error = rootStageError ?: fallbackError ?: foundationError ?:
+            MacWSError(25, @"无法复制项目提供器文件");
+        return NO;
+    }
+    if (error) *error = nil;
     if (chrootPath) *chrootPath = [destination.path substringFromIndex:
         MacWSRootFSHostPrefix.length];
     return YES;
@@ -974,27 +1165,34 @@ static NSURL *MacWSResolvedProviderFileURL(id item) {
             scheduledRepresentations++;
         }
         NSString *materializationType = MacWSPreferredMaterializationType(types);
-        BOOL materializationTypeIsAbstract =
-            [materializationType isEqualToString:UTTypeItem.identifier] ||
-            [materializationType isEqualToString:UTTypeContent.identifier] ||
-            [materializationType isEqualToString:UTTypeData.identifier];
         if (materializationType &&
             scheduledRepresentations < MACWS_INTEROP_MAX_REPRESENTATIONS) {
             // Request the provider's primary payload while performDrop: still
             // owns the UIDropSession. Runtime-confirmed on 2026-09-10: Notes'
             // public.png endpoint was invalidated after the earlier in-place
             // and UIImage attempts, so the later data request received zero
-            // bytes. Concrete UTIs are acquired directly as data; abstract
-            // public.content attachments use loadItem so their file URL and
-            // suggested filename survive the provider callback boundary.
+            // bytes. loadItem preserves either its real callback-scoped URL
+            // or concrete object for abstract and concrete UTIs alike.
             [jobs addObject:@{
                 @"provider": provider,
                 @"item_index": @(itemIndex),
                 @"order": @(-3),
                 MacWSArchiveTypeKey: materializationType,
-                @"kind": materializationTypeIsAbstract
-                    ? @"direct-item" : @"primary-data",
-                @"materialize_data": @(!materializationTypeIsAbstract)
+                @"kind": @"direct-item"
+            }];
+            scheduledRepresentations++;
+        }
+        if (materializationType &&
+            scheduledRepresentations < MACWS_INTEROP_MAX_REPRESENTATIONS) {
+            // Keep the provider's declared data loader as a fallback when
+            // loadItem returns an object that cannot be materialized.
+            [jobs addObject:@{
+                @"provider": provider,
+                @"item_index": @(itemIndex),
+                @"order": @(-2.5),
+                MacWSArchiveTypeKey: materializationType,
+                @"kind": @"primary-data",
+                @"materialize_data": @YES
             }];
             scheduledRepresentations++;
         }
@@ -1043,8 +1241,7 @@ static NSURL *MacWSResolvedProviderFileURL(id item) {
             // staged URL when NSPasteboardItem de-duplicates identical types.
             if (!type.length || [type isEqualToString:UTTypeFileURL.identifier])
                 continue;
-            if ([type isEqualToString:materializationType] &&
-                !materializationTypeIsAbstract) continue;
+            if ([type isEqualToString:materializationType]) continue;
             [jobs addObject:@{
                 @"provider": provider,
                 @"item_index": @(itemIndex),
@@ -1078,6 +1275,17 @@ static NSURL *MacWSResolvedProviderFileURL(id item) {
     __block __weak void (^weakLoadNext)(void) = nil;
     loadNext = ^{
         if (finished) return;
+        // Once one real file representation has been staged, avoid asking
+        // that same short-lived provider for redundant formats. Runtime logs
+        // show Notes invalidating its endpoint during those later loaders;
+        // Finder only needs the staged public.file-url for this drag item.
+        while (jobIndex < jobs.count) {
+            NSDictionary *candidate = jobs[jobIndex];
+            NSUInteger candidateIndex =
+                [candidate[@"item_index"] unsignedIntegerValue];
+            if (!MacWSSlotHasFileURL(slots[candidateIndex])) break;
+            jobIndex++;
+        }
         if (jobIndex >= jobs.count) {
             finished = YES;
             [self sendLoadedProviderSlots:slots completion:completion];

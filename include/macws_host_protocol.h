@@ -243,25 +243,43 @@ enum {
 
 typedef uint16_t MacWSHostDisplayDensity;
 enum {
-    // Pixel-matched Retina mode. The Host derives density from the exported
-    // AppKit backing scale divided by the current MTK drawable/Scene scale;
-    // this remains correct when Stage Manager changes UIKit's render scale.
+    // One AppKit logical point maps to one UIKit Scene point. Retina backing
+    // scale is applied only while allocating/presenting drawable pixels and
+    // never feeds back into native Scene geometry.
     MacWSHostDisplayDensityTouchComfort = 1,
-    // Optional more-space mode. It applies a 0.85 factor to the dynamic native
-    // density so about 18% more macOS logical points fit into the Scene, at the
-    // cost of a controlled downsample.
+    // Retained persisted values, no longer selectable. More-space migrates
+    // to pixel matching; the old mild enlargement migrates to 125 percent.
     MacWSHostDisplayDensityKeyboard = 2,
-    // Optional larger touch presentation. The Host applies a mild 10%
-    // high-quality upsample, so this is deliberately not described as exact
-    // Retina. TouchComfort remains the default one-source-pixel-to-one-
-    // drawable-pixel mode.
     MacWSHostDisplayDensityComfort = 3,
+    MacWSHostDisplayDensityComfort125 = 4,
+    MacWSHostDisplayDensityComfort150 = 5,
 };
 
-// Physical source of an input sample. Version 4 keeps this explicit instead
-// of inferring Pencil, finger and indirect-pointer semantics from pressure or
-// contact IDs. Producers that cannot identify the device (for example the
-// legacy VNC bridge) use Unknown and retain ordinary mouse behavior.
+static inline MacWSHostDisplayDensity MacWSNormalizedDisplayDensity(
+        MacWSHostDisplayDensity density) {
+    if (density == MacWSHostDisplayDensityComfort ||
+        density == MacWSHostDisplayDensityComfort125)
+        return MacWSHostDisplayDensityComfort125;
+    if (density == MacWSHostDisplayDensityComfort150)
+        return MacWSHostDisplayDensityComfort150;
+    return MacWSHostDisplayDensityTouchComfort;
+}
+
+static inline double MacWSDisplayDensityFactor(
+        MacWSHostDisplayDensity density) {
+    density = MacWSNormalizedDisplayDensity(density);
+    if (density == MacWSHostDisplayDensityComfort125) return 1.25;
+    if (density == MacWSHostDisplayDensityComfort150) return 1.50;
+    return 1.0;
+}
+
+// Source semantics of an input sample. Version 4 keeps physical devices
+// explicit instead of inferring Pencil, finger and indirect-pointer behavior
+// from pressure or contact IDs. Producers that cannot identify the device
+// (for example the legacy VNC bridge) use Unknown. The interoperability probe
+// is deliberately distinct from a physical finger: it briefly asks AppKit to
+// publish the selected files on its native dragging pasteboard, and must not
+// be routed through the longer process-local direct-manipulation lifecycle.
 typedef uint16_t MacWSInputSource;
 enum {
     MacWSInputSourceUnknown = 0,
@@ -271,6 +289,8 @@ enum {
     MacWSInputSourceHardwareKeyboard = 4,
     MacWSInputSourceSoftwareKeyboard = 5,
     MacWSInputSourceVNC = 6,
+    MacWSInputSourceInteropDragProbe = 7,
+    MacWSInputSourceMax = MacWSInputSourceInteropDragProbe,
 };
 
 enum {

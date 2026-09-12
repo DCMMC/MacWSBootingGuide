@@ -185,7 +185,7 @@ static bool RecordIsValid(const MacWSInputRecord *record) {
         !isfinite(record->x) || !isfinite(record->y) ||
         record->frameWidth == 0 || record->frameHeight == 0 ||
         record->targetPID < 0 ||
-        record->source > MacWSInputSourceVNC ||
+        record->source > MacWSInputSourceMax ||
         !isfinite(record->altitude) || !isfinite(record->azimuth) ||
         !isfinite(record->tiltX) || !isfinite(record->tiltY) ||
         record->tiltX < -1.0f || record->tiltX > 1.0f ||

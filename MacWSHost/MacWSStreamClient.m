@@ -12,10 +12,30 @@
 @implementation MacWSStreamWindow
 - (instancetype)initWithDescriptor:(MacWSStreamWindowDescriptor)descriptor
                               title:(NSString *)title {
+    return [self initWithDescriptor:descriptor title:title limits:NULL];
+}
+- (instancetype)initWithDescriptor:(MacWSStreamWindowDescriptor)descriptor
+                              title:(NSString *)title
+                             limits:(const MacWSStreamWindowLimits *)limits {
     self = [super init];
     if (self) {
         _descriptor = descriptor;
         _title = [title copy];
+        if (MacWSStreamWindowLimitsAreValid(limits, sizeof(*limits)) &&
+            limits->ownerPID == descriptor.ownerPID &&
+            limits->windowID == descriptor.windowID) {
+            _maximumLogicalSize = CGSizeMake(limits->maximumLogicalWidth,
+                                             limits->maximumLogicalHeight);
+            _supportsConfigurationAcknowledgements = YES;
+            _latestConfigureTimestamp = limits->configureAck.timestamp;
+            _latestConfigureSequence = limits->configureAck.sequence;
+            _latestConfigureRequestedSize = CGSizeMake(
+                limits->configureAck.requestedWidth,
+                limits->configureAck.requestedHeight);
+            _latestConfigureAppliedSize = CGSizeMake(
+                limits->configureAck.appliedWidth,
+                limits->configureAck.appliedHeight);
+        }
     }
     return self;
 }
@@ -682,6 +702,23 @@
     if (!array || xpc_get_type(array) != XPC_TYPE_ARRAY) return;
     NSMutableArray<MacWSStreamWindow *> *windows = [NSMutableArray array];
     NSMutableData *fingerprint = [NSMutableData data];
+    NSMutableDictionary<NSString *, NSData *> *limitsByIdentity =
+        [NSMutableDictionary dictionary];
+    xpc_object_t limitsArray = xpc_dictionary_get_value(
+        event, MACWS_STREAM_KEY_WINDOW_LIMITS);
+    if (limitsArray && xpc_get_type(limitsArray) == XPC_TYPE_ARRAY) {
+        xpc_array_apply(limitsArray, ^bool(size_t index, xpc_object_t value) {
+            if (index >= MACWS_STREAM_MAX_WINDOWS) return false;
+            if (xpc_get_type(value) != XPC_TYPE_DATA) return true;
+            const MacWSStreamWindowLimits *limits = xpc_data_get_bytes_ptr(value);
+            size_t count = xpc_data_get_length(value);
+            if (!MacWSStreamWindowLimitsAreValid(limits, count)) return true;
+            NSString *identity = [NSString stringWithFormat:@"%d:%u",
+                limits->ownerPID, limits->windowID];
+            limitsByIdentity[identity] = [NSData dataWithBytes:limits length:count];
+            return true;
+        });
+    }
     xpc_array_apply(array, ^bool(size_t index, xpc_object_t value) {
         (void)index;
         if (windows.count >= MACWS_STREAM_MAX_WINDOWS ||
@@ -695,13 +732,19 @@
         [fingerprint appendBytes:bytes length:byteCount];
         MacWSStreamWindowDescriptor descriptor;
         memcpy(&descriptor, bytes, sizeof(descriptor));
+        NSString *identity = [NSString stringWithFormat:@"%d:%u",
+            descriptor.ownerPID, descriptor.windowID];
+        NSData *limitsData = limitsByIdentity[identity];
+        uint32_t limitsLength = (uint32_t)limitsData.length;
+        [fingerprint appendBytes:&limitsLength length:sizeof(limitsLength)];
+        if (limitsData) [fingerprint appendData:limitsData];
         NSData *titleData = [NSData dataWithBytes:(const uint8_t *)bytes +
                              sizeof(descriptor) length:descriptor.titleLength];
         NSString *title = [[NSString alloc] initWithData:titleData
                                                 encoding:NSUTF8StringEncoding];
         if (!title) title = @"macOS Window";
         [windows addObject:[[MacWSStreamWindow alloc]
-            initWithDescriptor:descriptor title:title]];
+            initWithDescriptor:descriptor title:title limits:limitsData.bytes]];
         return true;
     });
     if ([self.lastWindowCatalog isEqualToData:fingerprint]) return;

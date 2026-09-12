@@ -1037,10 +1037,10 @@ static NSDictionary<NSNumber *, NSValue *> *CopyWindowMetrics(int32_t pid) {
     const MacWSWindowMetricsHeader *header = data.bytes;
     if (!MacWSWindowMetricsAreValid(header, data.length)) return @{};
     NSMutableDictionary *result = [NSMutableDictionary dictionary];
-    const MacWSWindowMetricsEntry *entries =
-        (const void *)((const uint8_t *)data.bytes + sizeof(*header));
     for (uint32_t index = 0; index < header->entryCount; index++) {
-        MacWSWindowMetricsEntry entry = entries[index];
+        MacWSWindowMetricsEntry entry = {0};
+        if (!MacWSWindowMetricsReadEntry(header, data.length, index, &entry))
+            continue;
         if (entry.windowID == 0 ||
             !isfinite(entry.minimumLogicalWidth) ||
             !isfinite(entry.minimumLogicalHeight) ||
@@ -1087,7 +1087,9 @@ static MacWSStreamWindowDescriptor WindowDescriptor(
             (MacWSStreamWindowVisible | MacWSStreamWindowHasShadow |
              MacWSStreamWindowResizable |
              MacWSStreamWindowFocused | MacWSStreamWindowSpatialCanvas |
-             MacWSStreamWindowFullscreenCanvas);
+             MacWSStreamWindowFullscreenCanvas |
+             MacWSStreamWindowFixedWidth |
+             MacWSStreamWindowFixedHeight);
     }
     if ([info[(id)kCGWindowIsOnscreen] boolValue])
         descriptor.flags |= MacWSStreamWindowOnScreen;
@@ -1100,6 +1102,7 @@ static void SendWindowList(MacWSDisplayClient *client) {
     xpc_dictionary_set_string(event, MACWS_STREAM_KEY_EVENT,
                               MACWS_STREAM_EVENT_WINDOWS);
     xpc_object_t array = xpc_array_create(NULL, 0);
+    xpc_object_t limitsArray = xpc_array_create(NULL, 0);
     NSUInteger emitted = 0;
     NSMutableDictionary<NSNumber *, NSDictionary *> *metricsByPID =
         [NSMutableDictionary dictionary];
@@ -1229,6 +1232,22 @@ static void SendWindowList(MacWSDisplayClient *client) {
         [bytes appendData:titleData];
         xpc_object_t item = xpc_data_create(bytes.bytes, bytes.length);
         xpc_array_append_value(array, item);
+        MacWSStreamWindowLimits limits = {
+            .windowID = descriptor.windowID,
+            .ownerPID = descriptor.ownerPID,
+            .maximumLogicalWidth = metrics.maximumLogicalWidth,
+            .maximumLogicalHeight = metrics.maximumLogicalHeight,
+            .configureAck = metrics.configureAck,
+        };
+        // V2 metrics have a zero-filled extension; do not advertise ACK
+        // support for an old AppKit producer merely because displayd is new.
+        if ((limits.maximumLogicalWidth > 0 ||
+             limits.maximumLogicalHeight > 0 ||
+             limits.configureAck.timestamp > 0) &&
+            MacWSStreamWindowLimitsAreValid(&limits, sizeof(limits))) {
+            xpc_object_t limitsItem = xpc_data_create(&limits, sizeof(limits));
+            xpc_array_append_value(limitsArray, limitsItem);
+        }
         MacWSStreamWindowFlags requiredDirectFlags =
             MacWSStreamWindowFocused | MacWSStreamWindowVisible |
             MacWSStreamWindowOnScreen;
@@ -1267,6 +1286,7 @@ static void SendWindowList(MacWSDisplayClient *client) {
                    (unsigned long)emitted);
     }
     xpc_dictionary_set_value(event, MACWS_STREAM_KEY_WINDOWS, array);
+    xpc_dictionary_set_value(event, MACWS_STREAM_KEY_WINDOW_LIMITS, limitsArray);
     xpc_connection_send_message(client.connection, event);
 }
 

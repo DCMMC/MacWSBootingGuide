@@ -1444,7 +1444,7 @@ BASE_TRUST_BOOT_MARKER="$LOGDIR/macws-base-trust.boot-ready"
 BASE_TRUST_CLOSURE_VERSION=5
 BASE_TRUST_READY=0
 WINDOWING_READY_WITNESS=/var/mobile/Library/Preferences/com.macwsguide.dense-grid.loaded
-WINDOWING_REQUIRED_VERSION=16
+WINDOWING_REQUIRED_VERSION=29
 WINDOWING_TWEAK=/var/jb/Library/MobileSubstrate/DynamicLibraries/MacWSWindowing.dylib
 WINDOWING_VALIDATED_CACHE=/var/jb/var/mobile/macws-cross-build/MacWSWindowing.dylib
 WINDOWING_VALIDATED_SHA=/var/jb/var/mobile/macws-cross-build/MacWSWindowing.sha256
@@ -1508,6 +1508,8 @@ windowing_bridge_ready() {
     [ "$witness_pid" = "$springboard_pid" ] || return 1
     grep -Fq \
         'fullscreen=exact-scene-activate-then-maximization-toggle-action-17' \
+        "$WINDOWING_READY_WITNESS" 2>/dev/null && grep -Fq \
+        'initial=preactivation-generic-app-layout-grid' \
         "$WINDOWING_READY_WITNESS" 2>/dev/null
 }
 

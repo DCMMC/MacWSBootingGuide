@@ -8,8 +8,18 @@ NS_ASSUME_NONNULL_BEGIN
 @interface MacWSStreamWindow : NSObject
 @property(nonatomic, readonly) MacWSStreamWindowDescriptor descriptor;
 @property(nonatomic, readonly) NSString *title;
+@property(nonatomic, readonly) CGSize maximumLogicalSize;
+@property(nonatomic, readonly) BOOL supportsConfigurationAcknowledgements;
+@property(nonatomic, readonly) double latestConfigureTimestamp;
+@property(nonatomic, readonly) uint32_t latestConfigureSequence;
+@property(nonatomic, readonly) CGSize latestConfigureRequestedSize;
+@property(nonatomic, readonly) CGSize latestConfigureAppliedSize;
 - (instancetype)initWithDescriptor:(MacWSStreamWindowDescriptor)descriptor
-                              title:(NSString *)title NS_DESIGNATED_INITIALIZER;
+                              title:(NSString *)title;
+- (instancetype)initWithDescriptor:(MacWSStreamWindowDescriptor)descriptor
+                              title:(NSString *)title
+                             limits:(nullable const MacWSStreamWindowLimits *)limits
+    NS_DESIGNATED_INITIALIZER;
 - (instancetype)init NS_UNAVAILABLE;
 @end
 

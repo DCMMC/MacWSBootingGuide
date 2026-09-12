@@ -54,6 +54,8 @@ int main(void) {
     assert(sizeof(MacWSFinalCompositeRecord) == 56);
     assert(sizeof(MacWSInputRecord) == 84);
     assert(MacWSInputSourcePencil != MacWSInputSourceFinger);
+    assert(MacWSInputSourceInteropDragProbe > MacWSInputSourceVNC);
+    assert(MacWSInputSourceMax == MacWSInputSourceInteropDragProbe);
     assert(MacWSInputKindDesktopCommand == 20);
     assert(MacWSInputKindSystemGesture == 21);
     assert(MacWSInputKindRotate == 22);
@@ -193,10 +195,27 @@ int main(void) {
     assert(constrainedX == 4.0 && constrainedY == -7.0);
 
     MacWSViewport viewport = {0};
-    assert(Near(MacWSStableWindowDensity(2.0, 2.0, 1.0), 1.0f));
-    assert(Near(MacWSStableWindowDensity(2.0, 2.0, 0.85), 0.85f));
-    assert(Near(MacWSStableWindowDensity(2.0, 2.0, 1.10), 1.10f));
-    assert(Near(MacWSStableWindowDensity(0.0, 0.0, 1.0), 1.0f));
+    assert(Near(MacWSLogicalWindowDensity(1.0), 1.0f));
+    assert(Near(MacWSLogicalWindowDensity(0.85), 0.85f));
+    assert(Near(MacWSLogicalWindowDensity(1.10), 1.10f));
+    assert(Near(MacWSLogicalWindowDensity(NAN), 1.0f));
+    MacWSNativePresentationRect nativeRect = {0};
+    assert(MacWSComputeNativeWindowPresentationRect(
+        880, 640, 2, 1.10, 484, 380, &nativeRect));
+    assert(Near(nativeRect.x, 0.0f));
+    assert(Near(nativeRect.y, 14.0f));
+    assert(Near(nativeRect.width, 484.0f));
+    assert(Near(nativeRect.height, 352.0f));
+    // A too-small interactive Scene crops the same-size native surface.  It
+    // never scales 880x640 pixels down to the temporary 420x300 rectangle.
+    assert(MacWSComputeNativeWindowPresentationRect(
+        880, 640, 2, 1.10, 420, 300, &nativeRect));
+    assert(Near(nativeRect.x, -32.0f));
+    assert(Near(nativeRect.y, -26.0f));
+    assert(Near(nativeRect.width, 484.0f));
+    assert(Near(nativeRect.height, 352.0f));
+    assert(!MacWSComputeNativeWindowPresentationRect(
+        880, 640, 0, 1.10, 420, 300, &nativeRect));
     assert(MacWSComputeViewport(1600, 1000, 600, 800, 1, 0.5, 0.5,
                                 &viewport));
     assert(Near(viewport.visibleSource.width, 0.46875f));
@@ -252,6 +271,60 @@ int main(void) {
     };
     assert(MacWSWindowMetricsAreValid(metrics, sizeof(metricsBytes)));
     assert(!MacWSWindowMetricsAreValid(metrics, sizeof(*metrics)));
+    MacWSWindowMetricsEntry metricsEntry = {0};
+    assert(MacWSWindowMetricsReadEntry(metrics, sizeof(metricsBytes), 0,
+                                       &metricsEntry));
+    assert(!MacWSWindowMetricsReadEntry(metrics, sizeof(metricsBytes), 1,
+                                        &metricsEntry));
+    // Mixed package upgrades: a new displayd must decode the old 20-byte
+    // stride, zero extensions, and not consume bytes from a sibling window.
+    unsigned char legacyMetricsBytes[sizeof(MacWSWindowMetricsHeader) +
+        2 * MACWS_WINDOW_METRICS_V2_ENTRY_SIZE] = {0};
+    MacWSWindowMetricsHeader *legacyMetrics = (void *)legacyMetricsBytes;
+    *legacyMetrics = *metrics;
+    legacyMetrics->version = 2;
+    legacyMetrics->entrySize = MACWS_WINDOW_METRICS_V2_ENTRY_SIZE;
+    legacyMetrics->entryCount = 2;
+    MacWSWindowMetricsEntry firstLegacy = {.windowID = 17,
+        .minimumLogicalWidth = 265, .minimumLogicalHeight = 378};
+    MacWSWindowMetricsEntry secondLegacy = {.windowID = 29,
+        .minimumLogicalWidth = 445, .minimumLogicalHeight = 573};
+    memcpy(legacyMetricsBytes + sizeof(*legacyMetrics), &firstLegacy,
+           MACWS_WINDOW_METRICS_V2_ENTRY_SIZE);
+    memcpy(legacyMetricsBytes + sizeof(*legacyMetrics) +
+           MACWS_WINDOW_METRICS_V2_ENTRY_SIZE, &secondLegacy,
+           MACWS_WINDOW_METRICS_V2_ENTRY_SIZE);
+    assert(MacWSWindowMetricsReadEntry(legacyMetrics, sizeof(legacyMetricsBytes),
+                                       1, &metricsEntry));
+    assert(metricsEntry.windowID == 29 &&
+           metricsEntry.minimumLogicalWidth == 445);
+    assert(metricsEntry.maximumLogicalWidth == 0 &&
+           metricsEntry.configureAck.timestamp == 0);
+    legacyMetrics->version = MACWS_WINDOW_METRICS_VERSION;
+    assert(!MacWSWindowMetricsAreValid(legacyMetrics, sizeof(legacyMetricsBytes)));
+    metricsEntry = (MacWSWindowMetricsEntry){.windowID = 31,
+        .maximumLogicalWidth = 400, .maximumLogicalHeight = 500,
+        .configureAck = {.timestamp = 123.25, .sequence = 7,
+            .requestedWidth = 585, .requestedHeight = 500,
+            .appliedWidth = 400, .appliedHeight = 500}};
+    memcpy(metricsBytes + sizeof(*metrics), &metricsEntry, sizeof(metricsEntry));
+    assert(MacWSWindowMetricsReadEntry(metrics, sizeof(metricsBytes), 0,
+                                       &metricsEntry));
+    assert(metricsEntry.configureAck.timestamp == 123.25 &&
+           metricsEntry.configureAck.sequence == 7 &&
+           metricsEntry.configureAck.appliedWidth == 400);
+    MacWSStreamWindowLimits limits = {.windowID = 31, .ownerPID = 101,
+        .maximumLogicalWidth = 400, .maximumLogicalHeight = 500,
+        .configureAck = metricsEntry.configureAck};
+    assert(MacWSStreamWindowLimitsAreValid(&limits, sizeof(limits)));
+    assert(!MacWSStreamWindowLimitsAreValid(&limits, sizeof(limits) - 1));
+    limits.maximumLogicalWidth = NAN;
+    assert(!MacWSStreamWindowLimitsAreValid(&limits, sizeof(limits)));
+    limits.maximumLogicalWidth = 400;
+    limits.configureAck.timestamp = 0;
+    assert(!MacWSStreamWindowLimitsAreValid(&limits, sizeof(limits)));
+    limits.configureAck = (MacWSWindowConfigureAck){0};
+    assert(MacWSStreamWindowLimitsAreValid(&limits, sizeof(limits)));
 
     MacWSStreamFrameDescriptor frame = {
         .magic = MACWS_STREAM_MAGIC,

@@ -790,8 +790,10 @@ windowing_ready() {
     case "$witness_version" in
         ''|*[!0-9]*) return 1 ;;
     esac
-    [ "$witness_version" -ge 16 ] && grep -Fq \
+    [ "$witness_version" -ge 29 ] && grep -Fq \
         'fullscreen=exact-scene-activate-then-maximization-toggle-action-17' \
+        "$windowing_witness" 2>/dev/null && grep -Fq \
+        'initial=preactivation-generic-app-layout-grid' \
         "$windowing_witness" 2>/dev/null
 }
 if ! windowing_ready; then

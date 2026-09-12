@@ -20,6 +20,17 @@ BOOL MacWSHostDiagnosticsEnabled(void) {
     return enabled;
 }
 
+BOOL MacWSHostTouchDiagnosticsEnabled(void) {
+    // Deliberately independent from macws_runtime_diagnostics. That shared
+    // switch also enables expensive AGX/app flight recorders in newly born
+    // chroot processes. This Host-only witness is checked dynamically so one
+    // physical gesture can be traced without restarting MacWSHost or changing
+    // the macOS GUI generation; callers log transaction edges only.
+    return access(
+        "/var/mobile/Library/Preferences/com.macwsguide.host.touch-diagnostics",
+        F_OK) == 0;
+}
+
 double MacWSMachMilliseconds(uint64_t start, uint64_t end) {
     if (!start || end < start) return -1.0;
     static mach_timebase_info_data_t timebase;

@@ -27,27 +27,106 @@ typedef struct {
     float y;
 } MacWSNormalizedPoint;
 
+// Window mode is a native-size surface, not a video player.  While iPadOS is
+// interactively resizing a Scene, keep one macOS backing pixel mapped to the
+// same number of physical iPad pixels selected by the density mode.  The
+// destination can temporarily extend beyond, or sit inside, the Scene while
+// the two native window managers settle; it must never be aspect-fitted and
+// visually zoomed merely because their geometry generations differ.
+typedef struct {
+    float x;
+    float y;
+    float width;
+    float height;
+} MacWSNativePresentationRect;
+
+typedef struct {
+    float width;
+    float height;
+} MacWSPresentationDrawableSize;
+
 static inline float MacWSClampFloat(float value, float minimum,
                                     float maximum) {
     return fminf(fmaxf(value, minimum), maximum);
 }
 
-// Window-mode density is a device-scale conversion, not a measurement of the
-// current source window. Deriving it from sourcePixels / HostBounds creates a
-// feedback loop: every AppKit resize changes the next density and therefore
-// the next requested resize. One macOS logical point contains backingScale
-// source pixels, while one UIKit point contains displayScale physical pixels.
-static inline float MacWSStableWindowDensity(float backingScale,
-                                              float displayScale,
-                                              float modeFactor) {
-    if (!isfinite(backingScale) || backingScale < 0.5f ||
-        backingScale > 8.0f) backingScale = 2.0f;
-    if (!isfinite(displayScale) || displayScale < 0.5f ||
-        displayScale > 8.0f) displayScale = 2.0f;
+// AppKit window geometry and UIKit Scene geometry are both expressed in
+// logical points. Retina backing scale belongs only to the IOSurface/drawable
+// pixel conversion; feeding it into native Scene geometry made the requested
+// size change when UIKit changed a Scene's render scale during attachment.
+// The user's macPad density preference is therefore the sole logical-point
+// conversion used by window mode.
+static inline float MacWSLogicalWindowDensity(float modeFactor) {
     if (!isfinite(modeFactor) || modeFactor < 0.5f ||
         modeFactor > 2.0f) modeFactor = 1.0f;
-    return MacWSClampFloat(backingScale / displayScale, 0.5f, 2.0f) *
-        modeFactor;
+    return modeFactor;
+}
+
+static inline bool MacWSComputeNativeWindowPresentationRect(
+        float sourcePixelWidth, float sourcePixelHeight,
+        float sourceBackingScale, float densityScale,
+        float viewWidth, float viewHeight,
+        MacWSNativePresentationRect *result) {
+    if (!result || !isfinite(sourcePixelWidth) ||
+        !isfinite(sourcePixelHeight) || !isfinite(sourceBackingScale) ||
+        !isfinite(densityScale) || !isfinite(viewWidth) ||
+        !isfinite(viewHeight) || sourcePixelWidth <= 0.0f ||
+        sourcePixelHeight <= 0.0f || sourceBackingScale < 0.5f ||
+        sourceBackingScale > 8.0f || densityScale < 0.5f ||
+        densityScale > 2.0f || viewWidth <= 0.0f || viewHeight <= 0.0f)
+        return false;
+
+    float width = sourcePixelWidth / sourceBackingScale * densityScale;
+    float height = sourcePixelHeight / sourceBackingScale * densityScale;
+    if (!isfinite(width) || !isfinite(height) || width <= 0.0f ||
+        height <= 0.0f) return false;
+    *result = (MacWSNativePresentationRect){
+        .x = (viewWidth - width) * 0.5f,
+        .y = (viewHeight - height) * 0.5f,
+        .width = width,
+        .height = height,
+    };
+    return true;
+}
+
+// Compute a destination pixel budget from independent source/display inputs.
+// MTKView.contentScaleFactor is an output of setting drawableSize and must
+// never be used here: fitting a differently shaped source with the previous
+// drawable's scale shrinks the pixel budget on each layout pass.
+//
+// Both drawable axes use one scale in UIKit coordinates. Window mode draws
+// at its fixed logical density; fullscreen draws an aspect-fitted desktop.
+// Capping at the display's scale prevents needless offscreen supersampling.
+static inline bool MacWSComputePresentationDrawableSize(
+        float viewWidth, float viewHeight,
+        float sourcePixelWidth, float sourcePixelHeight,
+        float sourceBackingScale, float densityScale,
+        float displayScale, bool nativeWindow,
+        MacWSPresentationDrawableSize *result) {
+    if (!result || !isfinite(viewWidth) || !isfinite(viewHeight) ||
+        !isfinite(sourcePixelWidth) || !isfinite(sourcePixelHeight) ||
+        !isfinite(displayScale) || viewWidth <= 0.0f ||
+        viewHeight <= 0.0f || sourcePixelWidth <= 0.0f ||
+        sourcePixelHeight <= 0.0f || displayScale < 0.5f ||
+        displayScale > 8.0f) return false;
+
+    float sourcePixelsPerViewPoint;
+    if (nativeWindow) {
+        if (!isfinite(sourceBackingScale) || sourceBackingScale < 0.5f ||
+            sourceBackingScale > 8.0f || !isfinite(densityScale) ||
+            densityScale < 0.5f || densityScale > 2.0f) return false;
+        sourcePixelsPerViewPoint = sourceBackingScale / densityScale;
+    } else {
+        sourcePixelsPerViewPoint = fmaxf(sourcePixelWidth / viewWidth,
+                                         sourcePixelHeight / viewHeight);
+    }
+    float pixelsPerViewPoint = fminf(displayScale, sourcePixelsPerViewPoint);
+    float width = roundf(viewWidth * pixelsPerViewPoint);
+    float height = roundf(viewHeight * pixelsPerViewPoint);
+    if (!isfinite(width) || !isfinite(height) || width < 1.0f ||
+        height < 1.0f) return false;
+    *result = (MacWSPresentationDrawableSize){ width, height };
+    return true;
 }
 
 static inline bool MacWSComputeViewport(float sourceWidth, float sourceHeight,

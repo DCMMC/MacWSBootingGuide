@@ -69,6 +69,10 @@ static const char *const kGUIStartState =
     "/var/jb/var/mobile/macos_gui_start.state";
 static const char *const kPostinstLog = "/var/jb/var/mobile/postinst.log";
 static const char *const kRootFS = "/var/mnt/rootfs";
+static const char *const kMacWSHostExecutable =
+    "/var/jb/Applications/MacWSHost.app/MacWSHost";
+static const char *const kProviderImportRoot =
+    "/var/mnt/rootfs/Users/Shared/MacWS Imports";
 static const char *const kGUI = "/var/jb/usr/macOS/bin/macos_gui.sh";
 static const char *const kBash = "/var/jb/usr/bin/bash";
 static const char *const kLaunchctl = "/var/jb/usr/bin/launchctl";
@@ -204,6 +208,7 @@ static dispatch_queue_t gLogQueue;
 static dispatch_queue_t gSteamSemaphoreQueue;
 static dispatch_queue_t gSteamMachRendezvousQueue;
 static dispatch_queue_t gMetalCompatQueue;
+static dispatch_queue_t gProviderFileQueue;
 static dispatch_source_t gSteamSemaphoreWaitListener;
 static int gSteamSemaphoreWaitListenerDescriptor = -1;
 static os_unfair_lock gStateLock = OS_UNFAIR_LOCK_INIT;
@@ -1426,8 +1431,8 @@ static BOOL WaitForWindowMetricsFlagsAfterGeneration(
                     MacWSWindowMetricsEntry entry = {0};
                     off_t offset = (off_t)header.size +
                         (off_t)index * header.entrySize;
-                    if (pread(fd, &entry, sizeof(entry), offset) !=
-                            (ssize_t)sizeof(entry))
+                    if (pread(fd, &entry, header.entrySize, offset) !=
+                            (ssize_t)header.entrySize)
                         break;
                     if ((entry.flags & requiredFlags) == requiredFlags) {
                         ready = YES;
@@ -5453,6 +5458,177 @@ static pid_t MetalCompatPeerPID(xpc_object_t request) {
     return getPID ? getPID(peer) : 0;
 }
 
+// Notes 16.3 returns a real callback-scoped NSURL, but the Host's direct
+// open(2) receives EPERM even while the URL exists.  Runtime-confirmed via
+// /var/mobile/Library/Logs/MacWSHost.log at 1789057282.681 and
+// 1789057285.296.  Keep the privilege boundary at the upstream file-open:
+// only the exact native MacWSHost executable may request a copy, the source
+// must be a regular file below an iOS data/group container, and the new file
+// must be created below the fixed MacWS Imports root with O_NOFOLLOW|O_EXCL.
+// This preserves the provider's bytes and filename; it does not fabricate a
+// successful representation when the real source cannot be opened.
+static BOOL MacWSProviderSourcePathAllowed(NSString *path) {
+    if (![path isKindOfClass:NSString.class] || path.length == 0 ||
+        ![path isAbsolutePath]) return NO;
+    NSString *standard = path.stringByStandardizingPath;
+    for (NSString *root in @[@"/private/var/mobile/Containers",
+                              @"/var/mobile/Containers"]) {
+        if ([standard hasPrefix:[root stringByAppendingString:@"/"]])
+            return YES;
+    }
+    return NO;
+}
+
+static BOOL MacWSProviderDestinationPathAllowed(NSString *path) {
+    if (![path isKindOfClass:NSString.class] || path.length == 0 ||
+        ![path isAbsolutePath]) return NO;
+    NSString *standard = path.stringByStandardizingPath;
+    NSString *root = [@(kProviderImportRoot).stringByStandardizingPath
+        stringByAppendingString:@"/"];
+    return [standard hasPrefix:root];
+}
+
+static BOOL CopyProviderFileForHost(NSString *sourcePath,
+                                    NSString *destinationPath,
+                                    uint64_t *copiedBytes,
+                                    NSString **message) {
+    if (!MacWSProviderSourcePathAllowed(sourcePath) ||
+        !MacWSProviderDestinationPathAllowed(destinationPath)) {
+        if (message) *message = @"提供器暂存路径不在允许范围内";
+        return NO;
+    }
+
+    char resolvedSource[PATH_MAX] = {0};
+    if (!realpath(sourcePath.fileSystemRepresentation, resolvedSource)) {
+        if (message) *message = [NSString stringWithFormat:
+            @"无法验证提供器源文件（errno=%d）", errno];
+        return NO;
+    }
+    NSString *resolvedSourcePath = [NSString stringWithUTF8String:
+        resolvedSource];
+    if (!MacWSProviderSourcePathAllowed(resolvedSourcePath)) {
+        if (message) *message = @"提供器源文件越过 iOS 容器目录";
+        return NO;
+    }
+
+    NSString *parentPath = destinationPath.stringByDeletingLastPathComponent;
+    char resolvedParent[PATH_MAX] = {0};
+    char resolvedRoot[PATH_MAX] = {0};
+    if (!realpath(parentPath.fileSystemRepresentation, resolvedParent) ||
+        !realpath(kProviderImportRoot, resolvedRoot)) {
+        if (message) *message = @"无法验证提供器暂存目录";
+        return NO;
+    }
+    size_t rootLength = strlen(resolvedRoot);
+    if (strncmp(resolvedParent, resolvedRoot, rootLength) != 0 ||
+        resolvedParent[rootLength] != '/') {
+        if (message) *message = @"提供器暂存目录越过固定导入根目录";
+        return NO;
+    }
+
+    int sourceFD = open(resolvedSource,
+                        O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (sourceFD < 0) {
+        if (message) *message = [NSString stringWithFormat:
+            @"无法读取提供器文件（errno=%d）", errno];
+        return NO;
+    }
+    struct stat sourceStat = {0};
+    static const off_t maximumBytes = 64 * 1024 * 1024;
+    if (fstat(sourceFD, &sourceStat) != 0 ||
+        !S_ISREG(sourceStat.st_mode) || sourceStat.st_size < 0 ||
+        sourceStat.st_size > maximumBytes) {
+        int savedErrno = errno ?: EFBIG;
+        close(sourceFD);
+        if (message) *message = [NSString stringWithFormat:
+            @"提供器文件类型或大小不受支持（errno=%d）", savedErrno];
+        return NO;
+    }
+
+    int destinationFD = open(destinationPath.fileSystemRepresentation,
+        O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
+    if (destinationFD < 0) {
+        int savedErrno = errno;
+        close(sourceFD);
+        if (message) *message = [NSString stringWithFormat:
+            @"无法创建提供器暂存文件（errno=%d）", savedErrno];
+        return NO;
+    }
+
+    BOOL copied = YES;
+    int savedErrno = 0;
+    uint64_t total = 0;
+    uint8_t buffer[128 * 1024];
+    while (copied) {
+        ssize_t count = read(sourceFD, buffer, sizeof(buffer));
+        if (count == 0) break;
+        if (count < 0) {
+            if (errno == EINTR) continue;
+            copied = NO;
+            savedErrno = errno;
+            break;
+        }
+        ssize_t offset = 0;
+        while (offset < count) {
+            ssize_t written = write(destinationFD, buffer + offset,
+                                    (size_t)(count - offset));
+            if (written < 0 && errno == EINTR) continue;
+            if (written <= 0) {
+                copied = NO;
+                savedErrno = written < 0 ? errno : EIO;
+                break;
+            }
+            offset += written;
+            total += (uint64_t)written;
+        }
+    }
+    if (copied && fsync(destinationFD) != 0) {
+        copied = NO;
+        savedErrno = errno;
+    }
+    close(destinationFD);
+    close(sourceFD);
+    if (!copied) {
+        unlink(destinationPath.fileSystemRepresentation);
+        if (message) *message = [NSString stringWithFormat:
+            @"复制提供器文件失败（errno=%d）", savedErrno ?: EIO];
+        return NO;
+    }
+    if (copiedBytes) *copiedBytes = total;
+    if (message) *message = @"提供器文件已暂存";
+    return YES;
+}
+
+static void ServeProviderFileRequest(xpc_object_t request) {
+    pid_t peerPID = MetalCompatPeerPID(request);
+    NSString *peerPath = RootExecutablePathForPID(peerPID);
+    if (peerPID <= 1 || ![peerPath isEqualToString:@(kMacWSHostExecutable)]) {
+        ReplyResult(request, NO, @"调用者不是 MacWSHost", nil);
+        HostLog(@"provider-stage rejected peer=%d path=%@", peerPID,
+                peerPath ?: @"(unknown)");
+        return;
+    }
+    const char *source = xpc_dictionary_get_string(
+        request, MACWS_CONTROL_KEY_PROVIDER_SOURCE_PATH);
+    const char *destination = xpc_dictionary_get_string(
+        request, MACWS_CONTROL_KEY_PROVIDER_DESTINATION_PATH);
+    NSString *sourcePath = source ? [NSString stringWithUTF8String:source] : nil;
+    NSString *destinationPath = destination
+        ? [NSString stringWithUTF8String:destination] : nil;
+    uint64_t copiedBytes = 0;
+    NSString *message = nil;
+    BOOL copied = CopyProviderFileForHost(
+        sourcePath, destinationPath, &copiedBytes, &message);
+    HostLog(@"provider-stage peer=%d source=%@ destination=%@ bytes=%llu result=%@ message=%@",
+            peerPID, sourcePath ?: @"(nil)",
+            destinationPath ?: @"(nil)",
+            (unsigned long long)copiedBytes,
+            copied ? @"ok" : @"failed", message ?: @"");
+    ReplyResult(request, copied, message, ^(xpc_object_t reply) {
+        xpc_dictionary_set_uint64(reply, "copied_bytes", copiedBytes);
+    });
+}
+
 static NSData *LoadCachedMetalReplacement(size_t sourceLength,
                                           uint64_t sourceHash,
                                           uint64_t *replacementHashOut,
@@ -5696,6 +5872,14 @@ static void ServeRequest(xpc_object_t request) {
         });
         return;
     }
+    if (strcmp(op, MACWS_CONTROL_OP_STAGE_PROVIDER_FILE) == 0) {
+        dispatch_async(gProviderFileQueue, ^{
+            @autoreleasepool {
+                ServeProviderFileRequest(request);
+            }
+        });
+        return;
+    }
 
     dispatch_async(gControlQueue, ^{
         os_unfair_lock_lock(&gStateLock);
@@ -5911,6 +6095,8 @@ int main(int argc, const char *argv[]) {
             DISPATCH_QUEUE_SERIAL);
         gMetalCompatQueue = dispatch_queue_create(
             "com.macwsguide.hostd.metal-compat", DISPATCH_QUEUE_SERIAL);
+        gProviderFileQueue = dispatch_queue_create(
+            "com.macwsguide.hostd.provider-file", DISPATCH_QUEUE_SERIAL);
         gSteamSemaphoreNames = [NSMutableDictionary dictionary];
         gSteamMachRendezvousPorts = [NSMutableDictionary dictionary];
         gSteamSemaphoreGenerations = [NSMutableDictionary dictionary];

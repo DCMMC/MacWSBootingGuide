@@ -4,6 +4,8 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <math.h>
+#include <string.h>
 
 // The display service is owned by a macOS process launched through
 // launchdchrootexec.  MacWSHost consumes it from the iOS side.  Keep every
@@ -32,7 +34,8 @@
 #define MACWS_STREAM_MAX_DAMAGE_RECTS 64u
 #define MACWS_STREAM_MAX_LAYER_GEOMETRY 64u
 #define MACWS_WINDOW_METRICS_MAGIC 0x4d57474du /* "MWGM" */
-#define MACWS_WINDOW_METRICS_VERSION 2u
+#define MACWS_WINDOW_METRICS_VERSION 3u
+#define MACWS_WINDOW_METRICS_V2_ENTRY_SIZE 20u
 #define MACWS_GEOMETRY_INVALIDATION_MAGIC 0x4d574749u /* "MWGI" */
 #define MACWS_GEOMETRY_INVALIDATION_VERSION 1u
 
@@ -46,6 +49,7 @@
 #define MACWS_STREAM_KEY_SEQUENCE "sequence"
 #define MACWS_STREAM_KEY_DESCRIPTOR "descriptor"
 #define MACWS_STREAM_KEY_WINDOWS "windows"
+#define MACWS_STREAM_KEY_WINDOW_LIMITS "window_limits"
 #define MACWS_STREAM_KEY_SURFACE_PORT "surface_port"
 #define MACWS_STREAM_KEY_SURFACE_ID "surface_id"
 #define MACWS_STREAM_KEY_DAMAGE_RECTS "damage_rects"
@@ -113,6 +117,12 @@ enum {
     // key window, and NSWorkspace can lag an explicit CGS activation in this
     // chroot, so neither source alone identifies the visibly frontmost app.
     MacWSStreamWindowFrontmostApplication = 1u << 9,
+    // Per-axis AppKit frame constraints. A window can retain the Resizable
+    // style while minSize/maxSize pin only one dimension (System Settings is
+    // a concrete example). Host forwards these facts to the exact iPadOS
+    // Scene so its resize grid can spring back on the constrained axis.
+    MacWSStreamWindowFixedWidth = 1u << 10,
+    MacWSStreamWindowFixedHeight = 1u << 11,
 };
 
 typedef uint32_t MacWSStreamFrameFlags;
@@ -349,25 +359,88 @@ typedef struct __attribute__((packed)) {
 } MacWSWindowMetricsHeader;
 
 typedef struct __attribute__((packed)) {
+    double timestamp;
+    uint32_t sequence;
+    float requestedWidth;
+    float requestedHeight;
+    float appliedWidth;
+    float appliedHeight;
+} MacWSWindowConfigureAck;
+
+// Optional windows-event companion. The V8 descriptor and surface protocol
+// remain unchanged; old Hosts ignore this key, new Hosts accept its absence.
+// Exact PID/window identity prevents a limit from leaking to sibling Scenes.
+typedef struct __attribute__((packed)) {
+    uint32_t windowID;
+    int32_t ownerPID;
+    float maximumLogicalWidth;
+    float maximumLogicalHeight;
+    MacWSWindowConfigureAck configureAck;
+} MacWSStreamWindowLimits;
+
+typedef struct __attribute__((packed)) {
     uint32_t windowID;
     uint32_t flags;
     uint32_t logicalGroupID;
     float minimumLogicalWidth;
     float minimumLogicalHeight;
+    // Version 3 appends to the unchanged V2 prefix. Zero means unavailable.
+    float maximumLogicalWidth;
+    float maximumLogicalHeight;
+    MacWSWindowConfigureAck configureAck;
 } MacWSWindowMetricsEntry;
 
 static inline bool MacWSWindowMetricsAreValid(
     const MacWSWindowMetricsHeader *header, size_t byteCount) {
     if (!header || header->magic != MACWS_WINDOW_METRICS_MAGIC ||
-        header->version != MACWS_WINDOW_METRICS_VERSION ||
+        !((header->version == 2 &&
+           header->entrySize == MACWS_WINDOW_METRICS_V2_ENTRY_SIZE) ||
+          (header->version == MACWS_WINDOW_METRICS_VERSION &&
+           header->entrySize == sizeof(MacWSWindowMetricsEntry))) ||
         header->size != sizeof(*header) ||
-        header->entrySize != sizeof(MacWSWindowMetricsEntry) ||
         header->entryCount > MACWS_STREAM_MAX_WINDOWS ||
         header->generation == 0) return false;
     size_t entriesSize =
-        (size_t)header->entryCount * sizeof(MacWSWindowMetricsEntry);
+        (size_t)header->entryCount * header->entrySize;
     return entriesSize <= SIZE_MAX - sizeof(*header) &&
         byteCount == sizeof(*header) + entriesSize;
+}
+
+static inline bool MacWSWindowMetricsReadEntry(
+    const MacWSWindowMetricsHeader *header, size_t byteCount,
+    uint32_t index, MacWSWindowMetricsEntry *entry) {
+    if (!entry || !MacWSWindowMetricsAreValid(header, byteCount) ||
+        index >= header->entryCount) return false;
+    memset(entry, 0, sizeof(*entry));
+    memcpy(entry, (const uint8_t *)header + header->size +
+           (size_t)index * header->entrySize, header->entrySize);
+    return true;
+}
+
+static inline bool MacWSStreamWindowLimitsAreValid(
+    const MacWSStreamWindowLimits *limits, size_t byteCount) {
+    if (!limits || byteCount != sizeof(*limits) || !limits->windowID ||
+        limits->ownerPID <= 1 ||
+        !isfinite(limits->maximumLogicalWidth) ||
+        !isfinite(limits->maximumLogicalHeight) ||
+        limits->maximumLogicalWidth < 0 || limits->maximumLogicalHeight < 0 ||
+        limits->maximumLogicalWidth > MACWS_STREAM_MAX_DIMENSION ||
+        limits->maximumLogicalHeight > MACWS_STREAM_MAX_DIMENSION)
+        return false;
+    MacWSWindowConfigureAck ack = limits->configureAck;
+    if (!isfinite(ack.timestamp) || ack.timestamp < 0) return false;
+    if (ack.timestamp == 0)
+        return ack.sequence == 0 && ack.requestedWidth == 0 &&
+            ack.requestedHeight == 0 && ack.appliedWidth == 0 &&
+            ack.appliedHeight == 0;
+    return isfinite(ack.requestedWidth) && isfinite(ack.requestedHeight) &&
+        isfinite(ack.appliedWidth) && isfinite(ack.appliedHeight) &&
+        ack.requestedWidth > 0 && ack.requestedHeight > 0 &&
+        ack.appliedWidth > 0 && ack.appliedHeight > 0 &&
+        ack.requestedWidth <= MACWS_STREAM_MAX_DIMENSION &&
+        ack.requestedHeight <= MACWS_STREAM_MAX_DIMENSION &&
+        ack.appliedWidth <= MACWS_STREAM_MAX_DIMENSION &&
+        ack.appliedHeight <= MACWS_STREAM_MAX_DIMENSION;
 }
 
 static inline bool MacWSStreamWindowDescriptorIsValid(
@@ -451,7 +524,11 @@ static_assert(sizeof(MacWSGeometryInvalidation) == 20,
               "MacWS geometry invalidation ABI");
 static_assert(sizeof(MacWSWindowMetricsHeader) == 24,
               "MacWS window metrics header ABI");
-static_assert(sizeof(MacWSWindowMetricsEntry) == 20,
+static_assert(sizeof(MacWSWindowConfigureAck) == 28, "Window configure ACK ABI");
+static_assert(sizeof(MacWSStreamWindowLimits) == 44, "Window limits ABI");
+static_assert(offsetof(MacWSWindowMetricsEntry, maximumLogicalWidth) == 20,
+              "Window metrics V2 prefix ABI");
+static_assert(sizeof(MacWSWindowMetricsEntry) == 56,
               "MacWS window metrics entry ABI");
 #else
 _Static_assert(sizeof(MacWSStreamWindowDescriptor) == 64,
@@ -466,7 +543,11 @@ _Static_assert(sizeof(MacWSGeometryInvalidation) == 20,
                "MacWS geometry invalidation ABI");
 _Static_assert(sizeof(MacWSWindowMetricsHeader) == 24,
                "MacWS window metrics header ABI");
-_Static_assert(sizeof(MacWSWindowMetricsEntry) == 20,
+_Static_assert(sizeof(MacWSWindowConfigureAck) == 28, "Window configure ACK ABI");
+_Static_assert(sizeof(MacWSStreamWindowLimits) == 44, "Window limits ABI");
+_Static_assert(offsetof(MacWSWindowMetricsEntry, maximumLogicalWidth) == 20,
+               "Window metrics V2 prefix ABI");
+_Static_assert(sizeof(MacWSWindowMetricsEntry) == 56,
                "MacWS window metrics entry ABI");
 #endif
 

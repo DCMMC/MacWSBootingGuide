@@ -47,10 +47,25 @@
 #include "macws_host_protocol.h"
 #include "macws_touch_policy.h"
 #include "macws_viewport_math.h"
+#include "macws_window_configuration.h"
 
 @interface UIWindowScene (MacWSFullscreenState)
 @property(nonatomic, readonly, getter=isFullScreen) BOOL fullScreen;
 @end
+
+@interface UIWindow (MacWSApplicationKeyWindow)
+- (BOOL)_isApplicationKeyWindow;
+@end
+
+// UIKitCore 20D67 distinguishes each Scene's local key window from the one
+// application-wide keyboard target. Both notification names are present in
+// the running cache; the application-key getter at 0x189170a48 compares the
+// receiver with _UIKeyWindowEvaluator's selected window, not Scene.keyWindow.
+static NSString *const MacWSApplicationKeyWindowNotification =
+    @"_UIWindowDidBecomeApplicationKeyNotification";
+static NSString *const MacWSKeyboardTargetSceneNotification =
+    @"_UISceneDidBecomeTargetOfKeyboardEventDeferringEnvironmentNotification";
+static const CGFloat MacWSNativeMenuBarHeight = 24.0;
 
 @interface UIScene (MacWSSceneIdentity)
 // RE-confirmed via UIKitCore 16.3.1 -[UIScene _sceneIdentifier] at
@@ -61,6 +76,13 @@
 
 @interface UISceneActivationRequestOptions (MacWSFullscreenRequest)
 - (void)_setRequestFullscreen:(BOOL)fullscreen;
+- (void)setPreserveLayout:(BOOL)preserveLayout;
+- (BOOL)preserveLayout;
+@end
+
+@interface UIWindowSceneActivationRequestOptions (MacWSWindowPlacement)
+- (void)_setPreserveLayout:(BOOL)preserveLayout;
+- (BOOL)_preserveLayout;
 @end
 
 @interface NSObject (MacWSMetalIOSurfaceAlignment)
@@ -73,6 +95,9 @@ static NSMutableSet<NSString *> *MacWSSceneCloseRequestsSent;
 static NSMutableSet<NSString *> *MacWSObservedWindowIdentities;
 static NSMutableSet<NSString *> *MacWSPreviouslyFrontmostWindowIdentities;
 static NSMutableSet<NSString *> *MacWSPendingWindowSceneIdentities;
+static NSMutableDictionary<NSString *, NSNumber *> *MacWSSceneCreationsInFlight;
+static NSString *MacWSWindowIdentity(int32_t ownerPID, uint32_t windowID,
+                                     uint32_t logicalGroupID);
 static NSMutableDictionary<NSString *, NSNumber *> *MacWSClosingWindowIdentities;
 static NSString *const MacWSSceneBindingsDefaultsKey =
     @"MacWSPersistedSceneWindowBindings";
@@ -82,12 +107,16 @@ static CFStringRef const MacWSRequestFullscreenNotification =
     CFSTR("com.macwsguide.windowing.request-fullscreen");
 static CFStringRef const MacWSRequestResizeNotification =
     CFSTR("com.macwsguide.windowing.request-resize");
+static CFStringRef const MacWSRequestInitialSizeNotification =
+    CFSTR("com.macwsguide.windowing.request-initial-size");
 static NSString *const MacWSResizeRequestDirectory =
     @"/var/mobile/Library/Preferences";
 static NSString *const MacWSFullscreenRequestPrefix =
     @"com.macwsguide.windowing.fullscreen-request.";
 static NSString *const MacWSResizeRequestPrefix =
     @"com.macwsguide.windowing.resize-request.";
+static NSString *const MacWSInitialSizeRequestPrefix =
+    @"com.macwsguide.windowing.initial-size-request.";
 static NSString *const MacWSControlCenterLanguageDefaultsKey =
     @"MacWSControlCenterLanguage";
 
@@ -99,6 +128,122 @@ static BOOL MacWSControlCenterUsesEnglish(void) {
 
 static NSString *MacWSLocalized(NSString *chinese, NSString *english) {
     return MacWSControlCenterUsesEnglish() ? english : chinese;
+}
+
+static BOOL MacWSWindowingBridgeIsLoadedWithCapability(NSString *capability);
+
+static BOOL MacWSWindowingInitialSizeBridgeIsLoaded(void) {
+    // Capability describes the wire contract, not the current hook's name.
+    // Runtime-confirmed: v47 renamed its diagnostic route and the old exact
+    // route-string check disabled all preactivation geometry publication.
+    return MacWSWindowingBridgeIsLoadedWithCapability(@"initial-size-protocol=1") ||
+        MacWSWindowingBridgeIsLoadedWithCapability(
+            @"initial=preactivation-lower-per-item-calculator") ||
+        MacWSWindowingBridgeIsLoadedWithCapability(
+            @"initial=preactivation-generic-app-layout-grid");
+}
+
+static CGFloat MacWSSceneMaximumAxis(CGFloat logicalMaximum, CGFloat density,
+                                     CGFloat chrome, CGFloat minimum) {
+    if (!isfinite(logicalMaximum) || logicalMaximum < 64.0) return 0.0;
+    // Scene request v1 has a 4096-point representable ceiling. An AppKit
+    // sentinel such as 16384 must not invalidate the entire initial request.
+    return MIN(4096.0, MAX(minimum, round(logicalMaximum * density + chrome)));
+}
+
+// Publish the AppKit geometry before UIKit asks FrontBoard to create a Scene.
+// SpringBoard can then use it as an input to its normal initial AppLayout/grid
+// transaction instead of replacing the visible layout several seconds later.
+// Both AppKit and UIKit dimensions here are logical points; the compact
+// semantic menu and the requesting display's live status-bar height are the
+// only Host chrome outside the streamed AppKit content.
+static NSDictionary *MacWSPublishInitialSceneSizeRequest(
+        UIScene *requestingScene, uint32_t windowID, int32_t ownerPID,
+        CGSize preferredSize, CGSize minimumSize, CGSize maximumSize, BOOL resizable,
+        BOOL fixedWidth, BOOL fixedHeight) {
+    if (!MacWSWindowingInitialSizeBridgeIsLoaded() ||
+        !isfinite(preferredSize.width) || !isfinite(preferredSize.height) ||
+        preferredSize.width < 64.0 || preferredSize.height < 64.0)
+        return nil;
+
+    MacWSHostDisplayDensity density = (MacWSHostDisplayDensity)
+        [NSUserDefaults.standardUserDefaults integerForKey:
+            @"MacWSDisplayDensity"];
+    density = MacWSNormalizedDisplayDensity(density);
+    CGFloat densityScale = MacWSDensityModeFactor(density);
+    CGFloat systemTop = 0.0;
+    if ([requestingScene isKindOfClass:UIWindowScene.class]) {
+        UIWindowScene *windowScene = (UIWindowScene *)requestingScene;
+        systemTop = windowScene.statusBarManager.statusBarFrame.size.height;
+        for (UIWindow *window in windowScene.windows)
+            systemTop = MAX(systemTop, window.safeAreaInsets.top);
+    }
+    // Target iPad13,6/20D67 reports a 24-point status-bar inset for ordinary
+    // Stage Manager windows. A fullscreen requesting Scene legitimately has a
+    // zero inset, but the new Standard Scene receives the ordinary inset. Use
+    // UIScreen's 24-point native top inset as the bounded pre-connection value
+    // only in that case; the postcondition below still records any mismatch.
+    if (systemTop < 1.0) systemTop = 24.0;
+    CGFloat chromeHeight = MacWSNativeMenuBarHeight + systemTop;
+    CGSize target = CGSizeMake(
+        preferredSize.width * densityScale,
+        preferredSize.height * densityScale + chromeHeight);
+    CGSize minimum = CGSizeMake(
+        ceil(MAX(150.0, minimumSize.width * densityScale)),
+        ceil(MAX(150.0, minimumSize.height * densityScale + chromeHeight)));
+    BOOL effectiveFixedWidth = !resizable || fixedWidth;
+    BOOL effectiveFixedHeight = !resizable || fixedHeight;
+    if (effectiveFixedWidth) minimum.width = ceil(target.width);
+    if (effectiveFixedHeight) minimum.height = ceil(target.height);
+    target.width = MacWSWindowSceneExtentAtLeastMinimum(target.width, minimum.width);
+    target.height = MacWSWindowSceneExtentAtLeastMinimum(target.height, minimum.height);
+    CGSize maximum = CGSizeMake(
+        effectiveFixedWidth ? target.width : MacWSSceneMaximumAxis(
+            maximumSize.width, densityScale, 0.0, minimum.width),
+        effectiveFixedHeight ? target.height : MacWSSceneMaximumAxis(
+            maximumSize.height, densityScale, chromeHeight, minimum.height));
+
+    NSString *nonce = NSUUID.UUID.UUIDString;
+    NSString *path = [MacWSResizeRequestDirectory
+        stringByAppendingPathComponent:[NSString stringWithFormat:
+            @"%@%@.plist", MacWSInitialSizeRequestPrefix, nonce]];
+    NSDictionary *request = @{
+        @"version": @1,
+        @"bundle_identifier": NSBundle.mainBundle.bundleIdentifier ?:
+            @"com.macwsguide.host",
+        @"window_id": @(windowID),
+        @"owner_pid": @(ownerPID),
+        @"activation_nonce": nonce,
+        @"target_width": @(target.width),
+        @"target_height": @(target.height),
+        @"minimum_width": @(minimum.width),
+        @"minimum_height": @(minimum.height),
+        @"maximum_width": @(maximum.width),
+        @"maximum_height": @(maximum.height),
+        @"fixed_width": @(effectiveFixedWidth),
+        @"fixed_height": @(effectiveFixedHeight),
+        @"issued_at": @(NSDate.date.timeIntervalSince1970),
+    };
+    if (![request writeToFile:path atomically:YES]) return nil;
+    CFNotificationCenterPostNotification(
+        CFNotificationCenterGetDarwinNotifyCenter(),
+        MacWSRequestInitialSizeNotification, NULL, NULL, true);
+    MacWSLog(@"scene-initial-size published nonce=%@ owner=%d window=%u preferred=%.1fx%.1f target=%.1fx%.1f minimum=%.1fx%.1f fixed=%@x%@ density=%.3f chrome-height=%.1f",
+        nonce, ownerPID, windowID, preferredSize.width, preferredSize.height,
+        target.width, target.height, minimum.width, minimum.height,
+        effectiveFixedWidth ? @"YES" : @"NO",
+        effectiveFixedHeight ? @"YES" : @"NO",
+        densityScale, chromeHeight);
+    return @{
+        @"initial_scene_size_published": @YES,
+        @"initial_scene_size_nonce": nonce,
+        @"initial_scene_window_id": @(windowID),
+        @"initial_scene_owner_pid": @(ownerPID),
+        @"initial_scene_width": @(target.width),
+        @"initial_scene_height": @(target.height),
+        @"initial_scene_minimum_width": @(minimum.width),
+        @"initial_scene_minimum_height": @(minimum.height),
+    };
 }
 
 static NSString *MacWSLocalizedPhase(NSString *phase) {
@@ -145,8 +290,11 @@ static NSString *MacWSLocalizedPhase(NSString *phase) {
                                 ownerPID:(int32_t)ownerPID
                           logicalGroupID:(uint32_t)logicalGroupID
                              minimumSize:(CGSize)minimumSize
+                             maximumSize:(CGSize)maximumSize
                            preferredSize:(CGSize)preferredSize
-                               resizable:(BOOL)resizable;
+                               resizable:(BOOL)resizable
+                              fixedWidth:(BOOL)fixedWidth
+                             fixedHeight:(BOOL)fixedHeight;
 - (void)performURLAction:(NSString *)action;
 - (void)resetPerformanceMeasurementForTargetPID:(int32_t)targetPID;
 - (void)launchApplicationIdentifier:(NSString *)identifier;
@@ -161,11 +309,19 @@ static NSString *MacWSLocalizedPhase(NSString *phase) {
 - (NSUserActivity *)streamRestorationActivity;
 - (void)suspendSceneStream;
 - (void)resumeSceneStream;
+- (void)requestWindowLifetimeReconciliation;
 - (void)cancelBootstrapTerminal;
 - (void)sceneGeometryDidChange;
 - (void)followNativeSceneSizeForAppliedLogicalSize:(CGSize)logicalSize
                                             reason:(NSString *)reason;
+- (void)prepareInitialWindowSceneGeometryForScene:(UIWindowScene *)scene
+                                     initialBounds:(CGRect)initialBounds
+                              publishedInitialSize:(CGSize)publishedInitialSize
+                           publishedMinimumSize:(CGSize)publishedMinimumSize;
+- (void)restoreDefaultSceneSizeRestrictions;
 - (BOOL)activateCurrentMacWindow;
+- (void)synchronizeMacWindowFocusWithReason:(NSString *)reason;
+- (void)applyDeferredForegroundSceneSize;
 - (BOOL)activateMacWindow:(MacWSStreamWindow *)window;
 - (BOOL)isFullscreenWorkspace;
 - (BOOL)activateMacWindowIDInFullscreenWorkspace:(uint32_t)windowID
@@ -211,6 +367,51 @@ static BOOL MacWSSceneIsFullscreenWorkspace(NSDictionary *info) {
         [info[@"mode"] unsignedIntValue] == MacWSStreamModeFullscreen;
 }
 
+// UIWindowSceneActivationRequestOptions is the public activation contract for
+// a multi-window UIKit Scene. Runtime evidence from the target showed that a
+// Prominent request first connected a new Finder panel in layout role 2 at the
+// stock 891x705 size, then moved it to role 1 before the exact-size transaction
+// could land. That first transaction necessarily missed and the retry exposed
+// the large black-bordered intermediate window. Request the system's Standard
+// window role directly. Runtime-confirmed on 20D67 by
+// misc/scene_activation_metadata_probe.m: calling the superclass
+// -setPreserveLayout: leaves UIWindowSceneActivationRequestOptions'
+// independent _preserveLayout value NO (`public=YES window=NO`). Use the
+// window-options setter whose getter is carried by this activation object;
+// otherwise this request does not preserve the current window arrangement.
+static UISceneActivationRequestOptions *MacWSSceneActivationOptions(
+        UIScene *requestingScene, BOOL windowed) {
+    UISceneActivationRequestOptions *options = nil;
+    if (windowed) {
+        UIWindowSceneActivationRequestOptions *windowOptions =
+            [UIWindowSceneActivationRequestOptions new];
+        // Runtime-confirmed by the Standard/Prominent A/B on 20D67:
+        // Standard kept the requesting Scene foreground with two connected
+        // windows (MacWSHost.log 1789139805.503), while Prominent backgrounded
+        // it and left only one foreground window (1789140530.119). Preserve
+        // Standard here; per-item geometry is handled by SpringBoard's exact
+        // Scene sizing bridge rather than changing activation semantics.
+        windowOptions.preferredPresentationStyle =
+            UIWindowScenePresentationStyleStandard;
+        options = windowOptions;
+    } else {
+        options = [UISceneActivationRequestOptions new];
+    }
+    options.requestingScene = requestingScene;
+    if (windowed) {
+        // These are independent ivars on 20D67. The public value describes
+        // the Scene activation request while the UIWindowScene subclass value
+        // describes placement of the new window. Runtime probe output after
+        // setting both is public=YES/window=YES; setting either one alone
+        // leaves the other false.
+        options.preserveLayout = YES;
+        if ([options respondsToSelector:@selector(_setPreserveLayout:)])
+            [(UIWindowSceneActivationRequestOptions *)options
+                _setPreserveLayout:YES];
+    }
+    return options;
+}
+
 static void MacWSEnsureRequestedSceneIsForeground(
         UIWindowScene *windowScene, NSUserActivity *activity,
         UIScene *preferredRequestingScene, NSUInteger attempt) {
@@ -222,7 +423,13 @@ static void MacWSEnsureRequestedSceneIsForeground(
         MacWSLog(@"scene-foreground-postcondition id=%@ attempt=%lu state=%ld",
                  windowScene.session.persistentIdentifier,
                  (unsigned long)attempt, (long)state);
-        if (state == UISceneActivationStateForegroundActive) return;
+        // A Stage Manager window which coexists with the key window is
+        // normally ForegroundInactive, not Background. Retrying activation
+        // for that already-visible state asks FrontBoard to rebuild/focus the
+        // layout again and can evict the requesting window from the current
+        // stage. Only a genuinely background/unattached Scene needs a retry.
+        if (state == UISceneActivationStateForegroundActive ||
+            state == UISceneActivationStateForegroundInactive) return;
 
         UIScene *requestingScene = nil;
         if (preferredRequestingScene != windowScene &&
@@ -239,9 +446,11 @@ static void MacWSEnsureRequestedSceneIsForeground(
                 }
             }
         }
+        BOOL windowed = [activity.userInfo[@"mode"] unsignedIntValue] ==
+            MacWSStreamModeWindow;
         UISceneActivationRequestOptions *options =
-            [UISceneActivationRequestOptions new];
-        options.requestingScene = requestingScene ?: windowScene;
+            MacWSSceneActivationOptions(requestingScene ?: windowScene,
+                                        windowed);
         [UIApplication.sharedApplication
             requestSceneSessionActivation:windowScene.session
             userActivity:activity
@@ -266,14 +475,20 @@ static void MacWSRequestNewScene(UIScene *requestingScene,
                                  uint32_t logicalGroupID,
                                  CGSize preferredSize,
                                  CGSize minimumSize,
+                                 CGSize maximumSize,
                                  BOOL resizable,
+                                 BOOL fixedWidth,
+                                 BOOL fixedHeight,
                                  NSString *title,
+                                 BOOL activateExistingForeground,
                                  void (^failureHandler)(NSError *error)) {
     UIApplication *application = UIApplication.sharedApplication;
+    NSString *creationIdentity = MacWSWindowIdentity(ownerPID, windowID, logicalGroupID);
+    __block NSNumber *creationStarted = nil;
     NSUserActivity *activity = [[NSUserActivity alloc]
         initWithActivityType:@"com.macwsguide.host.window"];
     activity.title = title.length ? title : @"MacWS Workspace";
-    activity.userInfo = @{
+    NSMutableDictionary *activityInfo = [@{
         @"mode": @(windowID ? MacWSStreamModeWindow : MacWSStreamModeFullscreen),
         @"window_id": @(windowID),
         @"owner_pid": @(windowID ? ownerPID : 0),
@@ -282,14 +497,19 @@ static void MacWSRequestNewScene(UIScene *requestingScene,
         @"preferred_height": @(windowID ? preferredSize.height : 0),
         @"minimum_width": @(windowID ? minimumSize.width : 0),
         @"minimum_height": @(windowID ? minimumSize.height : 0),
+        @"maximum_width": @(windowID ? maximumSize.width : 0),
+        @"maximum_height": @(windowID ? maximumSize.height : 0),
         @"resizable": @(windowID ? resizable : NO),
+        @"fixed_width": @(windowID ? fixedWidth : NO),
+        @"fixed_height": @(windowID ? fixedHeight : NO),
         @"title": activity.title,
         // A user action or a newly discovered AppKit document requested this
         // Scene for immediate presentation.  Preserve that intent through
         // willConnectToSession:, where UIKit has finally created a concrete
         // UIWindowScene whose foreground state can be verified.
         @"foreground_on_connect": @YES,
-    };
+    } mutableCopy];
+    activity.userInfo = activityInfo;
     UISceneSession *existingSession = nil;
     if (windowID != 0 && ownerPID > 1) {
         for (UISceneSession *session in application.openSessions) {
@@ -325,20 +545,103 @@ static void MacWSRequestNewScene(UIScene *requestingScene,
              (unsigned long)application.openSessions.count,
              requestingScene.session.persistentIdentifier, windowID);
     if (existingSession) {
+        if (!activateExistingForeground) {
+            for (UIScene *candidate in application.connectedScenes) {
+                if (candidate.session == existingSession &&
+                    (candidate.activationState == UISceneActivationStateForegroundActive ||
+                     candidate.activationState == UISceneActivationStateForegroundInactive)) {
+                    // The launch completion and catalog discovery can both
+                    // observe the same new window. Runtime: Terminal 193 was
+                    // reactivated 115 ms after its Scene connected. A visible
+                    // result already satisfies either automatic observer;
+                    // a second placement transaction is not needed.
+                    MacWSLog(@"scene-activation coalesced window=%u id=%@ reason=automatic-already-visible",
+                             windowID, existingSession.persistentIdentifier);
+                    return;
+                }
+            }
+        }
         MacWSLog(@"scene-activation reusing id=%@ owner=%d group=%u window=%u",
                  existingSession.persistentIdentifier, ownerPID,
                  logicalGroupID, windowID);
+    } else if (windowID != 0) {
+        if (creationIdentity && MacWSSceneCreationsInFlight[creationIdentity]) {
+            MacWSLog(@"scene-activation coalesced window=%u identity=%@ reason=creation-in-flight",
+                     windowID, creationIdentity);
+            return;
+        }
+        if (creationIdentity) {
+            if (!MacWSSceneCreationsInFlight)
+                MacWSSceneCreationsInFlight = [NSMutableDictionary dictionary];
+            creationStarted = @(CACurrentMediaTime());
+            MacWSSceneCreationsInFlight[creationIdentity] = creationStarted;
+            // Covers the gap before a new UISceneSession is observable.
+            // A real connection or explicit error retires this entry first;
+            // the bounded expiry permits recovery if UIKit supplies neither.
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 8 * NSEC_PER_SEC),
+                           dispatch_get_main_queue(), ^{
+                if ([MacWSSceneCreationsInFlight[creationIdentity]
+                        isEqual:creationStarted])
+                    [MacWSSceneCreationsInFlight removeObjectForKey:creationIdentity];
+            });
+        }
+        NSDictionary *initialSize = MacWSPublishInitialSceneSizeRequest(
+            requestingScene, windowID, ownerPID, preferredSize, minimumSize, maximumSize,
+            resizable, fixedWidth, fixedHeight);
+        if (initialSize.count) {
+            [activityInfo addEntriesFromDictionary:initialSize];
+            activity.userInfo = activityInfo;
+        }
     }
     UISceneActivationRequestOptions *options =
-        [UISceneActivationRequestOptions new];
-    options.requestingScene = requestingScene;
+        MacWSSceneActivationOptions(requestingScene, windowID != 0);
+    BOOL publicPreserve = windowID != 0 && options.preserveLayout;
+    BOOL windowPreserve = windowID != 0 &&
+        [options respondsToSelector:@selector(_preserveLayout)] &&
+        [(UIWindowSceneActivationRequestOptions *)options _preserveLayout];
+    NSString *originSessionIdentifier =
+        requestingScene.session.persistentIdentifier ?: @"none";
+    MacWSLog(@"scene-activation options window=%u public-preserve=%@ window-preserve=%@ origin-state=%ld",
+             windowID, publicPreserve ? @"YES" : @"NO",
+             windowPreserve ? @"YES" : @"NO",
+             (long)requestingScene.activationState);
     [application requestSceneSessionActivation:existingSession
                                   userActivity:activity
                                        options:options
                                   errorHandler:^(NSError *error) {
         MacWSLog(@"scene-activation failed: %@", error);
+        if (creationIdentity && creationStarted &&
+            [MacWSSceneCreationsInFlight[creationIdentity] isEqual:creationStarted])
+            [MacWSSceneCreationsInFlight removeObjectForKey:creationIdentity];
         if (failureHandler) failureHandler(error);
     }];
+    if (!existingSession && windowID != 0) {
+        // Preserve-layout is meaningful only if the requesting Scene remains
+        // in the same foreground Stage Manager set after the new Scene has
+        // connected. Record that concrete postcondition rather than treating
+        // the two option bits as proof that SpringBoard honored them.
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                     900 * NSEC_PER_MSEC),
+                       dispatch_get_main_queue(), ^{
+            NSUInteger foregroundWindowScenes = 0;
+            UISceneActivationState originState =
+                UISceneActivationStateUnattached;
+            for (UIScene *candidate in application.connectedScenes) {
+                if ([candidate isKindOfClass:UIWindowScene.class] &&
+                    (candidate.activationState ==
+                         UISceneActivationStateForegroundActive ||
+                     candidate.activationState ==
+                         UISceneActivationStateForegroundInactive))
+                    foregroundWindowScenes++;
+                if ([candidate.session.persistentIdentifier
+                        isEqualToString:originSessionIdentifier])
+                    originState = candidate.activationState;
+            }
+            MacWSLog(@"scene-activation layout-postcondition window=%u origin=%@ origin-state=%ld foreground-window-scenes=%lu",
+                     windowID, originSessionIdentifier, (long)originState,
+                     (unsigned long)foregroundWindowScenes);
+        });
+    }
     if (existingSession) {
         // willConnectToSession: does not run when a document belongs to an
         // already connected background Scene. Verify that reuse path here as
@@ -364,8 +667,8 @@ static void MacWSRequestNewScene(UIScene *requestingScene,
 // being discarded.
 static BOOL MacWSRequestWindowedReplacementScene(
         UIScene *requestingScene, uint32_t windowID, int32_t ownerPID,
-        uint32_t logicalGroupID, CGSize preferredSize, CGSize minimumSize,
-        BOOL resizable, NSString *title,
+        uint32_t logicalGroupID, CGSize preferredSize, CGSize minimumSize, CGSize maximumSize,
+        BOOL resizable, BOOL fixedWidth, BOOL fixedHeight, NSString *title,
         void (^failureHandler)(NSError *error)) {
     UISceneSession *oldSession = requestingScene.session;
     NSString *oldIdentifier = oldSession.persistentIdentifier;
@@ -375,7 +678,7 @@ static BOOL MacWSRequestWindowedReplacementScene(
     NSUserActivity *activity = [[NSUserActivity alloc]
         initWithActivityType:@"com.macwsguide.host.window"];
     activity.title = title.length ? title : @"MacWS Window";
-    activity.userInfo = @{
+    NSMutableDictionary *activityInfo = [@{
         @"mode": @(MacWSStreamModeWindow),
         @"window_id": @(windowID),
         @"owner_pid": @(ownerPID),
@@ -384,17 +687,26 @@ static BOOL MacWSRequestWindowedReplacementScene(
         @"preferred_height": @(preferredSize.height),
         @"minimum_width": @(minimumSize.width),
         @"minimum_height": @(minimumSize.height),
+        @"maximum_width": @(maximumSize.width),
+        @"maximum_height": @(maximumSize.height),
         @"resizable": @(resizable),
+        @"fixed_width": @(fixedWidth),
+        @"fixed_height": @(fixedHeight),
         @"title": activity.title,
         @"replaces_session_identifier": oldIdentifier,
-    };
+    } mutableCopy];
+    NSDictionary *initialSize = MacWSPublishInitialSceneSizeRequest(
+        requestingScene, windowID, ownerPID, preferredSize, minimumSize, maximumSize,
+        resizable, fixedWidth, fixedHeight);
+    if (initialSize.count)
+        [activityInfo addEntriesFromDictionary:initialSize];
+    activity.userInfo = activityInfo;
     if (!MacWSSceneSessionsPreservingMacWindow)
         MacWSSceneSessionsPreservingMacWindow = [NSMutableSet set];
     [MacWSSceneSessionsPreservingMacWindow addObject:oldIdentifier];
 
     UISceneActivationRequestOptions *options =
-        [UISceneActivationRequestOptions new];
-    options.requestingScene = requestingScene;
+        MacWSSceneActivationOptions(requestingScene, YES);
     MacWSLog(@"scene-windowed-replacement requested old=%@ owner=%d window=%u group=%u preferred=%.1fx%.1f route=new-system-window-scene",
              oldIdentifier, ownerPID, windowID, logicalGroupID,
              preferredSize.width, preferredSize.height);
@@ -428,7 +740,7 @@ static BOOL MacWSWindowingBridgeIsLoadedWithCapability(
     // readiness contract instead of accepting a stale capability string.
     BOOL publisherAlive = publisherPID > 1 &&
         (kill(publisherPID, 0) == 0 || errno == EPERM);
-    return version >= 16 && publisherAlive &&
+    return version >= 29 && publisherAlive &&
         [witness containsString:capability];
 }
 
@@ -439,12 +751,22 @@ static BOOL MacWSWindowingFullscreenBridgeIsLoaded(void) {
 
 static BOOL MacWSWindowingResizeBridgeIsLoaded(void) {
     return MacWSWindowingBridgeIsLoadedWithCapability(
-        @"resize=app-layout-transaction");
+        @"resize=app-layout-transaction") ||
+        MacWSWindowingBridgeIsLoadedWithCapability(
+            @"resize=whole-current-stage-membership-animation-disabled");
 }
 
 static BOOL MacWSRequestNativeSceneSizeWithRole(UIWindowScene *scene,
                                                 CGSize preferredSize,
-                                                BOOL requestWindowedRole) {
+                                                CGSize minimumSize,
+                                                CGSize maximumSize,
+                                                BOOL fixedWidth,
+                                                BOOL fixedHeight,
+                                                BOOL requestWindowedRole,
+                                                BOOL policyOnly,
+                                                void (^completion)(
+                                                    CGSize actualSize,
+                                                    BOOL landed)) {
     if (!scene || !scene.session || !isfinite(preferredSize.width) ||
         !isfinite(preferredSize.height) || preferredSize.width < 150.0 ||
         preferredSize.height < 150.0) {
@@ -476,8 +798,15 @@ static BOOL MacWSRequestNativeSceneSizeWithRole(UIWindowScene *scene,
             @"com.macwsguide.host",
         @"scene_identifier": sceneIdentifier,
         @"session_identifier": scene.session.persistentIdentifier ?: @"",
-        @"width": @(round(preferredSize.width)),
-        @"height": @(round(preferredSize.height)),
+        @"width": @(MacWSWindowSceneExtentAtLeastMinimum(preferredSize.width, minimumSize.width)),
+        @"height": @(MacWSWindowSceneExtentAtLeastMinimum(preferredSize.height, minimumSize.height)),
+        @"minimum_width": @(ceil(minimumSize.width)),
+        @"minimum_height": @(ceil(minimumSize.height)),
+        @"maximum_width": @(MAX(ceil(minimumSize.width), round(maximumSize.width))),
+        @"maximum_height": @(MAX(ceil(minimumSize.height), round(maximumSize.height))),
+        @"policy_only": @(policyOnly),
+        @"fixed_width": @(fixedWidth),
+        @"fixed_height": @(fixedHeight),
         @"windowed_role": @(requestWindowedRole),
         @"issued_at": @(NSDate.date.timeIntervalSince1970),
         @"nonce": nonce,
@@ -490,16 +819,33 @@ static BOOL MacWSRequestNativeSceneSizeWithRole(UIWindowScene *scene,
         return NO;
     }
 
-    MacWSLog(@"scene-native-size requested id=%@ fbs=%@ requested=%.1fx%.1f windowed-role=%@ route=SBMainWorkspace",
+    MacWSLog(@"scene-native-size requested id=%@ fbs=%@ requested=%.1fx%.1f minimum=%.1fx%.1f fixed=%@x%@ windowed-role=%@ route=SBMainWorkspace",
              scene.session.persistentIdentifier, sceneIdentifier,
              preferredSize.width, preferredSize.height,
+             minimumSize.width, minimumSize.height,
+             fixedWidth ? @"YES" : @"NO",
+             fixedHeight ? @"YES" : @"NO",
              requestWindowedRole ? @"YES" : @"NO");
     CFNotificationCenterPostNotification(
         CFNotificationCenterGetDarwinNotifyCenter(),
         MacWSRequestResizeNotification, NULL, NULL, true);
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
-                                 1500 * NSEC_PER_MSEC),
-                   dispatch_get_main_queue(), ^{
+    if (policyOnly) {
+        MacWSLog(@"scene-native-policy published id=%@ minimum=%.1fx%.1f maximum=%.1fx%.1f action=constraints-only",
+                 scene.session.persistentIdentifier, minimumSize.width,
+                 minimumSize.height, maximumSize.width, maximumSize.height);
+        return YES;
+    }
+    __block BOOL completionDelivered = NO;
+    void (^samplePostcondition)(BOOL, NSString *) =
+        ^(BOOL force, NSString *stage) {
+        if (completionDelivered) return;
+        // SpringBoard owns this request file until its AppLayout
+        // postcondition completes.  An animation-disabled transaction which
+        // has already removed the file can be checked promptly; a request
+        // still being sampled keeps the historical 1.5-second final bound.
+        if (!force && [[NSFileManager defaultManager]
+                fileExistsAtPath:path]) return;
+        completionDelivered = YES;
         UIWindow *sceneWindow = nil;
         for (UIWindow *candidate in scene.windows) {
             if (candidate.isKeyWindow) {
@@ -514,12 +860,27 @@ static BOOL MacWSRequestNativeSceneSizeWithRole(UIWindowScene *scene,
         CGRect screenBounds = scene.screen.bounds;
         BOOL fillsScreen = fabs(sceneBounds.size.width - screenBounds.size.width) <= 1.0 &&
             fabs(sceneBounds.size.height - screenBounds.size.height) <= 1.0;
-        MacWSLog(@"scene-native-size result id=%@ fbs=%@ requested=%.1fx%.1f windowed-role=%@ fills-screen=%@ bounds=%.1fx%.1f",
+        BOOL landed =
+            fabs(sceneBounds.size.width - preferredSize.width) <= 1.5 &&
+            fabs(sceneBounds.size.height - preferredSize.height) <= 1.5;
+        MacWSLog(@"scene-native-size result id=%@ fbs=%@ requested=%.1fx%.1f windowed-role=%@ fills-screen=%@ bounds=%.1fx%.1f landed=%@ stage=%@",
                  scene.session.persistentIdentifier, sceneIdentifier,
                  preferredSize.width, preferredSize.height,
                  requestWindowedRole ? @"YES" : @"NO",
                  fillsScreen ? @"YES" : @"NO",
-                 sceneBounds.size.width, sceneBounds.size.height);
+                 sceneBounds.size.width, sceneBounds.size.height,
+                 landed ? @"YES" : @"NO", stage);
+        if (completion) completion(sceneBounds.size, landed);
+    };
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                 350 * NSEC_PER_MSEC),
+                   dispatch_get_main_queue(), ^{
+        samplePostcondition(NO, @"request-completed-early");
+    });
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                 1500 * NSEC_PER_MSEC),
+                   dispatch_get_main_queue(), ^{
+        samplePostcondition(YES, @"final");
     });
     return YES;
 }
@@ -898,10 +1259,10 @@ typedef void (^MacWSCompactMenuSelection)(MacWSMenuItem *item);
     CGFloat width = 168.0;
     CGFloat height = 2.0;
     NSDictionary *titleAttributes = @{
-        NSFontAttributeName: [UIFont systemFontOfSize:13.0]
+        NSFontAttributeName: [UIFont systemFontOfSize:14.0]
     };
     NSDictionary *shortcutAttributes = @{
-        NSFontAttributeName: [UIFont systemFontOfSize:11.0]
+        NSFontAttributeName: [UIFont systemFontOfSize:12.0]
     };
     for (MacWSMenuItem *item in _items) {
         if (item.flags & MacWSMenuNodeHidden) continue;
@@ -922,6 +1283,17 @@ typedef void (^MacWSCompactMenuSelection)(MacWSMenuItem *item);
 }
 
 - (void)loadView {
+    UIView *root = [UIView new];
+    root.backgroundColor = UIColor.clearColor;
+    UIVisualEffectView *material = [[UIVisualEffectView alloc] initWithEffect:
+        [UIBlurEffect effectWithStyle:UIBlurEffectStyleSystemThinMaterial]];
+    material.frame = root.bounds;
+    material.autoresizingMask = UIViewAutoresizingFlexibleWidth |
+                               UIViewAutoresizingFlexibleHeight;
+    material.layer.cornerRadius = 10.0;
+    material.layer.cornerCurve = kCACornerCurveContinuous;
+    material.clipsToBounds = YES;
+    [root addSubview:material];
     _tableView = [[UITableView alloc] initWithFrame:CGRectZero
                                                style:UITableViewStylePlain];
     _tableView.dataSource = self;
@@ -931,9 +1303,13 @@ typedef void (^MacWSCompactMenuSelection)(MacWSMenuItem *item);
     _tableView.contentInset = UIEdgeInsetsMake(1, 0, 1, 0);
     _tableView.scrollEnabled = self.preferredContentSize.height >= 380.0;
     _tableView.showsVerticalScrollIndicator = _tableView.scrollEnabled;
-    _tableView.layer.cornerRadius = 8.0;
+    _tableView.frame = material.contentView.bounds;
+    _tableView.autoresizingMask = UIViewAutoresizingFlexibleWidth |
+                                 UIViewAutoresizingFlexibleHeight;
+    _tableView.layer.cornerRadius = 10.0;
     _tableView.clipsToBounds = YES;
-    self.view = _tableView;
+    [material.contentView addSubview:_tableView];
+    self.view = root;
 }
 
 - (NSInteger)tableView:(UITableView *)tableView
@@ -986,8 +1362,8 @@ typedef void (^MacWSCompactMenuSelection)(MacWSMenuItem *item);
         cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleValue1
                                        reuseIdentifier:@"MacWSMenuItem"];
         cell.backgroundColor = UIColor.clearColor;
-        cell.textLabel.font = [UIFont systemFontOfSize:13.0];
-        cell.detailTextLabel.font = [UIFont systemFontOfSize:11.0];
+        cell.textLabel.font = [UIFont systemFontOfSize:14.0];
+        cell.detailTextLabel.font = [UIFont systemFontOfSize:12.0];
         UIView *selection = [UIView new];
         selection.backgroundColor = UIColor.systemBlueColor;
         cell.selectedBackgroundView = selection;
@@ -1021,14 +1397,29 @@ typedef void (^MacWSCompactMenuSelection)(MacWSMenuItem *item);
 @end
 
 @implementation MacWSViewController {
+    __weak UIWindowScene *_connectedWindowScene;
     NSString *_sceneIdentifier;
     MacWSStreamMode _streamMode;
     uint32_t _windowID;
     int32_t _windowOwnerPID;
     uint32_t _windowGroupID;
     CGSize _windowMinimumSize;
+    CGSize _windowMaximumSize;
     CGSize _windowPreferredSize;
     BOOL _windowResizable;
+    BOOL _windowWidthFixed;
+    BOOL _windowHeightFixed;
+    BOOL _initialSceneSizePending;
+    CGSize _publishedInitialSceneSize;
+    uint64_t _initialSceneSizePostconditionSerial;
+    uint64_t _nativeFocusRequestSerial;
+    CFTimeInterval _lastNativeFocusRequestTime;
+    CGSize _deferredBackgroundSceneLogicalSize;
+    CGSize _deferredAppKitSceneLogicalSize;
+    uint32_t _deferredAppKitSceneWindowID;
+    int32_t _deferredAppKitSceneOwnerPID;
+    uint32_t _deferredBackgroundSceneWindowID;
+    int32_t _deferredBackgroundSceneOwnerPID;
     MacWSControlClient *_controlClient;
     MacWSInteropClient *_interopClient;
     MacWSMenuClient *_menuClient;
@@ -1089,7 +1480,6 @@ typedef void (^MacWSCompactMenuSelection)(MacWSMenuItem *item);
     UILabel *_crossAppDragHandleTitle;
     UIDragInteraction *_contentDragInteraction;
     UITapGestureRecognizer *_crossAppDragPrepareTap;
-    UITapGestureRecognizer *_crossAppDragSelectionTap;
     UILongPressGestureRecognizer *_crossAppDragTwoFingerHold;
     CGPoint _crossAppDragSelectionPoint;
     BOOL _crossAppDragSelectionPointValid;
@@ -1141,6 +1531,12 @@ typedef void (^MacWSCompactMenuSelection)(MacWSMenuItem *item);
     uint64_t _constrainedSceneResizeSerial;
     CGSize _lastConstrainedSceneTargetSize;
     CFTimeInterval _lastConstrainedSceneResizeRequestTime;
+    BOOL _capturedSceneSizeRestrictions;
+    BOOL _reportedSceneSizeRestrictionsUnavailable;
+    CGSize _defaultSceneMinimumSize;
+    CGSize _defaultSceneMaximumSize;
+    CGSize _appliedSceneRestrictionMinimumSize;
+    CGSize _appliedSceneRestrictionMaximumSize;
     int32_t _fullscreenCatalogRetainedInputPID;
     uint32_t _fullscreenActivatedInputWindowID;
     int32_t _fullscreenActivatedInputOwnerPID;
@@ -1157,9 +1553,12 @@ typedef void (^MacWSCompactMenuSelection)(MacWSMenuItem *item);
     int32_t _workspaceReturnOwnerPID;
     uint32_t _workspaceReturnGroupID;
     CGSize _workspaceReturnMinimumSize;
+    CGSize _workspaceReturnMaximumSize;
     CGSize _workspaceReturnPreferredSize;
     CGSize _workspaceReturnSceneSize;
     BOOL _workspaceReturnResizable;
+    BOOL _workspaceReturnWidthFixed;
+    BOOL _workspaceReturnHeightFixed;
     NSString *_workspaceReturnTitle;
 }
 
@@ -1204,7 +1603,8 @@ typedef void (^MacWSCompactMenuSelection)(MacWSMenuItem *item);
     BOOL fullscreen = _streamMode == MacWSStreamModeFullscreen;
     _semanticMenuBar.hidden = fullscreen;
     CGFloat safeTop = MAX(0.0, self.view.safeAreaInsets.top);
-    _semanticMenuHeightConstraint.constant = fullscreen ? 0.0 : 28.0 + safeTop;
+    _semanticMenuHeightConstraint.constant = fullscreen ? 0.0 :
+        MacWSNativeMenuBarHeight + safeTop;
     _semanticMenuContentTopConstraint.constant = fullscreen ? 0.0 : safeTop;
     if (_menuBarButton) {
         [self setButton:_menuBarButton
@@ -1253,6 +1653,9 @@ typedef void (^MacWSCompactMenuSelection)(MacWSMenuItem *item);
     _workspaceReturnMinimumSize = CGSizeMake(
         [info[@"return_minimum_width"] doubleValue],
         [info[@"return_minimum_height"] doubleValue]);
+    _workspaceReturnMaximumSize = CGSizeMake(
+        [info[@"return_maximum_width"] doubleValue],
+        [info[@"return_maximum_height"] doubleValue]);
     _workspaceReturnPreferredSize = CGSizeMake(
         [info[@"return_preferred_width"] doubleValue],
         [info[@"return_preferred_height"] doubleValue]);
@@ -1260,6 +1663,10 @@ typedef void (^MacWSCompactMenuSelection)(MacWSMenuItem *item);
         [info[@"return_scene_width"] doubleValue],
         [info[@"return_scene_height"] doubleValue]);
     _workspaceReturnResizable = [info[@"return_resizable"] boolValue];
+    _workspaceReturnWidthFixed = !_workspaceReturnResizable ||
+        [info[@"return_fixed_width"] boolValue];
+    _workspaceReturnHeightFixed = !_workspaceReturnResizable ||
+        [info[@"return_fixed_height"] boolValue];
     _workspaceReturnTitle = [info[@"return_title"] isKindOfClass:NSString.class]
         ? [info[@"return_title"] copy] : @"MacWS Window";
 }
@@ -1279,9 +1686,12 @@ typedef void (^MacWSCompactMenuSelection)(MacWSMenuItem *item);
     _workspaceReturnOwnerPID = 0;
     _workspaceReturnGroupID = 0;
     _workspaceReturnMinimumSize = CGSizeZero;
+    _workspaceReturnMaximumSize = CGSizeZero;
     _workspaceReturnPreferredSize = CGSizeZero;
     _workspaceReturnSceneSize = CGSizeZero;
     _workspaceReturnResizable = NO;
+    _workspaceReturnWidthFixed = NO;
+    _workspaceReturnHeightFixed = NO;
     _workspaceReturnTitle = nil;
     MacWSRememberSceneBinding(self.view.window.windowScene.session,
                               [self streamRestorationActivity]);
@@ -1299,8 +1709,11 @@ typedef void (^MacWSCompactMenuSelection)(MacWSMenuItem *item);
                                 ownerPID:(int32_t)ownerPID
                           logicalGroupID:(uint32_t)logicalGroupID
                              minimumSize:(CGSize)minimumSize
+                             maximumSize:(CGSize)maximumSize
                            preferredSize:(CGSize)preferredSize
-                               resizable:(BOOL)resizable {
+                               resizable:(BOOL)resizable
+                              fixedWidth:(BOOL)fixedWidth
+                             fixedHeight:(BOOL)fixedHeight {
     self = [super initWithNibName:nil bundle:nil];
     if (self) {
         _sceneIdentifier = [identifier copy];
@@ -1309,8 +1722,11 @@ typedef void (^MacWSCompactMenuSelection)(MacWSMenuItem *item);
         _windowOwnerPID = windowID ? ownerPID : 0;
         _windowGroupID = windowID ? logicalGroupID : 0;
         _windowMinimumSize = windowID ? minimumSize : CGSizeZero;
+        _windowMaximumSize = windowID ? maximumSize : CGSizeZero;
         _windowPreferredSize = windowID ? preferredSize : CGSizeZero;
         _windowResizable = windowID ? resizable : NO;
+        _windowWidthFixed = windowID && (!resizable || fixedWidth);
+        _windowHeightFixed = windowID && (!resizable || fixedHeight);
         _bootstrapTerminalPending = streamMode != MacWSStreamModeWindow ||
             windowID == 0;
         _bootstrapWindowReplacementPending = _bootstrapTerminalPending;
@@ -1508,7 +1924,7 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
         configuration.titleTextAttributesTransformer =
             ^NSDictionary *(NSDictionary *attributes) {
                 NSMutableDictionary *result = [attributes mutableCopy];
-                result[NSFontAttributeName] = [UIFont systemFontOfSize:13.0
+                result[NSFontAttributeName] = [UIFont systemFontOfSize:14.0
                     weight:index == 0 ? UIFontWeightSemibold
                                       : UIFontWeightRegular];
                 return result;
@@ -1593,6 +2009,52 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
     };
     [self metalView:_metalView emittedInput:activation];
     return YES;
+}
+
+- (void)nativeApplicationFocusDidChange:(NSNotification *)notification {
+    id target = notification.object;
+    UIWindow *window = self.viewIfLoaded.window;
+    if (!window) return;
+    if ([target isKindOfClass:UIWindow.class] && target != window) return;
+    if ([target isKindOfClass:UIScene.class] && target != window.windowScene)
+        return;
+    [self synchronizeMacWindowFocusWithReason:notification.name];
+}
+
+- (void)synchronizeMacWindowFocusWithReason:(NSString *)reason {
+    uint64_t serial = ++_nativeFocusRequestSerial;
+    // Scene activation and evaluator notifications can share one UIKit
+    // transaction. Wait one main-queue turn for its application-wide target;
+    // do not race every ForegroundActive Scene into becoming the macOS key.
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (serial != self->_nativeFocusRequestSerial ||
+            self->_sceneDestructionRequested ||
+            self->_streamMode != MacWSStreamModeWindow ||
+            self->_windowID == 0 || self->_windowOwnerPID <= 1) return;
+        UIWindow *window = self.viewIfLoaded.window;
+        UIWindowScene *scene = window.windowScene;
+        BOOL applicationKey = [window respondsToSelector:
+            @selector(_isApplicationKeyWindow)] &&
+            [window _isApplicationKeyWindow];
+        if (!window || window.hidden || !applicationKey ||
+            scene.activationState != UISceneActivationStateForegroundActive) {
+            MacWSLog(@"scene-focus skipped reason=%@ scene=%@ window=%u pid=%d local-key=%@ application-key=%@ state=%ld",
+                reason, scene.session.persistentIdentifier ?: @"none",
+                self->_windowID, self->_windowOwnerPID,
+                window.isKeyWindow ? @"YES" : @"NO",
+                applicationKey ? @"YES" : @"NO", (long)scene.activationState);
+            return;
+        }
+        CFTimeInterval now = CACurrentMediaTime();
+        if (now - self->_lastNativeFocusRequestTime < 0.04) return;
+        self->_lastNativeFocusRequestTime = now;
+        BOOL issued = [self activateCurrentMacWindow];
+        MacWSLog(@"scene-focus request reason=%@ scene=%@ window=%u pid=%d application-key=YES issued=%@",
+            reason, scene.session.persistentIdentifier, self->_windowID,
+            self->_windowOwnerPID, issued ? @"YES" : @"NO");
+        [self restoreHardwareKeyboardFocusWithReason:@"application-key-window"];
+        [self->_metalView requestStreamWindowList];
+    });
 }
 
 - (BOOL)activateMacWindow:(MacWSStreamWindow *)window {
@@ -1831,8 +2293,9 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
 
     [self addChildViewController:panel];
     panel.view.frame = CGRectMake(x, y, width, height);
-    panel.view.backgroundColor = UIColor.secondarySystemBackgroundColor;
-    panel.view.layer.cornerRadius = 8.0;
+    panel.view.backgroundColor = UIColor.clearColor;
+    panel.view.layer.cornerRadius = 10.0;
+    panel.view.layer.cornerCurve = kCACornerCurveContinuous;
     panel.view.layer.borderWidth = 0.5;
     panel.view.layer.borderColor =
         [UIColor.separatorColor colorWithAlphaComponent:0.7].CGColor;
@@ -1887,6 +2350,12 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
     UIView *root = [UIView new];
     root.backgroundColor = UIColor.systemBackgroundColor;
     self.view = root;
+    for (NSString *name in @[MacWSApplicationKeyWindowNotification,
+                             MacWSKeyboardTargetSceneNotification]) {
+        [NSNotificationCenter.defaultCenter addObserver:self
+            selector:@selector(nativeApplicationFocusDidChange:)
+            name:name object:nil];
+    }
 
     _metalView = [[MacWSMetalView alloc] initWithFrame:CGRectZero];
     _metalView.translatesAutoresizingMaskIntoConstraints = NO;
@@ -1894,26 +2363,15 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
     _metalView.sceneID = ((uint64_t)_sceneIdentifier.hash) &
         ~MACWS_INPUT_WINDOW_SCENE_FLAG;
     _metalView.minimumLogicalSize = _windowMinimumSize;
+    _metalView.maximumLogicalSize = _windowMaximumSize;
     _metalView.targetWindowResizable = _windowResizable;
+    _metalView.targetWindowFixedWidth = _windowWidthFixed;
+    _metalView.targetWindowFixedHeight = _windowHeightFixed;
     MacWSHostDisplayDensity savedDensity = (MacWSHostDisplayDensity)
         [NSUserDefaults.standardUserDefaults integerForKey:@"MacWSDisplayDensity"];
-    if (savedDensity != MacWSHostDisplayDensityTouchComfort &&
-        savedDensity != MacWSHostDisplayDensityKeyboard &&
-        savedDensity != MacWSHostDisplayDensityComfort)
-        savedDensity = MacWSHostDisplayDensityTouchComfort;
-    // The first comfort-mode experiment migrated exact pixel matching to a
-    // 10% host-side upsample. That makes controls larger, but it cannot retain
-    // one-source-pixel-to-one-drawable-pixel sharpness. Restore the exact mode
-    // once for existing installations; Comfort remains an explicit choice.
-    if (![NSUserDefaults.standardUserDefaults
-            boolForKey:@"MacWSDensityPixelMatchMigrationV2"]) {
-        if (savedDensity == MacWSHostDisplayDensityComfort)
-            savedDensity = MacWSHostDisplayDensityTouchComfort;
-        [NSUserDefaults.standardUserDefaults setBool:YES
-            forKey:@"MacWSDensityPixelMatchMigrationV2"];
-        [NSUserDefaults.standardUserDefaults setInteger:savedDensity
-            forKey:@"MacWSDisplayDensity"];
-    }
+    savedDensity = MacWSNormalizedDisplayDensity(savedDensity);
+    [NSUserDefaults.standardUserDefaults setInteger:savedDensity
+        forKey:@"MacWSDisplayDensity"];
     _metalView.displayDensity = savedDensity;
     MacWSHostPresentationResolution savedPresentationResolution =
         (MacWSHostPresentationResolution)
@@ -1938,31 +2396,29 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
     _metalView.targetPID = _windowOwnerPID;
     [root addSubview:_metalView];
     // A stationary two-finger hold is an explicit cross-App intent that does
-    // not overlap Finder's ordinary single-finger selection, context click,
-    // or internal drag. UIKit cancels the otherwise-idle two-finger contact
-    // only after the hold has actually recognized.
+    // not overlap Finder's ordinary single-finger selection or internal drag.
+    // The view's short two-finger context click waits for this recognizer to
+    // fail, so one physical chord can commit to exactly one action.
     if (_windowID != 0) {
-        _crossAppDragSelectionTap = [[UITapGestureRecognizer alloc]
-            initWithTarget:self
-                    action:@selector(crossAppDragSelectionTapped:)];
-        _crossAppDragSelectionTap.numberOfTouchesRequired = 1;
-        _crossAppDragSelectionTap.cancelsTouchesInView = NO;
-        _crossAppDragSelectionTap.delaysTouchesBegan = NO;
-        _crossAppDragSelectionTap.delaysTouchesEnded = NO;
-        _crossAppDragSelectionTap.delegate = self;
-        [_metalView addGestureRecognizer:_crossAppDragSelectionTap];
-
         _crossAppDragTwoFingerHold = [[UILongPressGestureRecognizer alloc]
             initWithTarget:self
                     action:@selector(crossAppDragTwoFingerHeld:)];
         _crossAppDragTwoFingerHold.minimumPressDuration = 0.48;
         _crossAppDragTwoFingerHold.numberOfTouchesRequired = 2;
         _crossAppDragTwoFingerHold.allowableMovement = 12.0;
-        _crossAppDragTwoFingerHold.cancelsTouchesInView = YES;
+        // The recognizer observes a two-finger chord but must never cancel the
+        // Metal view's real touch lifecycle. In particular, one finger held on
+        // a Finder item must remain owned by MacWSMetalView so the subsequent
+        // movement reaches AppKit's synchronous NSCoreDragManager tracker.
+        // Once a second finger arrives MacWSMetalView already cancels its
+        // single-touch candidate through its explicit multitouch branch.
+        _crossAppDragTwoFingerHold.cancelsTouchesInView = NO;
         _crossAppDragTwoFingerHold.delaysTouchesBegan = NO;
         _crossAppDragTwoFingerHold.allowedTouchTypes = @[@(UITouchTypeDirect)];
         _crossAppDragTwoFingerHold.delegate = self;
         [_metalView addGestureRecognizer:_crossAppDragTwoFingerHold];
+        [_metalView requireSecondaryTapToFailGestureRecognizer:
+            _crossAppDragTwoFingerHold];
     }
     // A plain UIKit source surface isolates the system drag recognizer from
     // MTKView's rendering/input recognizers. It is present only for the one
@@ -2173,17 +2629,18 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
                    forControlEvents:UIControlEventTouchUpInside];
     [root addSubview:_controlDismissLayer];
 
-    // The expanded card must be a stable reading surface. The former fixed
-    // dark blur was composited with adaptive light/dark labels and fills,
-    // which produced incorrect translucency and contrast. Keep blur only for
-    // the small floating affordance; the card itself follows one opaque
-    // semantic color system.
-    _controlPanel = [[UIVisualEffectView alloc] initWithEffect:nil];
+    // Use the same adaptive UIKit material/semantic labels in both light and
+    // dark appearances. An opaque contentView fill would hide the backdrop.
+    _controlPanel = [[UIVisualEffectView alloc] initWithEffect:
+        [UIBlurEffect effectWithStyle:UIBlurEffectStyleSystemThinMaterial]];
     _controlPanel.translatesAutoresizingMaskIntoConstraints = NO;
     _controlPanel.layer.cornerRadius = 22;
     _controlPanel.layer.cornerCurve = kCACornerCurveContinuous;
     _controlPanel.clipsToBounds = YES;
-    _controlPanel.contentView.backgroundColor = UIColor.systemBackgroundColor;
+    _controlPanel.contentView.backgroundColor = UIColor.clearColor;
+    _controlPanel.layer.borderWidth = 0.5;
+    _controlPanel.layer.borderColor = [UIColor.separatorColor
+        colorWithAlphaComponent:0.35].CGColor;
     [root addSubview:_controlPanel];
 
     UIScrollView *scroll = [UIScrollView new];
@@ -2456,10 +2913,10 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
                 forControlEvents:UIControlEventValueChanged];
 
     _densityControl = [[UISegmentedControl alloc]
-        initWithItems:@[@"像素匹配", @"放大 +10%", @"更多空间 +18%"]];
+        initWithItems:@[@"像素匹配", @"舒适 125%", @"舒适 150%"]];
     _densityControl.selectedSegmentIndex =
-        _metalView.displayDensity == MacWSHostDisplayDensityKeyboard ? 2 :
-        (_metalView.displayDensity == MacWSHostDisplayDensityComfort ? 1 : 0);
+        _metalView.displayDensity == MacWSHostDisplayDensityComfort150 ? 2 :
+        (_metalView.displayDensity == MacWSHostDisplayDensityComfort125 ? 1 : 0);
     [_densityControl addTarget:self action:@selector(densityChanged:)
                forControlEvents:UIControlEventValueChanged];
 
@@ -2557,11 +3014,11 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
     _showControlsMaterial = [[UIVisualEffectView alloc] initWithEffect:
         [UIBlurEffect effectWithStyle:UIBlurEffectStyleSystemChromeMaterial]];
     _showControlsMaterial.translatesAutoresizingMaskIntoConstraints = NO;
-    _showControlsMaterial.layer.cornerRadius = 15;
+    _showControlsMaterial.layer.cornerRadius = 7;
     _showControlsMaterial.layer.cornerCurve = kCACornerCurveContinuous;
     _showControlsMaterial.layer.borderWidth = 0.5;
     _showControlsMaterial.layer.borderColor =
-        [UIColor.separatorColor colorWithAlphaComponent:0.55].CGColor;
+        [UIColor.separatorColor colorWithAlphaComponent:0.28].CGColor;
     _showControlsMaterial.clipsToBounds = YES;
     [root addSubview:_showControlsMaterial];
 
@@ -2571,8 +3028,11 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
     UIButtonConfiguration *configuration =
         [UIButtonConfiguration plainButtonConfiguration];
     configuration.image = [UIImage systemImageNamed:@"switch.2"];
+    configuration.preferredSymbolConfigurationForImage =
+        [UIImageSymbolConfiguration configurationWithPointSize:14
+            weight:UIImageSymbolWeightMedium];
     configuration.baseForegroundColor = UIColor.labelColor;
-    configuration.contentInsets = NSDirectionalEdgeInsetsMake(3, 5, 3, 5);
+    configuration.contentInsets = NSDirectionalEdgeInsetsMake(2, 6, 2, 6);
     _showControlsButton.configuration = configuration;
     _showControlsButton.accessibilityLabel = @"MacWS 控制中心";
     [_showControlsMaterial.contentView addSubview:_showControlsButton];
@@ -2623,9 +3083,9 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
         [_showControlsMaterial.trailingAnchor constraintEqualToAnchor:
             safe.trailingAnchor constant:-6],
         [_showControlsMaterial.topAnchor constraintEqualToAnchor:
-            safe.topAnchor constant:2],
+            safe.topAnchor constant:1],
         [_showControlsMaterial.widthAnchor constraintEqualToConstant:38],
-        [_showControlsMaterial.heightAnchor constraintEqualToConstant:30],
+        [_showControlsMaterial.heightAnchor constraintEqualToConstant:22],
         [_showControlsButton.leadingAnchor constraintEqualToAnchor:
             _showControlsMaterial.contentView.leadingAnchor],
         [_showControlsButton.trailingAnchor constraintEqualToAnchor:
@@ -2637,7 +3097,7 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
     ]];
     if (_semanticMenuBar) {
         _semanticMenuHeightConstraint = [_semanticMenuBar.heightAnchor
-            constraintEqualToConstant:28];
+            constraintEqualToConstant:MacWSNativeMenuBarHeight];
         [NSLayoutConstraint activateConstraints:@[
             [_semanticMenuBar.leadingAnchor constraintEqualToAnchor:root.leadingAnchor],
             [_semanticMenuBar.trailingAnchor constraintEqualToAnchor:root.trailingAnchor],
@@ -2699,8 +3159,8 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
     [_inputModeControl setTitle:(english ? @"Precision Trackpad" : @"精确触控板")
               forSegmentAtIndex:1];
     NSArray *density = english
-        ? @[@"Pixel Match", @"Larger +10%", @"More Space +18%"]
-        : @[@"像素匹配", @"放大 +10%", @"更多空间 +18%"];
+        ? @[@"Pixel Match", @"Larger 125%", @"Larger 150%"]
+        : @[@"像素匹配", @"舒适 125%", @"舒适 150%"];
     NSArray *presentationResolution = english
         ? @[@"Auto Sharp", @"Always Sharp", @"Performance"]
         : @[@"自动清晰", @"始终清晰", @"性能优先"];
@@ -2791,6 +3251,47 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
         activation != UISceneActivationStateUnattached &&
         !(_bootstrapTerminalPending && _windowID == 0)) {
         [_metalView configureStreamMode:_streamMode windowID:_windowID];
+        // Configure first so targetWindowID is the synchronous presentation
+        // authority before any logical AppKit size is converted into Scene
+        // points. willConnectToSession previously requested geometry before
+        // this boundary, when the display client still reported its old
+        // fullscreen subscription and effectiveDensityScale took the 2.2x
+        // desktop path for exactly one transaction.
+        if (_streamMode == MacWSStreamModeWindow && _windowID != 0 &&
+            _windowPreferredSize.width > 0.0 &&
+            _windowPreferredSize.height > 0.0) {
+            if (_initialSceneSizePending &&
+                _publishedInitialSceneSize.width >= 150.0 &&
+                _publishedInitialSceneSize.height >= 150.0) {
+                uint64_t serial = ++_initialSceneSizePostconditionSerial;
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                             350 * NSEC_PER_MSEC),
+                               dispatch_get_main_queue(), ^{
+                    if (serial != self->_initialSceneSizePostconditionSerial ||
+                        !self->_initialSceneSizePending) return;
+                    CGSize actual = self.view.window.bounds.size;
+                    CGSize expected = self->_publishedInitialSceneSize;
+                    BOOL landed = fabs(actual.width - expected.width) <= 1.5 &&
+                        fabs(actual.height - expected.height) <= 1.5;
+                    self->_initialSceneSizePending = NO;
+                    MacWSLog(@"scene-initial-size postcondition id=%@ landed=%@ expected=%.1fx%.1f actual=%.1fx%.1f action=%@",
+                        self.view.window.windowScene.session.persistentIdentifier,
+                        landed ? @"YES" : @"NO", expected.width,
+                        expected.height, actual.width, actual.height,
+                        landed ? @"keep-initial-layout" : @"fallback-resize");
+                    if (!landed) {
+                        [self followNativeSceneSizeForAppliedLogicalSize:
+                            self->_windowPreferredSize
+                                                          reason:
+                            @"initial-layout-postcondition-failed"];
+                    }
+                    [self applyDeferredForegroundSceneSize];
+                });
+            } else {
+                [self followNativeSceneSizeForAppliedLogicalSize:
+                    _windowPreferredSize reason:@"view-did-appear"];
+            }
+        }
     }
     if (_windowID != 0) [self refreshSemanticMenuWithCompletion:nil];
     [self refreshStatus];
@@ -2815,6 +3316,7 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
 }
 
 - (void)sceneGeometryDidChange {
+    if (_sceneDestructionRequested) return;
     // UIWindowScene reports Stage Manager resizing as coordinate-space
     // updates, while ordinary split/full-screen transitions arrive through
     // view-controller layout.  Converge both on one transform/configuration
@@ -2825,36 +3327,404 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
     [_metalView geometryDidChange];
 }
 
+- (void)captureDefaultSceneSizeRestrictionsIfNeeded {
+    if (_capturedSceneSizeRestrictions) return;
+    UIWindowScene *windowScene = self.view.window.windowScene ?:
+        _connectedWindowScene;
+    UISceneSizeRestrictions *restrictions =
+        windowScene.sizeRestrictions;
+    if (!restrictions) {
+        if (!_reportedSceneSizeRestrictionsUnavailable) {
+            _reportedSceneSizeRestrictionsUnavailable = YES;
+            MacWSLog(@"scene-size-restrictions unavailable id=%@ route=springboard-exact-scene-policy",
+                     windowScene.session.persistentIdentifier);
+        }
+        return;
+    }
+    _defaultSceneMinimumSize = restrictions.minimumSize;
+    _defaultSceneMaximumSize = restrictions.maximumSize;
+    _appliedSceneRestrictionMinimumSize = _defaultSceneMinimumSize;
+    _appliedSceneRestrictionMaximumSize = _defaultSceneMaximumSize;
+    _capturedSceneSizeRestrictions = YES;
+    MacWSLog(@"scene-size-restrictions captured id=%@ minimum=%.1fx%.1f maximum=%.1fx%.1f",
+             windowScene.session.persistentIdentifier,
+             _defaultSceneMinimumSize.width,
+             _defaultSceneMinimumSize.height,
+             _defaultSceneMaximumSize.width,
+             _defaultSceneMaximumSize.height);
+}
+
+- (void)applySceneSizeRestrictionMinimum:(CGSize)minimum
+                                  maximum:(CGSize)maximum
+                                   reason:(NSString *)reason {
+    [self captureDefaultSceneSizeRestrictionsIfNeeded];
+    UIWindowScene *windowScene = self.view.window.windowScene ?:
+        _connectedWindowScene;
+    UISceneSizeRestrictions *restrictions =
+        windowScene.sizeRestrictions;
+    if (!restrictions || !_capturedSceneSizeRestrictions ||
+        !isfinite(minimum.width) || !isfinite(minimum.height) ||
+        !isfinite(maximum.width) || !isfinite(maximum.height) ||
+        minimum.width < 0.0 || minimum.height < 0.0 ||
+        maximum.width < minimum.width || maximum.height < minimum.height)
+        return;
+    if (fabs(minimum.width - _appliedSceneRestrictionMinimumSize.width) < 0.5 &&
+        fabs(minimum.height - _appliedSceneRestrictionMinimumSize.height) < 0.5 &&
+        fabs(maximum.width - _appliedSceneRestrictionMaximumSize.width) < 0.5 &&
+        fabs(maximum.height - _appliedSceneRestrictionMaximumSize.height) < 0.5)
+        return;
+
+    // UISceneSizeRestrictions is UIKit's public, per-Scene sizing policy.
+    // Widen maximum first, then change minimum, then install the real maximum
+    // so no intermediate assignment has maximum < minimum on either axis.
+    CGSize bridgeMaximum = CGSizeMake(
+        MAX(MAX(restrictions.maximumSize.width, maximum.width), minimum.width),
+        MAX(MAX(restrictions.maximumSize.height, maximum.height), minimum.height));
+    restrictions.maximumSize = bridgeMaximum;
+    restrictions.minimumSize = minimum;
+    restrictions.maximumSize = maximum;
+    _appliedSceneRestrictionMinimumSize = minimum;
+    _appliedSceneRestrictionMaximumSize = maximum;
+    MacWSLog(@"scene-size-restrictions applied id=%@ reason=%@ minimum=%.1fx%.1f maximum=%.1fx%.1f fixed=%@",
+             windowScene.session.persistentIdentifier,
+             reason ?: @"unknown", minimum.width, minimum.height,
+             maximum.width, maximum.height,
+             CGSizeEqualToSize(minimum, maximum) ? @"YES" : @"NO");
+}
+
+- (void)restoreDefaultSceneSizeRestrictions {
+    if (!_capturedSceneSizeRestrictions) return;
+    [self applySceneSizeRestrictionMinimum:_defaultSceneMinimumSize
+                                    maximum:_defaultSceneMaximumSize
+                                     reason:@"restore-system-default"];
+}
+
+- (void)prepareInitialWindowSceneGeometryForScene:(UIWindowScene *)scene
+                                     initialBounds:(CGRect)initialBounds
+                              publishedInitialSize:(CGSize)publishedInitialSize
+                           publishedMinimumSize:(CGSize)publishedMinimumSize {
+    if (_sceneDestructionRequested ||
+        _streamMode != MacWSStreamModeWindow || _windowID == 0 ||
+        _windowPreferredSize.width < 64.0 ||
+        _windowPreferredSize.height < 64.0 || !scene)
+        return;
+
+    // Setting rootViewController attaches the hierarchy to the concrete
+    // UIWindowScene before makeKeyAndVisible. Resolve the real menu-bar/safe-
+    // area chrome now and submit the exact AppKit size while the UIKit window
+    // is still hidden. The prior viewDidAppear-only route exposed UIKit's
+    // stock 1004x807 panel before the first 331x411 transaction even existed.
+    _connectedWindowScene = scene;
+    [self loadViewIfNeeded];
+    if (initialBounds.size.width >= 150.0 &&
+        initialBounds.size.height >= 150.0)
+        self.view.frame = initialBounds;
+    [self.view setNeedsLayout];
+    [self.view layoutIfNeeded];
+    if (publishedInitialSize.width >= 150.0 &&
+        publishedInitialSize.height >= 150.0) {
+        // Install the same AppKit-derived policy on UIKit's public per-Scene
+        // contract before the UIWindow becomes visible.  SpringBoard's
+        // initial AppLayout hook chooses the first geometry, while these
+        // restrictions prevent the first resize gesture from temporarily
+        // accepting a size that the target NSWindow cannot represent.  A
+        // fixed axis receives one value; the other axis retains the system's
+        // captured maximum and the AppKit minimum.
+        CGSize restrictionMinimum = CGSizeMake(
+            MAX(150.0, publishedMinimumSize.width),
+            MAX(150.0, publishedMinimumSize.height));
+        if (!isfinite(restrictionMinimum.width))
+            restrictionMinimum.width = 150.0;
+        if (!isfinite(restrictionMinimum.height))
+            restrictionMinimum.height = 150.0;
+        [self captureDefaultSceneSizeRestrictionsIfNeeded];
+        CGSize restrictionMaximum = _capturedSceneSizeRestrictions
+            ? _defaultSceneMaximumSize : CGSizeMake(4096.0, 4096.0);
+        if (_windowWidthFixed) {
+            restrictionMinimum.width = publishedInitialSize.width;
+            restrictionMaximum.width = publishedInitialSize.width;
+        }
+        if (_windowHeightFixed) {
+            restrictionMinimum.height = publishedInitialSize.height;
+            restrictionMaximum.height = publishedInitialSize.height;
+        }
+        restrictionMaximum.width = MAX(restrictionMaximum.width,
+                                       restrictionMinimum.width);
+        restrictionMaximum.height = MAX(restrictionMaximum.height,
+                                        restrictionMinimum.height);
+        [self applySceneSizeRestrictionMinimum:restrictionMinimum
+                                        maximum:restrictionMaximum
+                                         reason:@"pre-visible-appkit-policy"];
+        _initialSceneSizePending = YES;
+        _publishedInitialSceneSize = publishedInitialSize;
+        MacWSLog(@"scene-initial-size awaiting-layout id=%@ expected=%.1fx%.1f minimum=%.1fx%.1f fixed=%@x%@ current=%.1fx%.1f",
+            scene.session.persistentIdentifier, publishedInitialSize.width,
+            publishedInitialSize.height, restrictionMinimum.width,
+            restrictionMinimum.height, _windowWidthFixed ? @"YES" : @"NO",
+            _windowHeightFixed ? @"YES" : @"NO",
+            scene.coordinateSpace.bounds.size.width,
+            scene.coordinateSpace.bounds.size.height);
+        return;
+    }
+    [self followNativeSceneSizeForAppliedLogicalSize:_windowPreferredSize
+                                              reason:@"pre-visible-connect"];
+}
+
 - (void)followNativeSceneSizeForAppliedLogicalSize:(CGSize)logicalSize
                                             reason:(NSString *)reason {
-    if (_streamMode != MacWSStreamModeWindow || _windowID == 0 ||
+    [self updateNativeSceneSizeForAppliedLogicalSize:logicalSize
+        reason:reason policyOnly:NO];
+}
+
+- (void)updateNativeSceneSizeForAppliedLogicalSize:(CGSize)logicalSize
+                                            reason:(NSString *)reason
+                                        policyOnly:(BOOL)policyOnly {
+    if (_sceneDestructionRequested ||
+        _streamMode != MacWSStreamModeWindow || _windowID == 0 ||
         !isfinite(logicalSize.width) || !isfinite(logicalSize.height) ||
-        logicalSize.width <= 0.0 || logicalSize.height <= 0.0) return;
+        logicalSize.width < 64.0 || logicalSize.height < 64.0) return;
+    UIWindowScene *owningScene = self.viewIfLoaded.window.windowScene ?:
+        _connectedWindowScene;
+    // Native corner ownership outlives a pause in bounds notifications. Do
+    // not submit a reciprocal workspace transaction while that finger is down.
+    if (_metalView.nativeWindowResizeGestureActive) policyOnly = YES;
+    if (!policyOnly &&
+        owningScene.activationState == UISceneActivationStateBackground) {
+        // A background app can change its own size. Publish only its limits
+        // now; applying a geometry transaction would pull its old Stage to
+        // the front. Keep the latest exact target because catalog handling
+        // already updates _windowPreferredSize and will not rediscover this
+        // same geometry as a change when the user returns.
+        _deferredBackgroundSceneLogicalSize = logicalSize;
+        _deferredBackgroundSceneWindowID = _windowID;
+        _deferredBackgroundSceneOwnerPID = _windowOwnerPID;
+        policyOnly = YES;
+        MacWSLog(@"scene-size deferred-background window=%u pid=%d logical=%.1fx%.1f reason=%@",
+            _windowID, _windowOwnerPID, logicalSize.width, logicalSize.height,
+            reason ?: @"unknown");
+    }
+    // The pre-activation SpringBoard transaction is already authoritative for
+    // a new Scene. Runtime-confirmed by MacWSHost.log 1789110580.857-.898:
+    // About Finder connected at 330x410 for the published 331x411 target, but
+    // the first catalog refresh submitted the same geometry again before the
+    // 350-ms initial postcondition. That second Primary-role transaction
+    // changed UIKit to the stock 327x603 preset. Wait for the initial
+    // transaction's concrete UIWindow postcondition before allowing normal
+    // AppKit-autonomous size synchronization.
+    if (_initialSceneSizePending && !policyOnly) {
+        MacWSLog(@"window-size follows-appkit deferred window=%u pid=%d reason=%@ state=initial-layout-pending",
+                 _windowID, _windowOwnerPID, reason ?: @"unknown");
+        return;
+    }
     CGFloat density = _metalView.effectiveDensityScale;
     if (!isfinite(density) || density <= 0.0) density = 1.0;
     [self.view layoutIfNeeded];
+    UIWindowScene *windowScene = self.view.window.windowScene ?:
+        _connectedWindowScene;
     CGSize chrome = CGSizeMake(
         MAX(0.0, self.view.bounds.size.width - _metalView.bounds.size.width),
         MAX(0.0, self.view.bounds.size.height - _metalView.bounds.size.height));
+    if (_streamMode == MacWSStreamModeWindow) {
+        CGFloat systemTop = MAX(self.view.safeAreaInsets.top,
+            windowScene.statusBarManager.statusBarFrame.size.height);
+        // Before makeKeyAndVisible, UIKit has not attached the controller's
+        // safe-area guide yet. The visible hierarchy uses the same compact
+        // semantic menu plus the status-bar inset; use that same public
+        // geometry instead of issuing one undersized pre-visible request.
+        chrome.height = MAX(chrome.height, MacWSNativeMenuBarHeight + systemTop);
+    }
     CGSize sceneTarget = CGSizeMake(logicalSize.width * density + chrome.width,
                                     logicalSize.height * density + chrome.height);
+    [self captureDefaultSceneSizeRestrictionsIfNeeded];
+    // A frame update and its window-catalog metadata are separate producer
+    // messages. Runtime-confirmed by Finder.host.log generation 36/37 and
+    // MacWSWindowing.log 1789070739.052: Get Info had already contracted from
+    // 501 to 467 points, while the controller still carried the preceding
+    // 501-point minimum. That produced target=440x566, minimum=292x603 and
+    // SpringBoard correctly rejected the impossible request. The concrete
+    // AppKit frame is proof that a preceding minimum is no longer current;
+    // bound each stale catalog axis by the applied size until the matching
+    // catalog generation arrives.
+    CGSize effectiveMinimumLogical = CGSizeMake(
+        _windowMinimumSize.width > 0.0
+            ? MIN(_windowMinimumSize.width, logicalSize.width) : 0.0,
+        _windowMinimumSize.height > 0.0
+            ? MIN(_windowMinimumSize.height, logicalSize.height) : 0.0);
+    CGSize restrictionMinimum = CGSizeMake(
+        ceil(MAX(150.0, effectiveMinimumLogical.width * density + chrome.width)),
+        ceil(MAX(150.0, effectiveMinimumLogical.height * density + chrome.height)));
+    BOOL fixedWidth = !_windowResizable || _windowWidthFixed;
+    BOOL fixedHeight = !_windowResizable || _windowHeightFixed;
+    CGSize restrictionMaximum = _capturedSceneSizeRestrictions
+        ? _defaultSceneMaximumSize
+        : CGSizeMake(4096.0, 4096.0);
+    CGFloat sourceMaximumWidth = MacWSSceneMaximumAxis(
+        _windowMaximumSize.width, density, chrome.width, restrictionMinimum.width);
+    CGFloat sourceMaximumHeight = MacWSSceneMaximumAxis(
+        _windowMaximumSize.height, density, chrome.height, restrictionMinimum.height);
+    if (sourceMaximumWidth > 0.0) restrictionMaximum.width = sourceMaximumWidth;
+    if (sourceMaximumHeight > 0.0) restrictionMaximum.height = sourceMaximumHeight;
+    if (fixedWidth) {
+        sceneTarget.width = ceil(sceneTarget.width);
+        restrictionMinimum.width = sceneTarget.width;
+        restrictionMaximum.width = sceneTarget.width;
+    }
+    if (fixedHeight) {
+        sceneTarget.height = ceil(sceneTarget.height);
+        restrictionMinimum.height = sceneTarget.height;
+        restrictionMaximum.height = sceneTarget.height;
+    }
+    if (!fixedWidth || !fixedHeight) {
+        if (!fixedWidth)
+            restrictionMaximum.width = MAX(restrictionMaximum.width,
+                                           restrictionMinimum.width);
+        if (!fixedHeight)
+            restrictionMaximum.height = MAX(restrictionMaximum.height,
+                                            restrictionMinimum.height);
+    }
+    [self applySceneSizeRestrictionMinimum:restrictionMinimum
+                                    maximum:restrictionMaximum
+                                     reason:reason];
+    if (policyOnly) {
+        // Runtime-confirmed Get Info 1789182729.058-.421: an animation's
+        // first 466-point request was still in flight when the 555-point
+        // terminal size arrived. Policy-only publication lost that latest
+        // geometry. Keep one exact-target successor, but never retain a
+        // catalog snapshot over a native gesture or a pending configure ACK.
+        if (_metalView.sceneResizeFollowingTargetWindow &&
+            !_metalView.nativeWindowResizeGestureActive &&
+            !_metalView.windowConfigurationAwaitingAcknowledgement &&
+            !_metalView.windowConfigurationAwaitingSettlement &&
+            !_metalView.windowConfigurationHasQueuedRequest) {
+            _deferredAppKitSceneLogicalSize = logicalSize;
+            _deferredAppKitSceneWindowID = _windowID;
+            _deferredAppKitSceneOwnerPID = _windowOwnerPID;
+            MacWSLog(@"window-size appkit-animation deferred window=%u pid=%d latest=%.1fx%.1f",
+                _windowID, _windowOwnerPID, logicalSize.width, logicalSize.height);
+        }
+        MacWSRequestNativeSceneSizeWithRole(windowScene, sceneTarget,
+            restrictionMinimum, restrictionMaximum, fixedWidth, fixedHeight,
+            NO, YES, nil);
+        return;
+    }
+    UIWindow *sceneWindow = self.view.window;
+    CGSize currentSceneSize = sceneWindow
+        ? sceneWindow.bounds.size : windowScene.coordinateSpace.bounds.size;
+    // Do not submit an AppLayout transition when the visible UIKit window
+    // already represents the AppKit target. Besides avoiding a redundant
+    // animation, this preserves the exact Center-window geometry selected by
+    // the initial layout path. The 1.5-point tolerance matches the rounded
+    // Scene postcondition and covers the observed 331x411 -> 330x410 UIKit
+    // edge rounding without accepting a stock preset or a black-border-sized
+    // mismatch.
+    if (currentSceneSize.width >= restrictionMinimum.width &&
+        currentSceneSize.height >= restrictionMinimum.height &&
+        fabs(sceneTarget.width - currentSceneSize.width) <= 1.5 &&
+        fabs(sceneTarget.height - currentSceneSize.height) <= 1.5) {
+        // Update the exact Scene policy even when no geometry transaction is
+        // needed. Otherwise newly discovered AppKit limits never reach the
+        // SpringBoard resize gesture until the first over-sized request.
+        MacWSRequestNativeSceneSizeWithRole(windowScene, sceneTarget,
+            restrictionMinimum, restrictionMaximum, fixedWidth, fixedHeight,
+            NO, YES, nil);
+        _lastConstrainedSceneTargetSize = sceneTarget;
+        _lastConstrainedSceneResizeRequestTime = CACurrentMediaTime();
+        MacWSLog(@"window-size follows-appkit skipped window=%u pid=%d reason=%@ scene=%.1fx%.1f current=%.1fx%.1f state=already-matches",
+                 _windowID, _windowOwnerPID, reason ?: @"unknown",
+                 sceneTarget.width, sceneTarget.height,
+                 currentSceneSize.width, currentSceneSize.height);
+        return;
+    }
     CFTimeInterval now = CACurrentMediaTime();
     if (fabs(sceneTarget.width - _lastConstrainedSceneTargetSize.width) < 1.0 &&
         fabs(sceneTarget.height - _lastConstrainedSceneTargetSize.height) < 1.0 &&
         now - _lastConstrainedSceneResizeRequestTime < 0.75) return;
     _lastConstrainedSceneTargetSize = sceneTarget;
     _lastConstrainedSceneResizeRequestTime = now;
-    _constrainedSceneResizeSerial++;
+    _deferredAppKitSceneWindowID = 0;
+    uint64_t resizeSerial = ++_constrainedSceneResizeSerial;
+    uint32_t expectedWindowID = _windowID;
+    NSString *expectedSessionIdentifier =
+        windowScene.session.persistentIdentifier;
     [_metalView beginSceneResizeFollowingTargetWindowLogicalSize:logicalSize];
+    __weak typeof(self) weakSelf = self;
     BOOL requested = MacWSRequestNativeSceneSizeWithRole(
-        self.view.window.windowScene, sceneTarget, NO);
+        windowScene, sceneTarget, restrictionMinimum, restrictionMaximum,
+        fixedWidth, fixedHeight, NO, NO,
+        ^(CGSize actualSceneSize, BOOL landed) {
+            typeof(self) strongSelf = weakSelf;
+            if (!strongSelf ||
+                strongSelf->_constrainedSceneResizeSerial != resizeSerial ||
+                strongSelf->_windowID != expectedWindowID ||
+                ![strongSelf.view.window.windowScene.session
+                    .persistentIdentifier
+                    isEqualToString:expectedSessionIdentifier]) return;
+            [strongSelf->_metalView
+                cancelSceneResizeFollowingTargetWindow];
+            if (strongSelf.view.window.windowScene.activationState ==
+                    UISceneActivationStateBackground) {
+                if (strongSelf->_deferredBackgroundSceneWindowID == 0) {
+                    strongSelf->_deferredBackgroundSceneLogicalSize = logicalSize;
+                    strongSelf->_deferredBackgroundSceneWindowID = expectedWindowID;
+                    strongSelf->_deferredBackgroundSceneOwnerPID =
+                        strongSelf->_windowOwnerPID;
+                }
+                return;
+            }
+            if (strongSelf->_deferredAppKitSceneWindowID == expectedWindowID &&
+                strongSelf->_deferredAppKitSceneOwnerPID ==
+                    strongSelf->_windowOwnerPID) {
+                CGSize latest = strongSelf->_deferredAppKitSceneLogicalSize;
+                strongSelf->_deferredAppKitSceneWindowID = 0;
+                if (!strongSelf->_metalView.nativeWindowResizeGestureActive &&
+                    !strongSelf->_metalView.windowConfigurationAwaitingAcknowledgement &&
+                    !strongSelf->_metalView.windowConfigurationHasQueuedRequest) {
+                    [strongSelf followNativeSceneSizeForAppliedLogicalSize:latest
+                        reason:@"appkit-animation-latest"];
+                    return;
+                }
+            }
+            if (landed) return;
+            BOOL flexibleAxisMismatch =
+                (!fixedWidth && fabs(actualSceneSize.width -
+                                     sceneTarget.width) > 1.5) ||
+                (!fixedHeight && fabs(actualSceneSize.height -
+                                      sceneTarget.height) > 1.5);
+            if (!flexibleAxisMismatch) {
+                MacWSLog(@"scene-native-size mismatch window=%u pid=%d requested=%.1fx%.1f actual=%.1fx%.1f fixed=%@x%@ action=preserve-appkit-fixed-axis",
+                         strongSelf->_windowID,
+                         strongSelf->_windowOwnerPID,
+                         sceneTarget.width, sceneTarget.height,
+                         actualSceneSize.width, actualSceneSize.height,
+                         fixedWidth ? @"YES" : @"NO",
+                         fixedHeight ? @"YES" : @"NO");
+                return;
+            }
+            // Runtime-confirmed by MacWSHost.log at
+            // 1789117729.733-1789117731.261: a restored Finder Scene can be
+            // packed by Stage Manager to 440x603 even after SpringBoard's
+            // AppLayout accepted the requested 490x603 model size.  Once the
+            // completed transaction's concrete UIWindow disagrees, that
+            // visible Scene is authoritative on each flexible axis.  Feed
+            // its geometry through the ordinary ConfigureWindow path instead
+            // of retaining a clipped 445-point AppKit source indefinitely.
+            MacWSLog(@"scene-native-size mismatch window=%u pid=%d requested=%.1fx%.1f actual=%.1fx%.1f fixed=%@x%@ action=configure-appkit-to-visible-scene",
+                     strongSelf->_windowID, strongSelf->_windowOwnerPID,
+                     sceneTarget.width, sceneTarget.height,
+                     actualSceneSize.width, actualSceneSize.height,
+                     fixedWidth ? @"YES" : @"NO",
+                     fixedHeight ? @"YES" : @"NO");
+            [strongSelf sceneGeometryDidChange];
+        });
     if (!requested)
         [_metalView cancelSceneResizeFollowingTargetWindow];
-    MacWSLog(@"window-size follows-appkit window=%u pid=%d reason=%@ logical=%.1fx%.1f density=%.3f chrome=%.1fx%.1f scene=%.1fx%.1f requested=%@",
+    MacWSLog(@"window-size follows-appkit window=%u pid=%d reason=%@ logical=%.1fx%.1f density=%.3f chrome=%.1fx%.1f scene=%.1fx%.1f fixed=%@x%@ requested=%@",
              _windowID, _windowOwnerPID, reason ?: @"unknown",
              logicalSize.width, logicalSize.height, density,
              chrome.width, chrome.height, sceneTarget.width,
-             sceneTarget.height, requested ? @"YES" : @"NO");
+             sceneTarget.height, fixedWidth ? @"YES" : @"NO",
+             fixedHeight ? @"YES" : @"NO",
+             requested ? @"YES" : @"NO");
 }
 
 - (void)viewWillDisappear:(BOOL)animated {
@@ -2890,6 +3760,9 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
     // owned by this controller.
     if (_keyboardProxy.isFirstResponder || _appSearchField.isFirstResponder)
         return;
+    UIWindow *window = self.viewIfLoaded.window;
+    if ([window respondsToSelector:@selector(_isApplicationKeyWindow)] &&
+        ![window _isApplicationKeyWindow]) return;
     [_metalView restoreHardwareKeyboardFocusWithReason:reason];
 }
 
@@ -3126,25 +3999,21 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
 
 - (void)densityChanged:(UISegmentedControl *)sender {
     MacWSHostDisplayDensity density = sender.selectedSegmentIndex == 2
-        ? MacWSHostDisplayDensityKeyboard
+        ? MacWSHostDisplayDensityComfort150
         : (sender.selectedSegmentIndex == 1
-            ? MacWSHostDisplayDensityComfort
+            ? MacWSHostDisplayDensityComfort125
             : MacWSHostDisplayDensityTouchComfort);
     _metalView.displayDensity = density;
     [NSUserDefaults.standardUserDefaults setInteger:density
                                               forKey:@"MacWSDisplayDensity"];
-    if (density == MacWSHostDisplayDensityKeyboard) {
+    if (density != MacWSHostDisplayDensityTouchComfort) {
         _inputLabel.text = [NSString stringWithFormat:
-            @"显示：更多空间；当前有效密度 %.0f%%，画布比像素匹配模式多约 18%%",
-            _metalView.effectiveDensityScale * 100.0];
-    } else if (density == MacWSHostDisplayDensityComfort) {
-        _inputLabel.text = [NSString stringWithFormat:
-            @"显示：放大 +10%%；有效密度 %.0f%%，使用 Metal 高质量重采样；如需逐像素锐利请切换像素匹配",
-            _metalView.effectiveDensityScale * 100.0];
+            MacWSLocalized(@"显示：舒适放大 %.0f%% · 保留源 Retina 像素；逐像素显示请选择像素匹配",
+                @"Display: larger %.0f%% · preserves source Retina pixels; choose Pixel Match for exact mapping"),
+            MacWSDensityModeFactor(density) * 100.0];
     } else {
-        _inputLabel.text = [NSString stringWithFormat:
-            @"显示：像素匹配 Retina；当前有效密度 %.0f%%（随 iPadOS 合成比例自动调整）",
-            _metalView.effectiveDensityScale * 100.0];
+        _inputLabel.text = MacWSLocalized(@"显示：像素匹配 Retina · macOS 与 iPadOS 逻辑尺寸 1:1",
+            @"Display: Pixel Match Retina · macOS and iPadOS logical size 1:1");
     }
 }
 
@@ -3768,8 +4637,7 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
 
 - (BOOL)gestureRecognizer:(UIGestureRecognizer *)gestureRecognizer
         shouldReceiveTouch:(UITouch *)touch {
-    if (gestureRecognizer == _crossAppDragSelectionTap ||
-        gestureRecognizer == _crossAppDragTwoFingerHold)
+    if (gestureRecognizer == _crossAppDragTwoFingerHold)
         return touch.type != UITouchTypePencil;
     return YES;
 }
@@ -3785,16 +4653,18 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
 - (BOOL)gestureRecognizer:(UIGestureRecognizer *)gestureRecognizer
  shouldRecognizeSimultaneouslyWithGestureRecognizer:
         (UIGestureRecognizer *)otherGestureRecognizer {
-    // The one-finger observer never owns input. The two-finger hold stays
-    // exclusive once recognized so Maps-style pan/pinch/rotation cannot emit
-    // a partial macOS gesture during a file-export transaction.
-    return gestureRecognizer == _crossAppDragSelectionTap ||
-        otherGestureRecognizer == _crossAppDragSelectionTap;
+    // The two-finger hold is intentionally exclusive: MacWSMetalView's
+    // secondary tap waits for it to fail, so a short chord becomes one
+    // context click and a long chord becomes one export preparation.
+    (void)gestureRecognizer;
+    (void)otherGestureRecognizer;
+    return NO;
 }
 
-- (void)crossAppDragSelectionTapped:(UITapGestureRecognizer *)recognizer {
-    if (recognizer.state != UIGestureRecognizerStateEnded) return;
-    _crossAppDragSelectionPoint = [recognizer locationInView:_metalView];
+- (void)metalView:(MacWSMetalView *)view
+    completedDirectTapAtViewPoint:(CGPoint)viewPoint {
+    (void)view;
+    _crossAppDragSelectionPoint = viewPoint;
     _crossAppDragSelectionPointValid = YES;
     if (_crossAppDragArmed && _preparedMacOSDragProviders.count &&
         !_crossAppDragTransferPending)
@@ -4069,8 +4939,11 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
                                window.descriptor.logicalHeight),
                     CGSizeMake(window.descriptor.minimumLogicalWidth,
                                window.descriptor.minimumLogicalHeight),
+                    window.maximumLogicalSize,
                     (window.descriptor.flags & MacWSStreamWindowResizable) != 0,
-                    title, ^(NSError *error) {
+                    (window.descriptor.flags & MacWSStreamWindowFixedWidth) != 0,
+                    (window.descriptor.flags & MacWSStreamWindowFixedHeight) != 0,
+                    title, YES, ^(NSError *error) {
                         if ([error.domain isEqualToString:@"FBSWorkspaceErrorDomain"] &&
                             error.code == 2) {
                             [self openWindowInCurrentScene:window
@@ -4090,23 +4963,34 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
 
 - (void)openWindowInCurrentScene:(MacWSStreamWindow *)window
                           reason:(NSString *)reason {
-    if (!window || window.descriptor.windowID == 0) return;
+    if (_sceneDestructionRequested || !window ||
+        window.descriptor.windowID == 0) return;
     [self openWindowIDInCurrentScene:window.descriptor.windowID
                             ownerPID:window.descriptor.ownerPID
                       logicalGroupID:window.descriptor.logicalGroupID
                                title:window.title
                               reason:reason];
     _windowMinimumSize = CGSizeMake(window.descriptor.minimumLogicalWidth,
-                                    window.descriptor.minimumLogicalHeight);
+                                   window.descriptor.minimumLogicalHeight);
+    _windowMaximumSize = window.maximumLogicalSize;
     _windowPreferredSize = CGSizeMake(window.descriptor.logicalWidth,
                                       window.descriptor.logicalHeight);
     _windowResizable =
         (window.descriptor.flags & MacWSStreamWindowResizable) != 0;
+    _windowWidthFixed =
+        (window.descriptor.flags & MacWSStreamWindowFixedWidth) != 0 ||
+        !_windowResizable;
+    _windowHeightFixed =
+        (window.descriptor.flags & MacWSStreamWindowFixedHeight) != 0 ||
+        !_windowResizable;
     [_metalView observeTargetWindowLogicalSize:
         CGSizeMake(window.descriptor.logicalWidth,
                    window.descriptor.logicalHeight)];
     _metalView.minimumLogicalSize = _windowMinimumSize;
+    _metalView.maximumLogicalSize = _windowMaximumSize;
     _metalView.targetWindowResizable = _windowResizable;
+    _metalView.targetWindowFixedWidth = _windowWidthFixed;
+    _metalView.targetWindowFixedHeight = _windowHeightFixed;
     // openWindowIDInCurrentScene: establishes the stream before catalog
     // metadata is installed. Persist once more with the authoritative AppKit
     // size so a later FrontBoard reconnect can reproduce the same small
@@ -4121,6 +5005,17 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
                              title:(NSString *)title
                             reason:(NSString *)reason {
     if (windowID == 0 || ownerPID <= 1) return;
+    if (_sceneDestructionRequested) return;
+    // A failed orphan-Scene retirement keeps a no-close tombstone. Only a
+    // genuine new binding may replace it; never let a delayed discard send
+    // CloseWindow through the retired owner's restoration metadata.
+    NSString *sessionIdentifier =
+        self.view.window.windowScene.session.persistentIdentifier;
+    if (sessionIdentifier.length) {
+        [MacWSSceneSessionsPreservingMacWindow removeObject:sessionIdentifier];
+        [MacWSSceneCloseRequestsSent removeObject:sessionIdentifier];
+    }
+    [self restoreDefaultSceneSizeRestrictions];
     [_metalView suspendStream];
     // A Scene is reused across per-window and desktop presentation. A
     // double-tap zoom belongs to the old stream's coordinate space; carrying
@@ -4136,10 +5031,16 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
     _sceneDestructionRequested = NO;
     _targetWindowMissingSerial++;
     _windowMinimumSize = CGSizeZero;
+    _windowMaximumSize = CGSizeZero;
     _windowPreferredSize = CGSizeZero;
     _windowResizable = NO;
+    _windowWidthFixed = NO;
+    _windowHeightFixed = NO;
     _metalView.minimumLogicalSize = CGSizeZero;
+    _metalView.maximumLogicalSize = CGSizeZero;
     _metalView.targetWindowResizable = NO;
+    _metalView.targetWindowFixedWidth = NO;
+    _metalView.targetWindowFixedHeight = NO;
     _metalView.targetPID = ownerPID;
     [self updateImmersivePresentation];
     [self updateWorkspaceChrome];
@@ -4158,6 +5059,7 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
 }
 
 - (void)openFullscreenWorkspace {
+    if (_sceneDestructionRequested) return;
     if (_streamMode == MacWSStreamModeFullscreen) {
         if (!_workspaceReturnValid || _workspaceReturnWindowID == 0 ||
             _workspaceReturnOwnerPID <= 1) {
@@ -4190,12 +5092,19 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
             _workspaceReturnMinimumSize = CGSizeMake(
                 fallback.descriptor.minimumLogicalWidth,
                 fallback.descriptor.minimumLogicalHeight);
+            _workspaceReturnMaximumSize = fallback.maximumLogicalSize;
             _workspaceReturnPreferredSize = CGSizeMake(
                 fallback.descriptor.logicalWidth,
                 fallback.descriptor.logicalHeight);
             _workspaceReturnSceneSize = _workspaceReturnPreferredSize;
             _workspaceReturnResizable =
                 (fallback.descriptor.flags & MacWSStreamWindowResizable) != 0;
+            _workspaceReturnWidthFixed =
+                (fallback.descriptor.flags & MacWSStreamWindowFixedWidth) != 0 ||
+                !_workspaceReturnResizable;
+            _workspaceReturnHeightFixed =
+                (fallback.descriptor.flags & MacWSStreamWindowFixedHeight) != 0 ||
+                !_workspaceReturnResizable;
             _workspaceReturnTitle = fallback.title.length
                 ? [fallback.title copy] : @"macOS Window";
             MacWSLog(@"workspace-return recovered-from-catalog owner=%d window=%u group=%u title=%@",
@@ -4207,9 +5116,12 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
         int32_t returnOwnerPID = _workspaceReturnOwnerPID;
         uint32_t returnGroupID = _workspaceReturnGroupID;
         CGSize returnMinimumSize = _workspaceReturnMinimumSize;
+        CGSize returnMaximumSize = _workspaceReturnMaximumSize;
         CGSize returnPreferredSize = _workspaceReturnPreferredSize;
         CGSize returnSceneSize = _workspaceReturnSceneSize;
         BOOL returnResizable = _workspaceReturnResizable;
+        BOOL returnWidthFixed = _workspaceReturnWidthFixed;
+        BOOL returnHeightFixed = _workspaceReturnHeightFixed;
         NSString *returnTitle = [_workspaceReturnTitle copy];
         UIWindowScene *scene = self.view.window.windowScene;
         __weak MacWSViewController *weakSelf = self;
@@ -4224,9 +5136,12 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
             strongSelf->_workspaceReturnOwnerPID = 0;
             strongSelf->_workspaceReturnGroupID = 0;
             strongSelf->_workspaceReturnMinimumSize = CGSizeZero;
+            strongSelf->_workspaceReturnMaximumSize = CGSizeZero;
             strongSelf->_workspaceReturnPreferredSize = CGSizeZero;
             strongSelf->_workspaceReturnSceneSize = CGSizeZero;
             strongSelf->_workspaceReturnResizable = NO;
+            strongSelf->_workspaceReturnWidthFixed = NO;
+            strongSelf->_workspaceReturnHeightFixed = NO;
             strongSelf->_workspaceReturnTitle = nil;
             [strongSelf openWindowIDInCurrentScene:returnWindowID
                                           ownerPID:returnOwnerPID
@@ -4234,10 +5149,20 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
                                              title:returnTitle
                                             reason:nil];
             strongSelf->_windowMinimumSize = returnMinimumSize;
+            strongSelf->_windowMaximumSize = returnMaximumSize;
             strongSelf->_windowPreferredSize = returnPreferredSize;
             strongSelf->_windowResizable = returnResizable;
+            strongSelf->_windowWidthFixed = returnWidthFixed ||
+                !returnResizable;
+            strongSelf->_windowHeightFixed = returnHeightFixed ||
+                !returnResizable;
             strongSelf->_metalView.minimumLogicalSize = returnMinimumSize;
+            strongSelf->_metalView.maximumLogicalSize = returnMaximumSize;
             strongSelf->_metalView.targetWindowResizable = returnResizable;
+            strongSelf->_metalView.targetWindowFixedWidth =
+                strongSelf->_windowWidthFixed;
+            strongSelf->_metalView.targetWindowFixedHeight =
+                strongSelf->_windowHeightFixed;
             MacWSRememberSceneBinding(scene.session,
                                       [strongSelf streamRestorationActivity]);
             [strongSelf hideControls];
@@ -4260,8 +5185,9 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
         _sceneDestructionRequested = YES;
         BOOL requestedReplacement = MacWSRequestWindowedReplacementScene(
             scene, returnWindowID, returnOwnerPID, returnGroupID,
-            returnPreferredSize, returnMinimumSize, returnResizable,
-            returnTitle, restoreInCurrentScene);
+            returnPreferredSize, returnMinimumSize, returnMaximumSize, returnResizable,
+            returnWidthFixed, returnHeightFixed, returnTitle,
+            restoreInCurrentScene);
         if (!requestedReplacement) {
             restoreInCurrentScene(nil);
             return;
@@ -4287,6 +5213,7 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
     _workspaceReturnOwnerPID = _windowOwnerPID;
     _workspaceReturnGroupID = _windowGroupID;
     _workspaceReturnMinimumSize = _windowMinimumSize;
+    _workspaceReturnMaximumSize = _windowMaximumSize;
     _workspaceReturnPreferredSize = _windowPreferredSize;
     // UIWindowScene.coordinateSpace is panel-sized even for a Stage Manager
     // Center window on iPadOS 16 (runtime: 1389x970 in both roles). The root
@@ -4297,6 +5224,8 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
         currentViewSize.width >= 150.0 && currentViewSize.height >= 150.0
             ? currentViewSize : _windowPreferredSize;
     _workspaceReturnResizable = _windowResizable;
+    _workspaceReturnWidthFixed = _windowWidthFixed;
+    _workspaceReturnHeightFixed = _windowHeightFixed;
     _workspaceReturnTitle = [self.view.window.windowScene.title copy];
     BOOL activatedExactWindow = [self activateCurrentMacWindow];
     [_metalView suspendStream];
@@ -4306,8 +5235,11 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
     _windowOwnerPID = 0;
     _windowGroupID = 0;
     _windowMinimumSize = CGSizeZero;
+    _windowMaximumSize = CGSizeZero;
     _windowPreferredSize = CGSizeZero;
     _windowResizable = NO;
+    _windowWidthFixed = NO;
+    _windowHeightFixed = NO;
     _targetWindowObservedInCatalog = NO;
     _targetWindowMissingCheckPending = NO;
     _sceneDestructionRequested = NO;
@@ -4316,7 +5248,11 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
     _bootstrapWindowReplacementPending = NO;
     _metalView.targetPID = 0;
     _metalView.minimumLogicalSize = CGSizeZero;
+    _metalView.maximumLogicalSize = CGSizeZero;
     _metalView.targetWindowResizable = NO;
+    _metalView.targetWindowFixedWidth = NO;
+    _metalView.targetWindowFixedHeight = NO;
+    [self restoreDefaultSceneSizeRestrictions];
     [self dismissSemanticMenu];
     [self updateImmersivePresentation];
     [self updateWorkspaceChrome];
@@ -5410,8 +6346,11 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
                    target.descriptor.logicalHeight),
         CGSizeMake(target.descriptor.minimumLogicalWidth,
                    target.descriptor.minimumLogicalHeight),
+        target.maximumLogicalSize,
         (target.descriptor.flags & MacWSStreamWindowResizable) != 0,
-        title, ^(NSError *error) {
+        (target.descriptor.flags & MacWSStreamWindowFixedWidth) != 0,
+        (target.descriptor.flags & MacWSStreamWindowFixedHeight) != 0,
+        title, NO, ^(NSError *error) {
             if ([error.domain isEqualToString:@"FBSWorkspaceErrorDomain"] &&
                 error.code == 2) {
                 [self openWindowInCurrentScene:target
@@ -5648,8 +6587,8 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
     // MacWSHost.log on 2026-09-08: alternating
     // "scene-foreground follows-frontmost" requests repeatedly brought the
     // previous Scene back after the user selected another Stage Manager
-    // window. The forward transaction now lives in sceneDidBecomeActive:,
-    // where that selected Scene activates its exact AppKit window.
+    // window. The forward transaction observes the application-key-window
+    // evaluator; per-Scene isKeyWindow and activation are not global focus.
 
     NSMutableArray<MacWSStreamWindow *> *newWindows = [NSMutableArray array];
     NSMutableSet<NSString *> *reusedFrontmostWindows = [NSMutableSet set];
@@ -5724,15 +6663,26 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
                     : [reusedFrontmostWindows containsObject:identity]
                         ? @"existing-unbound-became-frontmost"
                         : @"new-onscreen-top-level");
-        // AppKit dialogs can briefly appear as a layer-0 catalog window and
-        // then become the base window's transient layer on the next commit.
-        // Runtime-confirmed with Terminal's Low Disk Space alert: requesting
-        // a Scene on the first edge created both an exact iPad window and the
-        // correct in-window overlay. Require the identity to remain a real
-        // visible catalog entry after one short ordering interval. Ordinary
-        // new windows remain in _streamWindows; alerts disappear from it when
-        // displayd's real CGWindow layer reconciliation runs.
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 250 * NSEC_PER_MSEC),
+        // AppKit publishes the NSWindow first and its final min/max axis
+        // policy on the next 500-ms metrics generation. Runtime-confirmed for
+        // Finder Get Info window 482: the first catalog flags were 0x24f
+        // (resizable, no fixed axis), while Finder's next metrics generation
+        // reported min=265x481, max=16384x481, fixed=NOxYES. Creating the
+        // Scene at 250 ms therefore permanently seeded it with stale policy.
+        // Ask displayd for fresh snapshots while AppKit settles, then create
+        // the native Scene once from the post-publication descriptor. This
+        // short invisible preparation is preferable to presenting a stock
+        // 1004x807 Scene and visibly shrinking it seconds later.
+        for (NSNumber *delay in @[@220, @520]) {
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                         delay.longLongValue * NSEC_PER_MSEC),
+                           dispatch_get_main_queue(), ^{
+                if ([MacWSPendingWindowSceneIdentities
+                        containsObject:identity])
+                    [self->_metalView requestStreamWindowList];
+            });
+        }
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 680 * NSEC_PER_MSEC),
                        dispatch_get_main_queue(), ^{
             MacWSStreamWindow *stableWindow = nil;
             for (MacWSStreamWindow *candidate in self->_streamWindows) {
@@ -5770,8 +6720,16 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
             }
             NSString *title = stableWindow.title.length
                 ? stableWindow.title : @"macOS Window";
-            MacWSLog(@"window-auto-scene identity=%@ title=%@ stable-ms=250",
-                     identity, title);
+            MacWSLog(@"window-auto-scene identity=%@ title=%@ stable-ms=680 flags=%#x logical=%.1fx%.1f minimum=%.1fx%.1f fixed=%@x%@",
+                     identity, title, stableWindow.descriptor.flags,
+                     stableWindow.descriptor.logicalWidth,
+                     stableWindow.descriptor.logicalHeight,
+                     stableWindow.descriptor.minimumLogicalWidth,
+                     stableWindow.descriptor.minimumLogicalHeight,
+                     (stableWindow.descriptor.flags &
+                        MacWSStreamWindowFixedWidth) ? @"YES" : @"NO",
+                     (stableWindow.descriptor.flags &
+                        MacWSStreamWindowFixedHeight) ? @"YES" : @"NO");
             MacWSRequestNewScene(self.view.window.windowScene,
                 stableWindow.descriptor.windowID,
                 stableWindow.descriptor.ownerPID,
@@ -5780,8 +6738,13 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
                            stableWindow.descriptor.logicalHeight),
                 CGSizeMake(stableWindow.descriptor.minimumLogicalWidth,
                            stableWindow.descriptor.minimumLogicalHeight),
+                stableWindow.maximumLogicalSize,
                 (stableWindow.descriptor.flags & MacWSStreamWindowResizable) != 0,
-                title, ^(NSError *error) {
+                (stableWindow.descriptor.flags &
+                    MacWSStreamWindowFixedWidth) != 0,
+                (stableWindow.descriptor.flags &
+                    MacWSStreamWindowFixedHeight) != 0,
+                title, NO, ^(NSError *error) {
                     [MacWSPendingWindowSceneIdentities removeObject:identity];
                     [MacWSObservedWindowIdentities removeObject:identity];
                     [MacWSPreviouslyFrontmostWindowIdentities
@@ -5800,44 +6763,7 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
   receivedWindows:(NSArray<MacWSStreamWindow *> *)windows {
     (void)view;
     _streamWindows = [windows copy];
-    if (_streamMode == MacWSStreamModeWindow && _windowID != 0 &&
-        _windowOwnerPID > 1) {
-        errno = 0;
-        BOOL ownerMissing = kill(_windowOwnerPID, 0) != 0 && errno == ESRCH;
-        if (ownerMissing) {
-            // Runtime-confirmed after the 2026-09-03 full-package cold start:
-            // the restored Scene still targeted Weather pid 45820/window 122
-            // after desktop cleanup had removed that process. The new
-            // DisplayStream catalog was healthy (Terminal was present), but
-            // an exact-window subscription can never publish a first frame
-            // for a dead owner, leaving the Host black indefinitely. Process
-            // absence is the authoritative generation boundary; clear the
-            // invalid return identity and reuse this same foreground Scene as
-            // the full desktop. A live root-owned process returns EPERM and
-            // is deliberately retained while its first window is launching.
-            int32_t missingOwnerPID = _windowOwnerPID;
-            uint32_t missingWindowID = _windowID;
-            _windowID = 0;
-            _windowOwnerPID = 0;
-            _windowGroupID = 0;
-            _windowMinimumSize = CGSizeZero;
-            _windowPreferredSize = CGSizeZero;
-            _windowResizable = NO;
-            _workspaceReturnValid = NO;
-            _workspaceReturnWindowID = 0;
-            _workspaceReturnOwnerPID = 0;
-            _workspaceReturnGroupID = 0;
-            _metalView.targetPID = 0;
-            _metalView.minimumLogicalSize = CGSizeZero;
-            _metalView.targetWindowResizable = NO;
-            MacWSLog(@"runtime-confirmed stale-window-generation "
-                     "owner=%d window=%u catalog=%lu recovery=desktop",
-                     missingOwnerPID, missingWindowID,
-                     (unsigned long)windows.count);
-            [self openFullscreenWorkspace];
-            return;
-        }
-    }
+    if (_sceneDestructionRequested) return;
     if (_streamMode == MacWSStreamModeFullscreen) {
         NSMutableSet<NSNumber *> *eligiblePIDs = [NSMutableSet set];
         for (MacWSStreamWindow *window in windows) {
@@ -6051,10 +6977,29 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
     [self openInitialFinderBrowserWindowIfNeeded:windows];
     [self openPendingApplicationWindowFromCatalog:windows];
     [self openNewMacWindowsFromCatalog:windows];
+    // The explicit pending-launch path can rebind this Scene above. Probe
+    // its current owner afterward; a retired owner's ESRCH must not become
+    // absence evidence for the newly bound application.
+    BOOL targetOwnerMissing = NO;
+    if (_streamMode == MacWSStreamModeWindow && _windowID != 0 &&
+        _windowOwnerPID > 1) {
+        errno = 0;
+        targetOwnerMissing = kill(_windowOwnerPID, 0) != 0 && errno == ESRCH;
+        // Runtime-confirmed: MacWSHost.log 1789161045.785/.800 converted the
+        // dead Finder owner's About/Get Info Scenes into desktop workspaces;
+        // each then issued a fullscreen activation and displaced the stage.
+        // A window Scene owns only this exact native window, not a fallback
+        // desktop. Retire it through the confirmed missing-window path below.
+        // ESRCH, not EPERM or one absent catalog entry, is process-death proof.
+    }
     if (_windowID != 0) {
         MacWSStreamWindow *exactWindow = nil;
         MacWSStreamWindow *groupReplacement = nil;
         for (MacWSStreamWindow *window in windows) {
+            // A retained catalog can outlive the process it describes. Never
+            // adopt its stale entry, or another process's reused window ID.
+            if (targetOwnerMissing ||
+                window.descriptor.ownerPID != _windowOwnerPID) continue;
             if (window.descriptor.windowID == _windowID) {
                 exactWindow = window;
             } else if (_windowGroupID != 0 &&
@@ -6092,8 +7037,15 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
         if (resolvedWindow) {
             BOOL previouslyObservedTarget = _targetWindowObservedInCatalog;
             CGSize previousPreferredSize = _windowPreferredSize;
+            CGSize previousMinimumSize = _windowMinimumSize;
+            CGSize previousMaximumSize = _windowMaximumSize;
             BOOL configurationPending =
-                _metalView.windowConfigurationAwaitingAcknowledgement;
+                _metalView.nativeWindowResizeGestureActive ||
+                _metalView.windowConfigurationAwaitingAcknowledgement ||
+                _metalView.windowConfigurationAwaitingSettlement ||
+                _metalView.windowConfigurationHasQueuedRequest;
+            BOOL sceneFollowingAppKit =
+                _metalView.sceneResizeFollowingTargetWindow;
             _targetWindowObservedInCatalog = YES;
             _targetWindowMissingCheckPending = NO;
             _targetWindowMissingSerial++;
@@ -6103,31 +7055,93 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
             _windowMinimumSize = CGSizeMake(
                 resolvedWindow.descriptor.minimumLogicalWidth,
                 resolvedWindow.descriptor.minimumLogicalHeight);
+            _windowMaximumSize = resolvedWindow.maximumLogicalSize;
             CGSize observedLogicalSize = CGSizeMake(
                 resolvedWindow.descriptor.logicalWidth,
                 resolvedWindow.descriptor.logicalHeight);
-            _windowPreferredSize = observedLogicalSize;
+            BOOL usableObservedGeometry =
+                observedLogicalSize.width >= 64.0 &&
+                observedLogicalSize.height >= 64.0;
+            if (usableObservedGeometry)
+                _windowPreferredSize = observedLogicalSize;
+            BOOL previousWidthFixed = _windowWidthFixed;
+            BOOL previousHeightFixed = _windowHeightFixed;
             _windowResizable =
                 (resolvedWindow.descriptor.flags & MacWSStreamWindowResizable) != 0;
-            [_metalView observeTargetWindowLogicalSize:observedLogicalSize];
+            _windowWidthFixed =
+                (resolvedWindow.descriptor.flags &
+                    MacWSStreamWindowFixedWidth) != 0 || !_windowResizable;
+            _windowHeightFixed =
+                (resolvedWindow.descriptor.flags &
+                    MacWSStreamWindowFixedHeight) != 0 || !_windowResizable;
+            // Install native limits before delivering the exact configure
+            // ACK. A catalog minimum or a changed surface alone is not an
+            // acknowledgement of the currently requested geometry.
             _metalView.minimumLogicalSize = _windowMinimumSize;
+            _metalView.maximumLogicalSize = _windowMaximumSize;
+            _metalView.windowConfigurationAcknowledgementsAvailable =
+                resolvedWindow.supportsConfigurationAcknowledgements;
             _metalView.targetWindowResizable = _windowResizable;
-            BOOL appKitChangedItsOwnSize = previouslyObservedTarget &&
-                resolvedID == _windowID && !configurationPending &&
+            _metalView.targetWindowFixedWidth = _windowWidthFixed;
+            _metalView.targetWindowFixedHeight = _windowHeightFixed;
+            if (usableObservedGeometry)
+                [_metalView observeTargetWindowLogicalSize:observedLogicalSize];
+            if (resolvedWindow.supportsConfigurationAcknowledgements)
+                [_metalView observeWindowConfigurationWithTimestamp:
+                    resolvedWindow.latestConfigureTimestamp
+                    sampleSequence:resolvedWindow.latestConfigureSequence
+                    requestedSize:resolvedWindow.latestConfigureRequestedSize
+                    appliedSize:resolvedWindow.latestConfigureAppliedSize];
+            BOOL geometryTransactionBusy = configurationPending ||
+                _metalView.nativeWindowResizeGestureActive ||
+                sceneFollowingAppKit ||
+                _metalView.windowConfigurationAwaitingAcknowledgement ||
+                _metalView.windowConfigurationAwaitingSettlement ||
+                _metalView.windowConfigurationHasQueuedRequest ||
+                _metalView.sceneResizeFollowingTargetWindow;
+            BOOL appKitChangedItsOwnSize = usableObservedGeometry &&
+                previouslyObservedTarget &&
+                resolvedID == _windowID && !geometryTransactionBusy &&
                 previousPreferredSize.width > 0.0 &&
                 previousPreferredSize.height > 0.0 &&
                 (fabs(observedLogicalSize.width -
                       previousPreferredSize.width) >= 0.75 ||
                  fabs(observedLogicalSize.height -
                       previousPreferredSize.height) >= 0.75);
-            if (appKitChangedItsOwnSize) {
-                // No Host ConfigureWindow transaction was outstanding, so
-                // this catalog generation is an autonomous AppKit geometry
-                // change (for example an application's loading window being
-                // replaced by its constrained main window). Follow it once
-                // at the native Scene layer.
-                [self followNativeSceneSizeForAppliedLogicalSize:
-                    observedLogicalSize reason:@"appkit-autonomous"];
+            BOOL axisPolicyChanged = previouslyObservedTarget &&
+                (previousWidthFixed != _windowWidthFixed ||
+                 previousHeightFixed != _windowHeightFixed ||
+                 !CGSizeEqualToSize(previousMinimumSize, _windowMinimumSize) ||
+                 !CGSizeEqualToSize(previousMaximumSize, _windowMaximumSize));
+            // Restoration metadata can predate the axis flags added to the
+            // stream protocol. The first authoritative catalog is therefore
+            // also a policy transition when it discovers a fixed axis. Apply
+            // that Scene restriction immediately instead of waiting for the
+            // AppKit frame to change a second time.
+            BOOL initialAxisPolicyDiscovered = !previouslyObservedTarget &&
+                (_windowWidthFixed || _windowHeightFixed ||
+                 _windowMaximumSize.width > 0.0 || _windowMaximumSize.height > 0.0);
+            if (usableObservedGeometry &&
+                (appKitChangedItsOwnSize || axisPolicyChanged ||
+                 initialAxisPolicyDiscovered)) {
+                // A policy update may accompany a stale geometry snapshot
+                // while a newer configure is pending. Publish its limits,
+                // but never cancel that transaction to follow the snapshot.
+                [self updateNativeSceneSizeForAppliedLogicalSize:
+                    observedLogicalSize reason:(axisPolicyChanged ||
+                                                initialAxisPolicyDiscovered)
+                        ? @"appkit-axis-policy" : @"appkit-autonomous"
+                    policyOnly:geometryTransactionBusy];
+            } else if (!usableObservedGeometry) {
+                // Runtime-confirmed by MacWSHost.log at 1789061518.061: a
+                // closing/transitioning AppKit window briefly appeared in the
+                // catalog as 2x3 points.  It is not a usable window geometry
+                // and must not overwrite the last stable restoration size or
+                // become a reverse Scene-size request.
+                MacWSLog(@"window-geometry transient-rejected window=%u pid=%d logical=%.1fx%.1f",
+                         resolvedID, _windowOwnerPID,
+                         observedLogicalSize.width,
+                         observedLogicalSize.height);
             }
             if (resolvedID != _windowID) {
                 uint32_t oldID = _windowID;
@@ -6144,7 +7158,7 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
                 MacWSRememberSceneBinding(self.view.window.windowScene.session,
                                           [self streamRestorationActivity]);
             }
-        } else if (_targetWindowObservedInCatalog &&
+        } else if ((_targetWindowObservedInCatalog || targetOwnerMissing) &&
                    !_targetWindowMissingCheckPending &&
                    !_sceneDestructionRequested) {
             // The catalog is authoritative, but one transient refresh can
@@ -6156,6 +7170,8 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
             uint32_t expectedWindowID = _windowID;
             uint32_t expectedGroupID = _windowGroupID;
             int32_t expectedOwnerPID = _windowOwnerPID;
+            uint64_t firstMissingCatalogRevision = _metalView.windowCatalogRevision;
+            BOOL ownerWasMissing = targetOwnerMissing;
             [_metalView requestStreamWindowList];
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
                                          650 * NSEC_PER_MSEC),
@@ -6163,22 +7179,102 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
                 if (serial != self->_targetWindowMissingSerial ||
                     !self->_targetWindowMissingCheckPending ||
                     self->_sceneDestructionRequested ||
-                    self->_windowID != expectedWindowID) return;
+                    self->_streamMode != MacWSStreamModeWindow ||
+                    self->_windowID != expectedWindowID ||
+                    self->_windowOwnerPID != expectedOwnerPID ||
+                    self->_windowGroupID != expectedGroupID) return;
+                errno = 0;
+                BOOL ownerStillMissing =
+                    kill(expectedOwnerPID, 0) != 0 && errno == ESRCH;
+                self->_targetWindowMissingCheckPending = NO;
+                // Do not turn an unanswered re-query into a second absence
+                // witness. A live/reused PID requires another catalog; two
+                // ESRCH probes across the interval independently prove death.
+                BOOL refreshedCatalog = self->_metalView.windowCatalogRevision >
+                    firstMissingCatalogRevision;
+                if (!refreshedCatalog &&
+                    !(ownerWasMissing && ownerStillMissing)) {
+                    MacWSLog(@"mac-window-removed confirmation-deferred owner=%d window=%u reason=no-fresh-catalog",
+                             expectedOwnerPID, expectedWindowID);
+                    [self->_metalView requestStreamWindowList];
+                    return;
+                }
                 BOOL present = NO;
                 for (MacWSStreamWindow *candidate in self->_streamWindows) {
+                    if (ownerStillMissing ||
+                        candidate.descriptor.ownerPID != expectedOwnerPID)
+                        continue;
                     if (candidate.descriptor.windowID == expectedWindowID ||
                         (expectedGroupID != 0 &&
-                         candidate.descriptor.ownerPID == expectedOwnerPID &&
                          candidate.descriptor.logicalGroupID == expectedGroupID)) {
                         present = YES;
                         break;
                     }
                 }
-                self->_targetWindowMissingCheckPending = NO;
                 if (present) return;
                 UISceneSession *session = self.view.window.windowScene.session;
                 NSString *identifier = session.persistentIdentifier;
                 if (!session || !identifier.length) return;
+                // A closing AppKit panel and the top-level windows exposed by
+                // that close can share one DisplayStream catalog generation.
+                // openNewMacWindowsFromCatalog: has already submitted their
+                // UIKit Scene activations, but FrontBoard has not necessarily
+                // connected either successor yet. Runtime-confirmed on
+                // 2026-09-11: destroying About Finder's last connected Scene
+                // 30 ms before the root/Get Info activation requests caused
+                // iPadOS to synthesize an activity-less default Scene. That
+                // Scene restored as fullscreen, launched bootstrap Terminal,
+                // and discarded an unrelated Excel Stage Manager window.
+                // Keep this now-orphaned presentation alive until one of the
+                // exact pending successors has a real UISceneSession. If all
+                // requests fail, their existing five-second expiry clears the
+                // pending set and the ordinary missing-window path resumes.
+                BOOL pendingSuccessorConnection = NO;
+                if (MacWSPendingWindowSceneIdentities.count != 0) {
+                    for (UISceneSession *candidate in
+                            UIApplication.sharedApplication.openSessions) {
+                        if (candidate == session) continue;
+                        NSUserActivity *candidateActivity =
+                            MacWSSceneBindings[
+                                candidate.persistentIdentifier] ?:
+                            MacWSPersistedSceneActivity(
+                                candidate.persistentIdentifier) ?:
+                            candidate.stateRestorationActivity;
+                        int32_t candidateOwner = 0;
+                        uint32_t candidateWindow = 0;
+                        uint32_t candidateGroup = 0;
+                        if (!MacWSSceneOwnedWindowFields(
+                                candidateActivity.userInfo,
+                                &candidateOwner, &candidateWindow,
+                                &candidateGroup)) continue;
+                        NSString *candidateIdentity = MacWSWindowIdentity(
+                            candidateOwner, candidateWindow, candidateGroup);
+                        if ([MacWSPendingWindowSceneIdentities
+                                containsObject:candidateIdentity]) {
+                            pendingSuccessorConnection = YES;
+                            break;
+                        }
+                    }
+                    if (!pendingSuccessorConnection) {
+                        NSArray<NSString *> *pending =
+                            [MacWSPendingWindowSceneIdentities.allObjects
+                                sortedArrayUsingSelector:@selector(compare:)];
+                        MacWSLog(@"mac-window-removed destruction-deferred id=%@ owner=%d window=%u pending-successors=%@",
+                                 identifier, expectedOwnerPID,
+                                 expectedWindowID,
+                                 [pending componentsJoinedByString:@","]);
+                        dispatch_after(dispatch_time(
+                                DISPATCH_TIME_NOW, 250 * NSEC_PER_MSEC),
+                            dispatch_get_main_queue(), ^{
+                                if (!self->_sceneDestructionRequested &&
+                                    self->_windowID == expectedWindowID &&
+                                    self->_windowOwnerPID == expectedOwnerPID)
+                                    [self->_metalView
+                                        requestStreamWindowList];
+                            });
+                        return;
+                    }
+                }
                 if (!MacWSSceneSessionsPreservingMacWindow)
                     MacWSSceneSessionsPreservingMacWindow = [NSMutableSet set];
                 if (!MacWSSceneCloseRequestsSent)
@@ -6188,19 +7284,28 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
                 [MacWSSceneBindings removeObjectForKey:identifier];
                 MacWSSetPersistedSceneBinding(identifier, nil);
                 self->_sceneDestructionRequested = YES;
-                MacWSLog(@"runtime-confirmed mac-window-removed id=%@ owner=%d window=%u group=%u catalog-count=%lu",
+                ++self->_nativeFocusRequestSerial;
+                ++self->_constrainedSceneResizeSerial;
+                self->_deferredBackgroundSceneWindowID = 0;
+                [self->_metalView cancelSceneResizeFollowingTargetWindow];
+                [self suspendSceneStream];
+                MacWSLog(@"runtime-confirmed mac-window-removed id=%@ owner=%d window=%u group=%u catalog-count=%lu owner-missing=%@ refreshed-catalog=%@ recovery=retire-scene mac-window=preserved",
                          identifier, expectedOwnerPID, expectedWindowID,
                          expectedGroupID,
-                         (unsigned long)self->_streamWindows.count);
+                         (unsigned long)self->_streamWindows.count,
+                         ownerStillMissing ? @"YES" : @"NO",
+                         refreshedCatalog ? @"YES" : @"NO");
                 [UIApplication.sharedApplication
                     requestSceneSessionDestruction:session options:nil
                     errorHandler:^(NSError *error) {
                         self->_sceneDestructionRequested = NO;
-                        [MacWSSceneSessionsPreservingMacWindow
-                            removeObject:identifier];
-                        [MacWSSceneCloseRequestsSent removeObject:identifier];
+                        // This Scene is still orphaned, even if FrontBoard
+                        // rejected its destruction. Keep the no-close
+                        // tombstones so a later discard cannot address a
+                        // recycled PID/window identity through restoration.
                         MacWSLog(@"mac-window-removed scene-destruction failed id=%@ error=%@",
                                  identifier, error);
+                        [self resumeSceneStream];
                     }];
             });
         }
@@ -6229,7 +7334,11 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
         @"preferred_height": @(_windowPreferredSize.height),
         @"minimum_width": @(_windowMinimumSize.width),
         @"minimum_height": @(_windowMinimumSize.height),
+        @"maximum_width": @(_windowMaximumSize.width),
+        @"maximum_height": @(_windowMaximumSize.height),
         @"resizable": @(_windowResizable),
+        @"fixed_width": @(_windowWidthFixed),
+        @"fixed_height": @(_windowHeightFixed),
         @"title": activity.title,
         @"return_window_id": @(_workspaceReturnValid
             ? _workspaceReturnWindowID : 0),
@@ -6245,12 +7354,20 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
             ? _workspaceReturnMinimumSize.width : 0),
         @"return_minimum_height": @(_workspaceReturnValid
             ? _workspaceReturnMinimumSize.height : 0),
+        @"return_maximum_width": @(_workspaceReturnValid
+            ? _workspaceReturnMaximumSize.width : 0),
+        @"return_maximum_height": @(_workspaceReturnValid
+            ? _workspaceReturnMaximumSize.height : 0),
         @"return_scene_width": @(_workspaceReturnValid
             ? _workspaceReturnSceneSize.width : 0),
         @"return_scene_height": @(_workspaceReturnValid
             ? _workspaceReturnSceneSize.height : 0),
         @"return_resizable": @(_workspaceReturnValid
             ? _workspaceReturnResizable : NO),
+        @"return_fixed_width": @(_workspaceReturnValid
+            ? _workspaceReturnWidthFixed : NO),
+        @"return_fixed_height": @(_workspaceReturnValid
+            ? _workspaceReturnHeightFixed : NO),
         @"return_title": _workspaceReturnValid
             ? (_workspaceReturnTitle ?: @"MacWS Window") : @"",
     };
@@ -6263,11 +7380,36 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
 }
 
 - (void)resumeSceneStream {
+    if (_sceneDestructionRequested) return;
     if (!(_bootstrapTerminalPending && _windowID == 0))
         [_metalView configureStreamMode:_streamMode windowID:_windowID];
     [_metalView requestStreamWindowList];
     [_interopClient connect];
     if (_windowID != 0) [self refreshSemanticMenuWithCompletion:nil];
+}
+
+- (void)requestWindowLifetimeReconciliation {
+    if (!_sceneDestructionRequested)
+        [_metalView requestStreamWindowList];
+}
+
+- (void)applyDeferredForegroundSceneSize {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (self->_deferredBackgroundSceneWindowID == 0 ||
+            self->_initialSceneSizePending ||
+            self.viewIfLoaded.window.windowScene.activationState !=
+                UISceneActivationStateForegroundActive) return;
+        CGSize logicalSize = self->_deferredBackgroundSceneLogicalSize;
+        BOOL exactTarget = self->_streamMode == MacWSStreamModeWindow &&
+            self->_deferredBackgroundSceneWindowID == self->_windowID &&
+            self->_deferredBackgroundSceneOwnerPID == self->_windowOwnerPID;
+        self->_deferredBackgroundSceneWindowID = 0;
+        self->_deferredBackgroundSceneOwnerPID = 0;
+        self->_deferredBackgroundSceneLogicalSize = CGSizeZero;
+        if (!exactTarget) return;
+        [self followNativeSceneSizeForAppliedLogicalSize:logicalSize
+            reason:@"foreground-deferred-appkit-size"];
+    });
 }
 
 - (void)cancelBootstrapTerminal {
@@ -6276,6 +7418,12 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
 }
 
 - (void)metalView:(MacWSMetalView *)view emittedInput:(MacWSInputRecord)record {
+    // A queued ConfigureWindow retry can outlive stream suspension. Retiring
+    // this presentation must not resize/focus its old target, but terminal
+    // gesture/key events must still release any input state it held.
+    if (_sceneDestructionRequested &&
+        (record.kind == MacWSInputKindConfigureWindow ||
+         record.kind == MacWSInputKindActivateTarget)) return;
     int32_t presentationTargetPID = record.targetPID;
     // Fullscreen pointer records become one hardware-style global stream in
     // routeFullscreenInputRecord:, leaving WindowServer authoritative for
@@ -6316,6 +7464,7 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
         case MacWSInputKindKeyDown: phase = @"key-down"; break;
         case MacWSInputKindKeyUp: phase = @"key-up"; break;
         case MacWSInputKindConfigureWindow: phase = @"configure-window"; break;
+        case MacWSInputKindActivateTarget: phase = @"activate-target"; break;
         case MacWSInputKindCloseWindow: phase = @"close-window"; break;
         case MacWSInputKindCreateInitialWindow:
             phase = @"create-initial-window"; break;
@@ -6335,6 +7484,7 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
                       record.kind == MacWSInputKindRotate ||
                       record.kind == MacWSInputKindSystemGesture;
     if (record.kind == MacWSInputKindPerformPaste ||
+        record.kind == MacWSInputKindActivateTarget ||
         (MacWSHostDiagnosticsEnabled() &&
          (!continuous || (_inputLogSequence % 60) == 0))) {
         MacWSLog(@"input transport=%@ errno=%d wire=%u scene=%llx target=%d kind=%@ source=%u point=(%.2f,%.2f) frame=%ux%u pressure=%.3f contact=%u sample=%u seq=%llu",
@@ -6407,17 +7557,13 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
 @implementation MacWSWorkspaceWindow
 - (void)becomeKeyWindow {
     [super becomeKeyWindow];
-    // Stage Manager may keep several MacWS Scenes ForegroundActive at once,
-    // but UIKit has one key UIWindow for the user's actual interaction
-    // target. Propagate that stronger public lifecycle edge to the bound
-    // AppKit window so another merely-active Scene cannot steal focus.
+    // This is Scene-local, not application-global key state. The evaluator
+    // notification is the primary focus edge; this is only an initial-window
+    // fallback, rechecked against the real application-key window.
     UIViewController *root = self.rootViewController;
     if ([root isKindOfClass:MacWSViewController.class]) {
-        BOOL activated = [(MacWSViewController *)root
-            activateCurrentMacWindow];
-        MacWSLog(@"window-became-key activates-appkit scene=%@ activated=%@",
-                 self.windowScene.session.persistentIdentifier ?: @"none",
-                 activated ? @"YES" : @"NO");
+        [(MacWSViewController *)root
+            synchronizeMacWindowFocusWithReason:@"window-became-key"];
     }
 }
 
@@ -6472,6 +7618,13 @@ static void MacWSPruneDeadWindowSceneSessions(void) {
         if ([info[@"mode"] unsignedIntValue] == MacWSStreamModeFullscreen &&
             [controller detachMissingWorkspaceReturnOwnerPID:ownerPID
                                                      windowID:windowID]) {
+            continue;
+        }
+        if (controller && [info[@"mode"] unsignedIntValue] ==
+                MacWSStreamModeWindow) {
+            // Connected windows share the same two-observation retirement
+            // path, including its in-flight successor-Scene protection.
+            [controller requestWindowLifetimeReconciliation];
             continue;
         }
         NSString *identifier = session.persistentIdentifier;
@@ -6630,21 +7783,34 @@ static void MacWSDeduplicateWindowScenes(void) {
     int32_t ownerPID = (int32_t)[activity.userInfo[@"owner_pid"] intValue];
     uint32_t logicalGroupID =
         [activity.userInfo[@"logical_group_id"] unsignedIntValue];
+    NSString *connectedIdentity = MacWSWindowIdentity(ownerPID, windowID, logicalGroupID);
+    if (connectedIdentity)
+        [MacWSSceneCreationsInFlight removeObjectForKey:connectedIdentity];
     CGSize minimumSize = CGSizeMake(
         [activity.userInfo[@"minimum_width"] doubleValue],
         [activity.userInfo[@"minimum_height"] doubleValue]);
+    CGSize maximumSize = CGSizeMake(
+        [activity.userInfo[@"maximum_width"] doubleValue],
+        [activity.userInfo[@"maximum_height"] doubleValue]);
     CGSize preferredSize = CGSizeMake(
         [activity.userInfo[@"preferred_width"] doubleValue],
         [activity.userInfo[@"preferred_height"] doubleValue]);
     BOOL resizable = [activity.userInfo[@"resizable"] boolValue];
+    BOOL fixedWidth = !resizable ||
+        [activity.userInfo[@"fixed_width"] boolValue];
+    BOOL fixedHeight = !resizable ||
+        [activity.userInfo[@"fixed_height"] boolValue];
     if (streamMode != MacWSStreamModeWindow || windowID == 0) {
         streamMode = MacWSStreamModeFullscreen;
         windowID = 0;
         ownerPID = 0;
         logicalGroupID = 0;
         minimumSize = CGSizeZero;
+        maximumSize = CGSizeZero;
         preferredSize = CGSizeZero;
         resizable = NO;
+        fixedWidth = NO;
+        fixedHeight = NO;
     }
     NSString *shortID = session.persistentIdentifier;
     if (shortID.length > 8) shortID = [shortID substringToIndex:8];
@@ -6656,11 +7822,27 @@ static void MacWSDeduplicateWindowScenes(void) {
                      streamMode:streamMode windowID:windowID
                        ownerPID:ownerPID logicalGroupID:logicalGroupID
                     minimumSize:minimumSize
+                    maximumSize:maximumSize
                   preferredSize:preferredSize
-                      resizable:resizable];
+                      resizable:resizable
+                     fixedWidth:fixedWidth
+                    fixedHeight:fixedHeight];
     [controller restoreWorkspaceReturnFromActivity:activity];
     self.window = [[MacWSWorkspaceWindow alloc] initWithWindowScene:windowScene];
     self.window.rootViewController = controller;
+    // Root attachment makes the concrete FBS Scene identifier and the real
+    // Host chrome available. Publish sizing policy and request exact native
+    // geometry before this UIWindow contributes its first visible frame.
+    CGSize publishedInitialSize = CGSizeMake(
+        [activity.userInfo[@"initial_scene_width"] doubleValue],
+        [activity.userInfo[@"initial_scene_height"] doubleValue]);
+    CGSize publishedMinimumSize = CGSizeMake(
+        [activity.userInfo[@"initial_scene_minimum_width"] doubleValue],
+        [activity.userInfo[@"initial_scene_minimum_height"] doubleValue]);
+    [controller prepareInitialWindowSceneGeometryForScene:windowScene
+                                            initialBounds:self.window.bounds
+                                     publishedInitialSize:publishedInitialSize
+                                  publishedMinimumSize:publishedMinimumSize];
     [self.window makeKeyAndVisible];
     // Scene restoration can reconnect directly in fullscreen mode without
     // passing through openFullscreenWorkspace. Re-assert and log UIKit's
@@ -6668,9 +7850,8 @@ static void MacWSDeduplicateWindowScenes(void) {
     // is visible so cold launch and interactive transition share the same
     // immersive postconditions.
     [controller updateImmersivePresentation];
-    if (streamMode == MacWSStreamModeWindow && windowID != 0)
-        MacWSRequestNativeSceneSizeWithRole(
-            windowScene, preferredSize, NO);
+    // viewDidAppear starts the stream and rechecks the geometry postcondition;
+    // the first native sizing transaction was already submitted above.
     MacWSRememberSceneBinding(session, [controller streamRestorationActivity]);
     MacWSLog(@"scene-connected id=%@ role=%@ mode=%u window=%u",
              session.persistentIdentifier, session.role, streamMode, windowID);
@@ -6684,9 +7865,9 @@ static void MacWSDeduplicateWindowScenes(void) {
              minimumSize.height, resizable ? @"YES" : @"NO");
     if ([activity.userInfo[@"foreground_on_connect"] boolValue]) {
         // requestSceneSessionActivation may connect the requested window but
-        // leave it Background under Stage Manager.  Connection is not the
-        // user's postcondition: verify ForegroundActive and retry the same
-        // public session-activation transaction a bounded number of times.
+        // leave it Background under Stage Manager. Connection is not the
+        // user's postcondition: accept either visible foreground state and
+        // retry only when FrontBoard actually left the Scene in background.
         MacWSEnsureRequestedSceneIsForeground(
             windowScene, activity, nil, 0);
     }
@@ -6768,12 +7949,8 @@ static void MacWSDeduplicateWindowScenes(void) {
     // The iPadOS Scene selected by Stage Manager is the user's focus intent.
     // Propagate that one-way to the exact AppKit window instead of letting a
     // later passive macOS catalog update reactivate some other iOS Scene.
-    if (![controller isFullscreenWorkspace] && self.window.isKeyWindow) {
-        BOOL activated = [controller activateCurrentMacWindow];
-        MacWSLog(@"scene-active activates-appkit id=%@ activated=%@",
-                 scene.session.persistentIdentifier,
-                 activated ? @"YES" : @"NO");
-    }
+    [controller synchronizeMacWindowFocusWithReason:@"scene-became-active"];
+    [controller applyDeferredForegroundSceneSize];
     dispatch_async(dispatch_get_main_queue(), ^{
         [controller restoreHardwareKeyboardFocusWithReason:@"scene-active"];
     });
@@ -6832,6 +8009,12 @@ static void MacWSDeduplicateWindowScenes(void) {
             uint32_t windowID = 0;
             int32_t ownerPID = 0;
             NSString *title = nil;
+            CGSize preferredSize = CGSizeZero;
+            CGSize minimumSize = CGSizeZero;
+            CGSize maximumSize = CGSizeZero;
+            BOOL resizable = NO;
+            BOOL fixedWidth = NO;
+            BOOL fixedHeight = NO;
             NSURLComponents *components = [NSURLComponents
                 componentsWithURL:context.URL resolvingAgainstBaseURL:NO];
             for (NSURLQueryItem *item in components.queryItems) {
@@ -6841,6 +8024,24 @@ static void MacWSDeduplicateWindowScenes(void) {
                     ownerPID = item.value.intValue;
                 else if ([item.name isEqualToString:@"title"])
                     title = item.value;
+                else if ([item.name isEqualToString:@"preferred_width"])
+                    preferredSize.width = item.value.doubleValue;
+                else if ([item.name isEqualToString:@"preferred_height"])
+                    preferredSize.height = item.value.doubleValue;
+                else if ([item.name isEqualToString:@"minimum_width"])
+                    minimumSize.width = item.value.doubleValue;
+                else if ([item.name isEqualToString:@"minimum_height"])
+                    minimumSize.height = item.value.doubleValue;
+                else if ([item.name isEqualToString:@"maximum_width"])
+                    maximumSize.width = item.value.doubleValue;
+                else if ([item.name isEqualToString:@"maximum_height"])
+                    maximumSize.height = item.value.doubleValue;
+                else if ([item.name isEqualToString:@"resizable"])
+                    resizable = item.value.boolValue;
+                else if ([item.name isEqualToString:@"fixed_width"])
+                    fixedWidth = item.value.boolValue;
+                else if ([item.name isEqualToString:@"fixed_height"])
+                    fixedHeight = item.value.boolValue;
             }
             MacWSViewController *controller =
                 [self.window.rootViewController
@@ -6854,7 +8055,8 @@ static void MacWSDeduplicateWindowScenes(void) {
                 break;
             }
             MacWSRequestNewScene(scene, windowID, ownerPID, 0,
-                                 CGSizeZero, CGSizeZero, NO, title,
+                                 preferredSize, minimumSize, maximumSize, resizable,
+                                 fixedWidth, fixedHeight, title, YES,
                                  ^(NSError *error) {
                 if ([error.domain isEqualToString:@"FBSWorkspaceErrorDomain"] &&
                     error.code == 2 && windowID != 0 && ownerPID > 1) {

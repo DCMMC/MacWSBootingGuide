@@ -127,12 +127,15 @@ static char MacWSWindowMetricsPath[PATH_MAX];
 static NSData *MacWSLastWindowMetricsEntries;
 static uint64_t MacWSWindowMetricsGeneration;
 static id MacWSWindowGeometryObserverInstance;
+static BOOL MacWSWindowMetricsEventPublishPending;
+static char MacWSWindowConfigureAckKey;
 static void MacWSPublishWindowMetrics(void);
 extern void MacWSInstallPreviewCoreImageRendererAdapter(void);
 static void MacWSNotifyDisplayCatalogChanged(uint8_t reason);
 static void MacWSNotifyDisplayGeometryChanged(uint32_t windowID, id window,
                                               CGRect appliedFrame);
 static void MacWSInstallWindowGeometryObservers(void);
+static void MacWSClearDirectTrackingContextLocked(void);
 static const char *MacWSAppInputProgramName(void);
 static void MacWSMarkProcessLocalMouseEvent(id event);
 static BOOL MacWSIsProcessLocalMouseEvent(id event);
@@ -176,6 +179,14 @@ static BOOL MacWSAppInputRFBTrackingActive;
 // NSEvent.pressedMouseButtons bit(s) represented by the one atomic gesture
 // currently dispatched through AppKit (left=1, right=2).
 static NSUInteger MacWSAppInputRFBTrackingButtons;
+// CoreDrag does not consume NSEvents appended to NSApplication's queue.  Its
+// Ventura source-drag loop installs NSCoreDragCGEventInputProc and then waits
+// in CoreDragStartDragging, so only the process's real CGS event stream can
+// advance the drag image after Finder has created the NSDraggingSession.
+// Publish that exact lifecycle edge to the socket thread; it may then keep the
+// already-validated window gesture on CGPostMouseEvent until the physical up.
+static _Atomic BOOL MacWSAppInputCoreDragNativeActive;
+static _Atomic uint32_t MacWSAppInputCoreDragNativeWindow;
 // Process-local mouse NSEvents do not update WindowServer's global pointer or
 // button state. Tag only events constructed by this bridge so the
 // NSApplication dispatch hook can restore those hardware invariants for the
@@ -203,6 +214,7 @@ static CGPoint MacWSAppInputMouseLocation;
 typedef struct {
     BOOL accepting;
     uint32_t contactID;
+    uint64_t sceneID;
     NSInteger windowNumber;
     CGRect screenFrame;
     CGPoint windowMinusScreen;
@@ -1821,6 +1833,7 @@ static void MacWSClearDirectTrackingContextLocked(void) {
         MacWSAppInputDirectContext.application = NULL;
     }
     MacWSAppInputDirectContext.contactID = 0;
+    MacWSAppInputDirectContext.sceneID = 0;
     MacWSAppInputDirectContext.windowNumber = 0;
     MacWSAppInputDirectContext.screenFrame = (CGRect){0};
     MacWSAppInputDirectContext.windowMinusScreen = (CGPoint){0};
@@ -1830,6 +1843,7 @@ static void MacWSClearDirectTrackingContextLocked(void) {
 // MacWSAppInputRouteLock must be held by the caller.
 static void MacWSArmDirectTrackingContextLocked(id application,
                                                 Class eventClass,
+                                                uint64_t sceneID,
                                                 uint32_t contactID,
                                                 NSInteger windowNumber,
                                                 CGRect screenFrame,
@@ -1838,6 +1852,7 @@ static void MacWSArmDirectTrackingContextLocked(id application,
     MacWSClearDirectTrackingContextLocked();
     MacWSAppInputDirectContext.accepting = YES;
     MacWSAppInputDirectContext.contactID = contactID;
+    MacWSAppInputDirectContext.sceneID = sceneID;
     MacWSAppInputDirectContext.windowNumber = windowNumber;
     MacWSAppInputDirectContext.screenFrame = screenFrame;
     MacWSAppInputDirectContext.windowMinusScreen = (CGPoint){
@@ -3142,7 +3157,7 @@ static BOOL MacWSInputRecordIsValid(const MacWSInputRecord *record) {
         !MacWSInputVersionSupportsKind(record->version, record->kind) ||
         record->targetPID != getpid() ||
         record->frameWidth == 0 || record->frameHeight == 0 ||
-        record->source > MacWSInputSourceVNC ||
+        record->source > MacWSInputSourceMax ||
         !isfinite(record->x) || !isfinite(record->y) ||
         !isfinite(record->altitude) || !isfinite(record->azimuth) ||
         !isfinite(record->tiltX) || !isfinite(record->tiltY) ||
@@ -5152,6 +5167,7 @@ static BOOL MacWSPrepareDirectTrackingPostLocked(
     if (!isTrackingRecord ||
         !MacWSAppInputDirectContext.accepting ||
         MacWSAppInputDirectContext.contactID != record.contactID ||
+        MacWSAppInputDirectContext.sceneID != record.sceneID ||
         !MacWSAppInputDirectContext.application ||
         !MacWSAppInputDirectContext.eventClass) {
         return NO;
@@ -5170,6 +5186,24 @@ static BOOL MacWSPrepareDirectTrackingPostLocked(
         MacWSAppInputDirectContext.accepting = NO;
     }
     return YES;
+}
+
+static void MacWSRetireDirectTrackingContextForTerminalRecord(
+        MacWSInputRecord record, NSInteger windowNumber) {
+    if (record.kind != MacWSInputKindTouchUp &&
+        record.kind != MacWSInputKindTouchCancel) return;
+    pthread_mutex_lock(&MacWSAppInputRouteLock);
+    // MacWSPrepareDirectTrackingPostLocked snapshots the retained application
+    // before marking this exact route non-accepting. Retire it only after the
+    // terminal record has been posted, and only if another gesture has not
+    // replaced the context in the meantime.
+    if (!MacWSAppInputDirectContext.accepting &&
+        MacWSAppInputDirectContext.contactID == record.contactID &&
+        MacWSAppInputDirectContext.sceneID == record.sceneID &&
+        MacWSAppInputDirectContext.windowNumber == windowNumber) {
+        MacWSClearDirectTrackingContextLocked();
+    }
+    pthread_mutex_unlock(&MacWSAppInputRouteLock);
 }
 
 // MacWSAppInputRouteLock must be held by the caller.
@@ -5456,6 +5490,52 @@ static void MacWSPostDirectTrackingRecord(
             screenPoint.x + snapshot.windowMinusScreen.x,
             screenPoint.y + snapshot.windowMinusScreen.y,
         };
+        BOOL coreDragNative =
+            (record.kind == MacWSInputKindTouchMove ||
+             record.kind == MacWSInputKindTouchUp ||
+             record.kind == MacWSInputKindTouchCancel) &&
+            atomic_load_explicit(&MacWSAppInputCoreDragNativeActive,
+                                 memory_order_acquire) &&
+            atomic_load_explicit(&MacWSAppInputCoreDragNativeWindow,
+                                 memory_order_acquire) ==
+                (uint32_t)snapshot.windowNumber;
+        if (coreDragNative) {
+            MacWSPostLegacyMouseEvent postMouse =
+                MacWSLegacySystemMousePoster();
+            CGPoint quartzPoint = {
+                screenPoint.x,
+                snapshot.screenFrame.origin.y +
+                    snapshot.screenFrame.size.height - screenPoint.y,
+            };
+            BOOL leftDown = record.kind == MacWSInputKindTouchMove;
+            int32_t result = postMouse
+                ? postMouse(quartzPoint, true, 3,
+                            leftDown, false, false)
+                : -1;
+            if (MacWSRuntimeDiagnosticsEnabled()) {
+                static _Atomic uint64_t coreDragPosts;
+                uint64_t post = atomic_fetch_add_explicit(
+                    &coreDragPosts, 1, memory_order_relaxed) + 1;
+                if (post <= 16 || (post % 120) == 0 || !leftDown) {
+                    fprintf(stderr,
+                        "#### APP-INPUT CORE-DRAG-NATIVE pid=%d post=%llu "
+                        "kind=%u gesture=%u window=%ld quartz=(%.2f,%.2f) "
+                        "left=%s result=%d\n",
+                        getpid(), (unsigned long long)post, record.kind,
+                        record.contactID, (long)snapshot.windowNumber,
+                        quartzPoint.x, quartzPoint.y,
+                        leftDown ? "YES" : "NO", result);
+                    fflush(stderr);
+                }
+            }
+            if (result == 0) {
+                MacWSRetireDirectTrackingContextForTerminalRecord(
+                    record, snapshot.windowNumber);
+                if (snapshot.application)
+                    CFRelease(snapshot.application);
+                return;
+            }
+        }
         if (record.kind == MacWSInputKindHover ||
             record.kind == MacWSInputKindMenuHover) {
             // A process-local mouseMoved carries a location but does not move
@@ -5553,6 +5633,8 @@ static void MacWSPostDirectTrackingRecord(
             fflush(stderr);
         }
     }
+    MacWSRetireDirectTrackingContextForTerminalRecord(
+        record, snapshot.windowNumber);
     if (snapshot.application) CFRelease(snapshot.application);
 }
 
@@ -5620,14 +5702,20 @@ static void MacWSPostDirectMenuTapRecord(
 }
 
 // The caller holds MacWSAppInputRouteLock, so a socket record cannot pass its
-// direct-post decision while this scan is in progress.
-static BOOL MacWSHasPendingRFBTrackingRecordLocked(uint32_t contactID) {
+// direct-post decision while this scan is in progress.  Buffered tracking is
+// shared by the untargeted RFB canvas and exact native Window Scenes.  Match
+// the complete gesture identity here: restricting this scan to RFB's sentinel
+// scene made a fast Window-Scene move/up backlog invisible, so the first move
+// entered a synchronous AppKit tracker while its already-enqueued release was
+// stranded behind that tracker on the main run loop.
+static BOOL MacWSHasPendingTrackingRecordLocked(uint64_t sceneID,
+                                                 uint32_t contactID) {
     @synchronized(MacWSAppInputPending) {
         for (NSData *data in MacWSAppInputPending) {
             if ([data length] != sizeof(MacWSInputRecord)) continue;
             MacWSInputRecord pending = {0};
             [data getBytes:&pending length:sizeof(pending)];
-            if (pending.sceneID == 0x564e430000000001ull &&
+            if (pending.sceneID == sceneID &&
                 pending.contactID == contactID &&
                 (pending.kind == MacWSInputKindTouchMove ||
                  pending.kind == MacWSInputKindTouchUp ||
@@ -5879,16 +5967,74 @@ static id MacWSOutsidePopupWindow(id application, id baseWindow,
     return nil;
 }
 
+static void MacWSRequiredContentSizeLimits(id window, CGSize *minimum,
+                                            CGSize *maximum) {
+    id content = ((MacWSMsgID)objc_msgSend)(window,
+        sel_registerName("contentView"));
+    NSArray *constraints = content ? ((MacWSMsgID)objc_msgSend)(content,
+        sel_registerName("constraints")) : nil;
+    // RE-confirmed in the device's Finder: setContentView at 0x100457548
+    // activates root contentView.width >= natural minimum and width <= 400
+    // (0x100457658), without updating NSWindow.maxSize. Read that actual
+    // NSLayoutConstraint contract, not its observed frame or a class constant.
+    // Do not attempt to infer general cross-view/soft Auto Layout equations.
+    for (id constraint in constraints) {
+        if (!((MacWSMsgBool)objc_msgSend)(constraint,
+                sel_registerName("isActive")) ||
+            ((MacWSMsgFloat)objc_msgSend)(constraint,
+                sel_registerName("priority")) < 1000.0f ||
+            ((MacWSMsgID)objc_msgSend)(constraint,
+                sel_registerName("firstItem")) != content ||
+            ((MacWSMsgID)objc_msgSend)(constraint,
+                sel_registerName("secondItem")) != nil) continue;
+        NSInteger attribute = ((MacWSMsgInteger)objc_msgSend)(constraint,
+            sel_registerName("firstAttribute"));
+        if (attribute != 7 && attribute != 8) continue; // Width/Height.
+        double constant = ((MacWSMsgDouble)objc_msgSend)(constraint,
+            sel_registerName("constant"));
+        if (!isfinite(constant) || constant < 0.0 ||
+            constant > MACWS_STREAM_MAX_DIMENSION) continue;
+        NSInteger relation = ((MacWSMsgInteger)objc_msgSend)(constraint,
+            sel_registerName("relation"));
+        CGFloat *lower = attribute == 7 ? &minimum->width : &minimum->height;
+        CGFloat *upper = attribute == 7 ? &maximum->width : &maximum->height;
+        if (relation >= 0) *lower = fmax(*lower, constant);
+        if (relation <= 0) *upper = fmin(*upper, constant);
+    }
+}
+
 static CGSize MacWSEffectiveMinimumFrameSize(id window, CGRect frame,
-                                              BOOL *resizableOut) {
+                                              BOOL *resizableOut,
+                                              CGSize *maximumOut) {
     NSUInteger styleMask = ((MacWSMsgUInteger)objc_msgSend)(
         window, sel_registerName("styleMask"));
     BOOL resizable = (styleMask & (1u << 3)) != 0;
+
+    // Finder's Get Info inspector changes style from 0x7 to 0xf after it is
+    // ordered, but its public minSize/maxSize remain 0x28/16384x16384. The
+    // exact runtime witness in Finder.host.log (window class TInfoWindow,
+    // generations 8-11) therefore cannot express its intended interaction:
+    // the current content chooses height while the user may change width.
+    // Read the actual width anchors below and publish the live frame height
+    // as a content-driven fixed axis. Expanding General
+    // or More Info changes the real frame and naturally publishes a new fixed
+    // height; no title/localization heuristic or frame transform is involved.
+    Class infoWindowClass = objc_getClass("TInfoWindow");
+    BOOL contentDrivenHeight = infoWindowClass &&
+        ((MacWSMsgBoolID)objc_msgSend)(
+            window, sel_registerName("isKindOfClass:"), infoWindowClass);
+    if (contentDrivenHeight) resizable = YES;
     if (resizableOut) *resizableOut = resizable;
-    if (!resizable) return frame.size;
+    if (!resizable) {
+        if (maximumOut) *maximumOut = frame.size;
+        return frame.size;
+    }
 
     CGSize frameMinimum = {0};
     CGSize contentMinimum = {0};
+    CGSize contentMaximum = {
+        MACWS_STREAM_MAX_DIMENSION, MACWS_STREAM_MAX_DIMENSION,
+    };
     SEL minSizeSelector = sel_registerName("minSize");
     SEL contentMinSelector = sel_registerName("contentMinSize");
     if (((MacWSMsgBoolSEL)objc_msgSend)(window,
@@ -5899,6 +6045,16 @@ static CGSize MacWSEffectiveMinimumFrameSize(id window, CGRect frame,
             sel_registerName("respondsToSelector:"), contentMinSelector))
         contentMinimum = ((MacWSMsgSize)objc_msgSend)(window,
                                                        contentMinSelector);
+    SEL contentMaxSelector = sel_registerName("contentMaxSize");
+    if (((MacWSMsgBoolSEL)objc_msgSend)(window,
+            sel_registerName("respondsToSelector:"), contentMaxSelector)) {
+        CGSize value = ((MacWSMsgSize)objc_msgSend)(window, contentMaxSelector);
+        if (isfinite(value.width) && value.width > 0.0)
+            contentMaximum.width = fmin(contentMaximum.width, value.width);
+        if (isfinite(value.height) && value.height > 0.0)
+            contentMaximum.height = fmin(contentMaximum.height, value.height);
+    }
+    MacWSRequiredContentSizeLimits(window, &contentMinimum, &contentMaximum);
     CGRect contentRect = frame;
     SEL contentRectSelector = sel_registerName("contentRectForFrameRect:");
     if (((MacWSMsgBoolSEL)objc_msgSend)(window,
@@ -5917,7 +6073,70 @@ static CGSize MacWSEffectiveMinimumFrameSize(id window, CGRect frame,
         width > MACWS_STREAM_MAX_DIMENSION) width = 0.0;
     if (!isfinite(height) || height < 0.0 ||
         height > MACWS_STREAM_MAX_DIMENSION) height = 0.0;
-    return (CGSize){width, height};
+    CGSize minimum = {width, height};
+    CGSize maximum = {
+        fmin(MACWS_STREAM_MAX_DIMENSION, contentMaximum.width +
+             fmax(0.0, frame.size.width - contentRect.size.width)),
+        fmin(MACWS_STREAM_MAX_DIMENSION, contentMaximum.height +
+             fmax(0.0, frame.size.height - contentRect.size.height)),
+    };
+    SEL maxSizeSelector = sel_registerName("maxSize");
+    if (((MacWSMsgBoolSEL)objc_msgSend)(window,
+            sel_registerName("respondsToSelector:"), maxSizeSelector)) {
+        CGSize value = ((MacWSMsgSize)objc_msgSend)(window, maxSizeSelector);
+        if (isfinite(value.width) && value.width > 0.0)
+            maximum.width = fmin(value.width, maximum.width);
+        if (isfinite(value.height) && value.height > 0.0)
+            maximum.height = fmin(value.height, maximum.height);
+    }
+    // RE-confirmed in the actual macOS 13.4 AppKit, 0x184110e00/e08:
+    // this native query solves the whole window's Auto Layout min/max, then
+    // intersects minSize/maxSize. Its wrapper explicitly passes
+    // changingOnlySlightly=NO; using the nearby YES path would instead bound
+    // the answer around the current frame (0x184110f8c), not a global limit.
+    // Root-only constant constraints above cannot represent Finder's nested
+    // split-view minimum. Runtime 1789179434: CGWindow 290 was 445 wide while
+    // the earlier configure ACK claimed 409 and the published minimum was 0.
+    SEL nativeLimits = sel_registerName("_getConstrainedWindowMinSize:maxSize:");
+    if (((MacWSMsgBoolSEL)objc_msgSend)(window,
+            sel_registerName("respondsToSelector:"), nativeLimits)) {
+        CGSize nativeMinimum = {NAN, NAN}, nativeMaximum = {NAN, NAN};
+        ((void (*)(id, SEL, CGSize *, CGSize *))objc_msgSend)(
+            window, nativeLimits, &nativeMinimum, &nativeMaximum);
+        if (isfinite(nativeMinimum.width) && nativeMinimum.width >= 0.0 &&
+            nativeMinimum.width <= MACWS_STREAM_MAX_DIMENSION)
+            minimum.width = fmax(minimum.width, nativeMinimum.width);
+        if (isfinite(nativeMinimum.height) && nativeMinimum.height >= 0.0 &&
+            nativeMinimum.height <= MACWS_STREAM_MAX_DIMENSION)
+            minimum.height = fmax(minimum.height, nativeMinimum.height);
+        if (isfinite(nativeMaximum.width) && nativeMaximum.width > 0.0)
+            maximum.width = fmin(maximum.width, nativeMaximum.width);
+        if (isfinite(nativeMaximum.height) && nativeMaximum.height > 0.0)
+            maximum.height = fmin(maximum.height, nativeMaximum.height);
+        static char nativeLimitsWitnessKey;
+        CGSize witness[2] = {minimum, maximum};
+        NSData *previous = objc_getAssociatedObject(window, &nativeLimitsWitnessKey);
+        NSData *current = [NSData dataWithBytes:witness length:sizeof(witness)];
+        if (![previous isEqualToData:current]) {
+            objc_setAssociatedObject(window, &nativeLimitsWitnessKey, current,
+                OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            fprintf(stderr, "#### APP-INPUT NATIVE-CONSTRAINT-LIMITS pid=%d window=%ld "
+                "minimum=%.1fx%.1f maximum=%.1fx%.1f source=appkit-layout-engine\n",
+                getpid(), (long)((MacWSMsgInteger)objc_msgSend)(window,
+                    sel_registerName("windowNumber")), minimum.width, minimum.height,
+                maximum.width, maximum.height);
+        }
+    }
+    if (contentDrivenHeight) {
+        // Disclosures own height; native width anchors own width. Before
+        // anchors exist, leave that width unknown rather than caching an
+        // observed frame as a minimum.
+        minimum.height = maximum.height = frame.size.height;
+    }
+    maximum.width = fmax(maximum.width, minimum.width);
+    maximum.height = fmax(maximum.height, minimum.height);
+    if (maximumOut) *maximumOut = maximum;
+    return minimum;
 }
 
 // Apply the same public NSWindow constraints that participate in an ordinary
@@ -5933,22 +6152,12 @@ static CGSize MacWSConstrainedWindowFrameSize(id window, CGRect frame,
                                                CGSize *maximumOut,
                                                CGSize *aspectOut,
                                                CGSize *incrementsOut) {
-    CGSize maximum = {
-        MACWS_STREAM_MAX_DIMENSION, MACWS_STREAM_MAX_DIMENSION,
-    };
+    CGSize maximum = CGSizeZero;
+    (void)MacWSEffectiveMinimumFrameSize(window, frame, NULL, &maximum);
     CGSize aspect = CGSizeZero;
     CGSize increments = CGSizeZero;
-    SEL maxSizeSelector = sel_registerName("maxSize");
     SEL aspectSelector = sel_registerName("aspectRatio");
     SEL incrementsSelector = sel_registerName("resizeIncrements");
-    if (((MacWSMsgBoolSEL)objc_msgSend)(window,
-            sel_registerName("respondsToSelector:"), maxSizeSelector)) {
-        CGSize value = ((MacWSMsgSize)objc_msgSend)(window, maxSizeSelector);
-        if (isfinite(value.width) && value.width > 0.0)
-            maximum.width = fmin(value.width, MACWS_STREAM_MAX_DIMENSION);
-        if (isfinite(value.height) && value.height > 0.0)
-            maximum.height = fmin(value.height, MACWS_STREAM_MAX_DIMENSION);
-    }
     if (((MacWSMsgBoolSEL)objc_msgSend)(window,
             sel_registerName("respondsToSelector:"), aspectSelector)) {
         CGSize value = ((MacWSMsgSize)objc_msgSend)(window, aspectSelector);
@@ -7337,7 +7546,7 @@ static void MacWSPostInputOnMainThread(MacWSInputRecord record) {
             window, sel_registerName("frame"));
         BOOL resizable = NO;
         CGSize minimum = MacWSEffectiveMinimumFrameSize(
-            window, oldFrame, &resizable);
+            window, oldFrame, &resizable, NULL);
         BOOL anchorTopLeft =
             (record.flags & MacWSInputFlagConfigureAnchorTopLeft) != 0;
         BOOL anchorTopRight =
@@ -7387,24 +7596,84 @@ static void MacWSPostInputOnMainThread(MacWSInputRecord record) {
                 sel_registerName("respondsToSelector:"), setter)) return;
         ((MacWSMsgVoidRectBoolBool)objc_msgSend)(
             window, setter, newFrame, YES, NO);
+        // Complete AppKit's pending layout before recording accepted geometry.
+        // RE-confirmed layoutIfNeeded at 0x184112454: updateConstraintsIfNeeded,
+        // performPendingChangeNotifications, _changeWindowFrameFromConstraints
+        // (via its block), then _layoutViewTree. Merely returning from setFrame
+        // does not include the constraint-engine frame change in this ACK.
+        SEL layoutIfNeeded = sel_registerName("layoutIfNeeded");
+        if (((MacWSMsgBoolSEL)objc_msgSend)(window,
+                sel_registerName("respondsToSelector:"), layoutIfNeeded))
+            ((MacWSMsgVoid)objc_msgSend)(window, layoutIfNeeded);
         CGRect appliedFrame = ((MacWSMsgRect)objc_msgSend)(
             window, sel_registerName("frame"));
+        BOOL applicationConstrained =
+            fabs(appliedFrame.size.width - record.x) > 0.75 ||
+            fabs(appliedFrame.size.height - record.y) > 0.75;
+        // A result describes this transaction, not the window's global
+        // minimum. One response cannot distinguish a global minimum from
+        // quantization or another proposal-dependent application policy.
+        // The exact ACK below returns the accepted size to Host; never cache
+        // it as a permanent minimum for subsequent independent requests.
+        if ((anchorTopLeft || anchorTopRight) && applicationConstrained) {
+            // Anchor against the size AppKit actually accepted. Previously
+            // Finder retained a 445-point frame but was positioned as though
+            // it were 400 points wide, placing 45 points beyond the desktop.
+            CGRect correctedFrame = appliedFrame;
+            correctedFrame.origin.x = anchorTopRight
+                ? targetScreen.origin.x + targetScreen.size.width -
+                    appliedFrame.size.width
+                : targetScreen.origin.x;
+            correctedFrame.origin.y = targetScreen.origin.y +
+                targetScreen.size.height - appliedFrame.size.height;
+            if (fabs(correctedFrame.origin.x - appliedFrame.origin.x) > 0.25 ||
+                fabs(correctedFrame.origin.y - appliedFrame.origin.y) > 0.25) {
+                ((MacWSMsgVoidRectBoolBool)objc_msgSend)(
+                    window, setter, correctedFrame, YES, NO);
+                if (((MacWSMsgBoolSEL)objc_msgSend)(window,
+                        sel_registerName("respondsToSelector:"), layoutIfNeeded))
+                    ((MacWSMsgVoid)objc_msgSend)(window, layoutIfNeeded);
+                appliedFrame = ((MacWSMsgRect)objc_msgSend)(
+                    window, sel_registerName("frame"));
+            }
+        }
         BOOL geometryChanged =
             fabs(appliedFrame.origin.x - oldFrame.origin.x) > 0.25 ||
             fabs(appliedFrame.origin.y - oldFrame.origin.y) > 0.25 ||
             fabs(appliedFrame.size.width - oldFrame.size.width) > 0.25 ||
             fabs(appliedFrame.size.height - oldFrame.size.height) > 0.25;
-        BOOL applicationConstrained =
+        applicationConstrained =
             fabs(appliedFrame.size.width - record.x) > 0.75 ||
             fabs(appliedFrame.size.height - record.y) > 0.75;
-        // setFrame:display:animate: is synchronous with AppKit's accepted
-        // geometry. Publish that committed size now instead of making Host
+        // Commit an acknowledgement only after this exact input transaction
+        // has run setFrame and any anchor correction. Catalog/surface changes
+        // alone do not identify which of several queued resizes completed.
+        MacWSWindowConfigureAck configureAck = {0};
+        // Legacy probes may omit a timestamp. They can still configure the
+        // window, but cannot create an identifiable ACK (or invalidate the
+        // independent size-limit record with a partially filled zero token).
+        if (isfinite(record.timestamp) && record.timestamp > 0.0) {
+            configureAck = (MacWSWindowConfigureAck){
+                .timestamp = record.timestamp,
+                .sequence = record.sampleSequence,
+                .requestedWidth = record.x,
+                .requestedHeight = record.y,
+                .appliedWidth = (float)appliedFrame.size.width,
+                .appliedHeight = (float)appliedFrame.size.height,
+            };
+        }
+        objc_setAssociatedObject(window, &MacWSWindowConfigureAckKey,
+            [NSData dataWithBytes:&configureAck length:sizeof(configureAck)],
+            OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        // The setter, pending layout and anchor correction have now completed.
+        // Publish that committed size instead of making Host
         // wait for the 500-ms recovery timer or issue a blind catalog poll.
         MacWSPublishWindowMetrics();
         if (geometryChanged) {
             MacWSNotifyDisplayGeometryChanged(
                 windowNumber, window, appliedFrame);
-        } else if (applicationConstrained) {
+        }
+        if (applicationConstrained) {
             // A fixed or max-sized AppKit window has no new IOSurface
             // geometry to publish. Still emit one catalog edge so Host can
             // observe the unchanged real frame as the application's resize
@@ -7994,31 +8263,42 @@ static void MacWSPostInputOnMainThread(MacWSInputRecord record) {
     BOOL continuousContentStart =
         record.kind == MacWSInputKindTouchDown && exactContentView &&
         CGRectContainsPoint(exactContentBounds, exactContentPoint);
+    BOOL interopDragProbe =
+        record.source == MacWSInputSourceInteropDragProbe;
     // CGPostMouseEvent has no window parameter, so the visible Host layer and
     // WindowServer's independent global hit must agree before the system route
     // is allowed. This equality is the missing invariant: it keeps Maps-behind-
     // Terminal on the exact process-local route, while restoring native popup
     // dismissal, Dock tracking, atomic content controls, traffic lights and
     // title-bar move/zoom whenever the requested surface truly is frontmost.
-    // A content TouchDown is different: it can synchronously enter AppKit's
-    // NSDragging tracker and therefore must retain the exact process-local
-    // window identity. Runtime-confirmed with Finder window 115 on 2026-09-09:
-    // the former blanket global route received the complete move sequence but
-    // never began the file drag, while the selected file and target folder hit
-    // points were correct.
+    // A physical content TouchDown is different: it can synchronously enter
+    // AppKit's NSDragging tracker and therefore must retain the exact process-
+    // local window identity. Runtime-confirmed with Finder window 115 on
+    // 2026-09-09: the former blanket global route received the complete move
+    // sequence but never began the user's file drag, while the selected file
+    // and target-folder hit points were correct. The short interoperability
+    // probe has the opposite contract: Finder.host.log on 2026-09-11 shows its
+    // process-local Down/Move/Cancel returning before NSCoreDragManager begins,
+    // leaving the drag pasteboard empty. Route only that explicitly tagged
+    // synthetic transaction through Finder's native CGS input stream, which
+    // is the route under which this pasteboard probe previously succeeded.
     BOOL exactGlobalSystemStart = requestedWindowNumber != 0 &&
         exactPointerStart && globalWindowNumber == windowNumber &&
-        !catalystContentInput && !continuousContentStart;
+        !catalystContentInput &&
+        (!continuousContentStart || interopDragProbe);
     if (continuousContentStart &&
         (MacWSRuntimeDiagnosticsEnabled() ||
          record.contactID == MACWS_INPUT_CONTACT_DIAGNOSTIC)) {
         fprintf(stderr,
             "#### APP-INPUT CONTENT-DRAG-ROUTE pid=%d gesture=%u "
             "window=%ld local=(%.2f,%.2f) content=(%.2f,%.2f) "
-            "route=process-local-tracker\n",
+            "route=%s\n",
             getpid(), record.contactID, (long)windowNumber,
             windowPoint.x, windowPoint.y,
-            exactContentPoint.x, exactContentPoint.y);
+            exactContentPoint.x, exactContentPoint.y,
+            interopDragProbe && exactGlobalSystemStart
+                ? "native-system-interop-probe"
+                : "process-local-tracker");
         fflush(stderr);
     }
     // A tagged second tap must retain AppKit's clickCount=2 semantic. The
@@ -8616,10 +8896,10 @@ static void MacWSPostInputOnMainThread(MacWSInputRecord record) {
         id downEvent = nil;
         pthread_mutex_lock(&MacWSAppInputRouteLock);
         MacWSArmDirectTrackingContextLocked(application, eventClass,
-            record.contactID, windowNumber, inputMappingFrame,
+            record.sceneID, record.contactID, windowNumber, inputMappingFrame,
             screenPoint, windowPoint);
-        useBufferedFallback =
-            MacWSHasPendingRFBTrackingRecordLocked(record.contactID);
+        useBufferedFallback = MacWSHasPendingTrackingRecordLocked(
+            record.sceneID, record.contactID);
         if (useBufferedFallback) {
             MacWSClearDirectTrackingContextLocked();
         } else {
@@ -8653,16 +8933,34 @@ static void MacWSPostInputOnMainThread(MacWSInputRecord record) {
             ((MacWSSendEvent)objc_msgSend)(application,
                 sel_registerName("sendEvent:"), downEvent);
             pthread_mutex_lock(&MacWSAppInputRouteLock);
+            // An NSControl tracker normally returns only after the socket
+            // route posts its matching Up. Finder's TTrackingImageView is
+            // different: runtime-confirmed in Finder.host.log at
+            // 1789130632 that sendEvent(mouseDown) returned first and the
+            // already-queued initial move entered _dragUntilMouseUp: on the
+            // next AppKit turn. Preserve an accepting exact gesture context
+            // across that boundary so the CoreDrag bridge can hand subsequent
+            // move/up records to its real CGS input callback. A synchronously
+            // completed/cancelled tracker is already non-accepting and is
+            // retired here as before.
             MacWSAppInputRFBTrackingActive = NO;
             MacWSAppInputRFBTrackingButtons = 0;
-            MacWSClearDirectTrackingContextLocked();
+            BOOL awaitingAsynchronousTracker =
+                MacWSAppInputDirectContext.accepting &&
+                MacWSAppInputDirectContext.contactID == record.contactID &&
+                MacWSAppInputDirectContext.sceneID == record.sceneID &&
+                MacWSAppInputDirectContext.windowNumber == windowNumber;
+            if (!awaitingAsynchronousTracker)
+                MacWSClearDirectTrackingContextLocked();
             pthread_mutex_unlock(&MacWSAppInputRouteLock);
             if (MacWSRuntimeDiagnosticsEnabled()) {
                 fprintf(stderr,
                     "#### APP-INPUT LIVE-DISPATCH-RETURN pid=%d gesture=%u "
-                    "window=%ld first-move=(%.2f,%.2f)\n",
+                    "window=%ld first-move=(%.2f,%.2f) "
+                    "awaiting-async-tracker=%s\n",
                     getpid(), record.contactID, (long)windowNumber,
-                    screenPoint.x, screenPoint.y);
+                    screenPoint.x, screenPoint.y,
+                    awaitingAsynchronousTracker ? "YES" : "NO");
                 fflush(stderr);
             }
             MacWSLogAppInputGestureHitResult("live-drag", record.contactID);
@@ -9967,6 +10265,21 @@ static void MacWSWindowGeometryObserverCallback(id observer, SEL command,
     CGRect frame = ((MacWSMsgRect)objc_msgSend)(
         window, sel_registerName("frame"));
     MacWSNotifyDisplayGeometryChanged((uint32_t)number, window, frame);
+    // Window geometry and its min/max policy are one AppKit transaction, but
+    // the display side reads those values from the metrics sidecar. The old
+    // notification route invalidated only pixels and left that sidecar stale
+    // until the 500-ms recovery timer. Coalesce native update/resize bursts
+    // on the AppKit main queue, then publish the current frame and axis policy
+    // together; MacWSPublishWindowMetrics already suppresses unchanged files.
+    if (!MacWSWindowMetricsEventPublishPending) {
+        MacWSWindowMetricsEventPublishPending = YES;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                     50 * NSEC_PER_MSEC),
+                       dispatch_get_main_queue(), ^{
+            MacWSWindowMetricsEventPublishPending = NO;
+            MacWSPublishWindowMetrics();
+        });
+    }
 }
 
 static void MacWSPublishWindowMetrics(void) {
@@ -9983,6 +10296,8 @@ static void MacWSPublishWindowMetrics(void) {
     BOOL fullscreenCanvas =
         MacWSMainBundleUsesFullscreenCanvasPresentation();
     NSMutableData *entries = [NSMutableData data];
+    NSMutableArray<NSString *> *diagnosticEntries =
+        MacWSRuntimeDiagnosticsEnabled() ? [NSMutableArray array] : nil;
     NSUInteger count = [windows count];
     for (NSUInteger index = 0;
          index < count && entries.length / sizeof(MacWSWindowMetricsEntry) <
@@ -9998,8 +10313,9 @@ static void MacWSPublishWindowMetrics(void) {
             frame.size.width <= 0.0 || frame.size.height <= 0.0) continue;
 
         BOOL resizable = NO;
+        CGSize maximum = frame.size;
         CGSize minimum = MacWSEffectiveMinimumFrameSize(
-            window, frame, &resizable);
+            window, frame, &resizable, &maximum);
         BOOL orderedVisible = ((MacWSMsgBool)objc_msgSend)(
             window, sel_registerName("isVisible"));
         NSInteger windowLevel = ((MacWSMsgInteger)objc_msgSend)(
@@ -10024,6 +10340,10 @@ static void MacWSPublishWindowMetrics(void) {
         MacWSWindowMetricsEntry entry = {
             .windowID = (uint32_t)number,
             .flags = (resizable ? MacWSStreamWindowResizable : 0) |
+                (maximum.width <= minimum.width + 0.75
+                    ? MacWSStreamWindowFixedWidth : 0) |
+                (maximum.height <= minimum.height + 0.75
+                    ? MacWSStreamWindowFixedHeight : 0) |
                 (visible ? MacWSStreamWindowVisible : 0) |
                 (transient ? MacWSStreamWindowTransient : 0) |
                 (window == keyWindow ? MacWSStreamWindowFocused : 0) |
@@ -10034,8 +10354,52 @@ static void MacWSPublishWindowMetrics(void) {
             .logicalGroupID = MacWSLogicalWindowGroupID(window, application),
             .minimumLogicalWidth = (float)minimum.width,
             .minimumLogicalHeight = (float)minimum.height,
+            .maximumLogicalWidth = (float)maximum.width,
+            .maximumLogicalHeight = (float)maximum.height,
         };
+        NSData *ackData = objc_getAssociatedObject(
+            window, &MacWSWindowConfigureAckKey);
+        if (ackData.length == sizeof(entry.configureAck))
+            memcpy(&entry.configureAck, ackData.bytes, sizeof(entry.configureAck));
         [entries appendBytes:&entry length:sizeof(entry)];
+        if (diagnosticEntries) {
+            id title = ((MacWSMsgID)objc_msgSend)(
+                window, sel_registerName("title"));
+            NSUInteger styleMask = ((MacWSMsgUInteger)objc_msgSend)(
+                window, sel_registerName("styleMask"));
+            CGSize apiMinimum = ((MacWSMsgSize)objc_msgSend)(
+                window, sel_registerName("minSize"));
+            CGSize apiMaximum = ((MacWSMsgSize)objc_msgSend)(
+                window, sel_registerName("maxSize"));
+            CGSize apiContentMinimum = ((MacWSMsgSize)objc_msgSend)(
+                window, sel_registerName("contentMinSize"));
+            CGSize apiContentMaximum = ((MacWSMsgSize)objc_msgSend)(
+                window, sel_registerName("contentMaxSize"));
+            CGSize requiredMinimum = CGSizeZero;
+            CGSize requiredMaximum = {MACWS_STREAM_MAX_DIMENSION,
+                                       MACWS_STREAM_MAX_DIMENSION};
+            MacWSRequiredContentSizeLimits(window, &requiredMinimum,
+                                           &requiredMaximum);
+            CGSize apiIncrements = ((MacWSMsgSize)objc_msgSend)(
+                window, sel_registerName("resizeIncrements"));
+            [diagnosticEntries addObject:[NSString stringWithFormat:
+                @"id=%ld class=%s title=%@ style=%#lx frame=%.1fx%.1f min=%.1fx%.1f max=%.1fx%.1f resizable=%@ fixed=%@x%@ level=%ld visible=%@ transient=%@ api-min=%.1fx%.1f api-max=%.1fx%.1f content-min=%.1fx%.1f content-max=%.1fx%.1f required-min=%.1fx%.1f required-max=%.1fx%.1f increments=%.1fx%.1f",
+                (long)number, object_getClassName(window), title ?: @"",
+                (unsigned long)styleMask, frame.size.width, frame.size.height,
+                minimum.width, minimum.height, maximum.width, maximum.height,
+                resizable ? @"YES" : @"NO",
+                maximum.width <= minimum.width + 0.75 ? @"YES" : @"NO",
+                maximum.height <= minimum.height + 0.75 ? @"YES" : @"NO",
+                (long)windowLevel, visible ? @"YES" : @"NO",
+                transient ? @"YES" : @"NO",
+                apiMinimum.width, apiMinimum.height,
+                apiMaximum.width, apiMaximum.height,
+                apiContentMinimum.width, apiContentMinimum.height,
+                apiContentMaximum.width, apiContentMaximum.height,
+                requiredMinimum.width, requiredMinimum.height,
+                requiredMaximum.width, requiredMaximum.height,
+                apiIncrements.width, apiIncrements.height]];
+        }
     }
     NSString *path = [NSString stringWithUTF8String:MacWSWindowMetricsPath];
     BOOL entriesChanged = !MacWSLastWindowMetricsEntries ||
@@ -10048,6 +10412,15 @@ static void MacWSPublishWindowMetrics(void) {
     if (entriesChanged) {
         [MacWSLastWindowMetricsEntries release];
         MacWSLastWindowMetricsEntries = [entries copy];
+        if (diagnosticEntries.count) {
+            fprintf(stderr,
+                "#### APP-INPUT WINDOW-METRICS pid=%d generation=%llu %s\n",
+                getpid(),
+                (unsigned long long)(MacWSWindowMetricsGeneration + 1),
+                [[diagnosticEntries componentsJoinedByString:@" | "]
+                    UTF8String]);
+            fflush(stderr);
+        }
     }
     MacWSWindowMetricsHeader header = {
         .magic = MACWS_WINDOW_METRICS_MAGIC,
@@ -10115,6 +10488,12 @@ static void MacWSInstallWindowGeometryObservers(void) {
         "NSWindowDidMoveNotification",
         "NSWindowDidResizeNotification",
         "NSWindowDidEndLiveResizeNotification",
+        // Content-driven panels (Finder Get Info is the concrete case) can
+        // change min/max constraints without changing their current frame.
+        // DidUpdate is the public AppKit edge for that committed window state;
+        // the callback above coalesces it to at most one metrics query per
+        // 50-ms interval and writes only when the sidecar bytes changed.
+        "NSWindowDidUpdateNotification",
     };
     for (NSUInteger index = 0;
          index < sizeof(names) / sizeof(names[0]); index++) {
@@ -10124,6 +10503,106 @@ static void MacWSInstallWindowGeometryObservers(void) {
                    selector:@selector(macws_windowGeometryChanged:)
                        name:name
                      object:nil];
+    }
+}
+
+typedef void (*MacWSCoreDragUntilMouseUpFunction)(id, SEL, id, BOOL *);
+static MacWSCoreDragUntilMouseUpFunction
+    MacWSOriginalCoreDragUntilMouseUp;
+
+// RE-confirmed via the live macOS 13.4 AppKit image on iPad13,6:
+// -[NSCoreDragManager _dragUntilMouseUp:accepted:] installs
+// NSCoreDragCGEventInputProc and enters CoreDragStartDragging. That callback
+// wraps the WindowServer CGEvent and forwards source motion through
+// NSCoreDragProcessSourceDrag; it never reads continuation NSEvents from
+// NSApplication's queue. Window mode must therefore switch only the already-
+// accepted exact-window gesture to its CGS route for this native CoreDrag
+// interval. Fullscreen never creates a process-local down and cannot enter
+// this branch.
+static void MacWSCoreDragUntilMouseUpBridge(id self, SEL command,
+                                            id event, BOOL *accepted) {
+    BOOL ownsNativeRoute = NO;
+    NSInteger eventWindow = event ? ((MacWSMsgInteger)objc_msgSend)(
+        event, sel_registerName("windowNumber")) : 0;
+    BOOL processLocalEvent = MacWSIsProcessLocalMouseEvent(event);
+    BOOL hasSystemPoster = MacWSLegacySystemMousePoster() != NULL;
+    BOOL contextAccepting = NO;
+    NSInteger contextWindow = 0;
+    uint32_t contextContact = 0;
+    uint64_t contextScene = 0;
+    pthread_mutex_lock(&MacWSAppInputRouteLock);
+    contextAccepting = MacWSAppInputDirectContext.accepting;
+    contextWindow = MacWSAppInputDirectContext.windowNumber;
+    contextContact = MacWSAppInputDirectContext.contactID;
+    contextScene = MacWSAppInputDirectContext.sceneID;
+    ownsNativeRoute = eventWindow > 0 && eventWindow <= UINT32_MAX &&
+        processLocalEvent && hasSystemPoster && contextAccepting &&
+        contextWindow == eventWindow;
+    pthread_mutex_unlock(&MacWSAppInputRouteLock);
+    if (MacWSRuntimeDiagnosticsEnabled()) {
+        fprintf(stderr,
+            "#### APP-INPUT CORE-DRAG-ENTER pid=%d event-window=%ld "
+            "process-local=%s poster=%s context-accepting=%s "
+            "context-window=%ld gesture=%u scene=%#llx owns-native=%s\n",
+            getpid(), (long)eventWindow,
+            processLocalEvent ? "YES" : "NO",
+            hasSystemPoster ? "YES" : "NO",
+            contextAccepting ? "YES" : "NO", (long)contextWindow,
+            contextContact, (unsigned long long)contextScene,
+            ownsNativeRoute ? "YES" : "NO");
+        fflush(stderr);
+    }
+    if (ownsNativeRoute) {
+        atomic_store_explicit(&MacWSAppInputCoreDragNativeWindow,
+                              (uint32_t)eventWindow,
+                              memory_order_relaxed);
+        atomic_store_explicit(&MacWSAppInputCoreDragNativeActive, YES,
+                              memory_order_release);
+    }
+    double started = MacWSRuntimeDiagnosticsEnabled()
+        ? MacWSAppInputMonotonicSeconds() : 0.0;
+    if (MacWSOriginalCoreDragUntilMouseUp)
+        MacWSOriginalCoreDragUntilMouseUp(self, command, event, accepted);
+    if (ownsNativeRoute) {
+        atomic_store_explicit(&MacWSAppInputCoreDragNativeActive, NO,
+                              memory_order_release);
+        atomic_store_explicit(&MacWSAppInputCoreDragNativeWindow, 0,
+                              memory_order_relaxed);
+        pthread_mutex_lock(&MacWSAppInputRouteLock);
+        if (MacWSAppInputDirectContext.contactID == contextContact &&
+            MacWSAppInputDirectContext.sceneID == contextScene &&
+            MacWSAppInputDirectContext.windowNumber == contextWindow)
+            MacWSClearDirectTrackingContextLocked();
+        pthread_mutex_unlock(&MacWSAppInputRouteLock);
+    }
+    if (ownsNativeRoute && MacWSRuntimeDiagnosticsEnabled()) {
+        fprintf(stderr,
+            "#### APP-INPUT CORE-DRAG-SESSION pid=%d window=%ld "
+            "accepted=%s elapsed=%.3fms route=exact-window-cgs\n",
+            getpid(), (long)eventWindow,
+            accepted && *accepted ? "YES" : "NO",
+            (MacWSAppInputMonotonicSeconds() - started) * 1000.0);
+        fflush(stderr);
+    }
+}
+
+static void MacWSInstallCoreDragNativeBridge(void) {
+    Class coreClass = objc_getClass("NSCoreDragManager");
+    SEL untilSelector = sel_registerName("_dragUntilMouseUp:accepted:");
+    Method untilMethod = coreClass
+        ? class_getInstanceMethod(coreClass, untilSelector) : NULL;
+    if (untilMethod && !MacWSOriginalCoreDragUntilMouseUp) {
+        MacWSOriginalCoreDragUntilMouseUp =
+            (MacWSCoreDragUntilMouseUpFunction)
+                method_getImplementation(untilMethod);
+        method_setImplementation(untilMethod,
+            (IMP)MacWSCoreDragUntilMouseUpBridge);
+    }
+    if (MacWSRuntimeDiagnosticsEnabled()) {
+        fprintf(stderr,
+            "#### APP-INPUT CORE-DRAG-BRIDGE installed=%s\n",
+            MacWSOriginalCoreDragUntilMouseUp ? "YES" : "NO");
+        fflush(stderr);
     }
 }
 
@@ -10155,6 +10634,7 @@ static void MacWSInstallAppInputBridgeNow(void) {
         MacWSInstallWorkspaceOpenWitness();
         MacWSInstallApplicationKeyWitness();
         MacWSInstallMenuEventLoopWitness();
+        MacWSInstallCoreDragNativeBridge();
         MacWSInstallOrderedWindowRegistry();
         MacWSInstallTransientFrameConstraint();
         MacWSInstallFullscreenTransitionPrerequisite();
@@ -10249,6 +10729,10 @@ __attribute__((constructor)) static void MacWSInstallAppInputBridge(void) {
 
 __attribute__((destructor)) static void MacWSRemoveAppInputBridge(void) {
     pthread_mutex_lock(&MacWSAppInputRouteLock);
+    atomic_store_explicit(&MacWSAppInputCoreDragNativeActive, NO,
+                          memory_order_release);
+    atomic_store_explicit(&MacWSAppInputCoreDragNativeWindow, 0,
+                          memory_order_relaxed);
     MacWSAppInputRFBTrackingActive = NO;
     MacWSAppInputRFBTrackingButtons = 0;
     atomic_store_explicit(&MacWSAppInputSynchronousTrackingActive, NO,
