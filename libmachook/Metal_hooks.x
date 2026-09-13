@@ -32,6 +32,7 @@
 #include "macws_composite_candidate_policy.h"
 #include "macws_control_protocol.h"
 #include "macws_host_protocol.h"
+#include "macws_settings_paths.h"
 #import "MacWSFinalCompositePublisher.h"
 
 static BOOL macws_macho_has_uuid(const struct mach_header *header,
@@ -1689,9 +1690,7 @@ static id macws_bundle_record_for_current_process_compat(id receiver,
             ? [extensionAttributes objectForKey:@"EXExtensionPointIdentifier"]
             : nil;
     if (!identifierBytes ||
-        ![bundlePath hasPrefix:
-            @"/System/Library/ExtensionKit/Extensions/"] ||
-        [bundlePath rangeOfString:@".appex"].location == NSNotFound ||
+        !MacWSIsStockSettingsBundle(bundlePath.UTF8String) ||
         ![extensionPoint isEqualToString:
             @"com.apple.Settings.extension.ui"]) return nil;
 
@@ -5261,8 +5260,18 @@ static int macws_filtered_fprintf(FILE *stream, const char *format, ...) {
 
 MACWS_DEFINE_STARTUP_FLAG(macws_iogpu_error_diag_enabled,
                           "/tmp/macws_iogpu_error_diag")
-MACWS_DEFINE_STARTUP_FLAG(macws_command_error_diag_enabled,
-                          "/tmp/macws_command_error_diag")
+// Allow a bounded child-process capture without a system-wide sentinel.
+static BOOL macws_command_error_diag_enabled(void) {
+    static _Atomic int cached = -1;
+    int value = atomic_load_explicit(&cached, memory_order_acquire);
+    if (value < 0) {
+        const char *setting = getenv("MACWS_COMMAND_ERROR_DIAGNOSTICS");
+        value = (setting && strcmp(setting, "1") == 0) ||
+            access("/tmp/macws_command_error_diag", F_OK) == 0;
+        atomic_store_explicit(&cached, value, memory_order_release);
+    }
+    return value != 0;
+}
 MACWS_DEFINE_STARTUP_FLAG(macws_submit_ring_enabled,
                           "/tmp/macws_submit_ring")
 MACWS_DEFINE_STARTUP_FLAG(macws_res_diag_enabled,
@@ -5718,6 +5727,32 @@ static void macws_iogpu_buffer_complete(id self, SEL selector,
             }
         }
     }
+    if (macws_iogpu_callback_diag_enabled() && error) {
+        static _Atomic unsigned error_observation_count;
+        unsigned observation = atomic_fetch_add_explicit(
+            &error_observation_count, 1, memory_order_relaxed) + 1;
+        if (observation <= 256 ||
+            (observation & (observation - 1)) == 0) {
+            NSString *description = nil;
+            @try {
+                description = [error respondsToSelector:
+                                   @selector(localizedDescription)]
+                    ? [error localizedDescription] : nil;
+            } @catch (NSException *exception) {
+                (void)exception;
+            }
+            fprintf(stderr,
+                "#### IOGPU-CALLBACK-BUFFER-ERROR observation=%u "
+                "commandBuffer=%p submitSerial=%llu fixed=%u code=%ld "
+                "description=%s start=%#llx end=%#llx\n",
+                observation, (__bridge void *)self,
+                (unsigned long long)submit_serial, fixed_count,
+                (long)error_code,
+                description ? [description UTF8String] : "(nil)",
+                (unsigned long long)start_time,
+                (unsigned long long)end_time);
+        }
+    }
     if (error && error_code == 3) {
         int expected_fault_state = 0;
         if (atomic_compare_exchange_strong(
@@ -5870,11 +5905,22 @@ static id macws_iogpu_command_buffer_error(id self, SEL selector) {
 static void macws_install_iogpu_callback_diagnostics(void) {
     static dispatch_once_t once;
     dispatch_once(&once, ^{
-        Class queue_class = objc_getClass("IOGPUMetalCommandQueue");
+        // The public error/completion accessors are overridden by the
+        // concrete AGX family classes on this iPad.  Hooking only the IOGPU
+        // base class left Geekbench's actual AGXG13GFamilyCommandBuffer
+        // errors invisible even though its description printed 00000103.
+        // Prefer the runtime concrete classes when they are already realized;
+        // retain the base-class fallback for early Metal clients and other
+        // driver families.  This changes diagnostic observation only.
+        Class queue_class = objc_getClass("AGXG13GFamilyCommandQueue");
+        if (!queue_class)
+            queue_class = objc_getClass("IOGPUMetalCommandQueue");
         SEL queue_selector = sel_registerName("didComplete:withStatus:");
         Method queue_method = queue_class
             ? class_getInstanceMethod(queue_class, queue_selector) : NULL;
-        Class buffer_class = objc_getClass("IOGPUMetalCommandBuffer");
+        Class buffer_class = objc_getClass("AGXG13GFamilyCommandBuffer");
+        if (!buffer_class)
+            buffer_class = objc_getClass("IOGPUMetalCommandBuffer");
         SEL buffer_selector = sel_registerName(
             "didCompleteWithStartTime:endTime:error:");
         Method buffer_method = buffer_class
@@ -5905,6 +5951,582 @@ static void macws_install_iogpu_callback_diagnostics(void) {
             buffer_class, buffer_method, g_macws_orig_iogpu_buffer_complete,
             error_method, g_macws_orig_iogpu_command_buffer_error);
     });
+}
+
+typedef BOOL (*macws_has_unified_memory_fn)(id, SEL);
+static macws_has_unified_memory_fn
+    g_macws_geekbench_has_unified_memory_orig;
+typedef id (*macws_geekbench_new_buffer_length_fn)(
+    id, SEL, NSUInteger, MTLResourceOptions)
+    __attribute__((ns_returns_retained));
+static macws_geekbench_new_buffer_length_fn
+    g_macws_geekbench_new_buffer_length_orig;
+
+// The exact Geekbench worker constructs its CPU-visible benchmark buffers via
+// newBufferWithBytesNoCopy whenever this getter reports YES.  RE-confirmed via
+// Geekbench 6.7.1 UUID 49124C96-2DB4-319D-B083-3B90C2074777:
+// MetalImageBuffer::MetalImageBuffer at image+0x1a9618 and
+// MetalBuffer::MetalBuffer at image+0x1a8740 select that path, while
+// MetalImageBuffer::read at image+0x1a9c48 deliberately skips the readback
+// when its destination is the original no-copy pointer.
+//
+// Our required AGX compatibility boundary cannot preserve that contract:
+// -[AGXBuffer initWithDevice:bytes:...] is redirected below to an iOS-native
+// allocation because the macOS type=0x80 resource request is rejected by the
+// iOS driver.  Its initial bytes are copied, so later GPU writes do not alias
+// the caller's original pointer.  Expose the capability this compatibility
+// device actually provides to the verified worker.  Geekbench then uses its
+// own managed/staging transfer path; no validation result is intercepted.
+static BOOL macws_is_verified_geekbench_worker(void) {
+    static dispatch_once_t once;
+    static BOOL verified = NO;
+    dispatch_once(&once, ^{
+        const char *program = getprogname();
+        if (!program || strcmp(program, "geekbench_aarch64") != 0) return;
+        char executable[PATH_MAX] = {0};
+        verified = proc_pidpath(getpid(), executable, sizeof(executable)) > 0 &&
+            strcmp(executable,
+                "/Applications/Geekbench 6.app/Contents/Resources/"
+                "geekbench_aarch64") == 0;
+    });
+    return verified;
+}
+
+// Reporting a non-unified transfer contract makes Geekbench request macOS
+// MTLStorageModeManaged (resource-options bits 4..7) for its CPU staging
+// buffers.  The backing driver in this process is the iPadOS AGX driver, where
+// those pages are physically unified and the native storage contract is
+// Shared.  Preserve every cache/hazard bit and translate only that storage
+// nibble at the AGX allocation boundary.  Geekbench still executes its own
+// explicit upload/download commands and waits; this does not skip a transfer
+// or a validation.
+static NSUInteger macws_geekbench_native_buffer_options(
+        NSUInteger options) {
+    if (!macws_is_verified_geekbench_worker()) return options;
+    const NSUInteger storage_mask = (NSUInteger)0xf <<
+        MTLResourceStorageModeShift;
+    NSUInteger storage_mode =
+        (options & storage_mask) >> MTLResourceStorageModeShift;
+    // Value 1 is MTLStorageModeManaged in the macOS producer ABI.  The iOS
+    // SDK intentionally marks that enum name unavailable, which is precisely
+    // why this cross-platform translation is needed here.
+    if (storage_mode != 1) return options;
+    return (options & ~storage_mask) |
+        ((NSUInteger)MTLStorageModeShared << MTLResourceStorageModeShift);
+}
+
+static id macws_geekbench_new_buffer_with_length_compat(
+        id self, SEL selector, NSUInteger length,
+        MTLResourceOptions options)
+    __attribute__((ns_returns_retained));
+static id macws_geekbench_new_buffer_with_length_compat(
+        id self, SEL selector, NSUInteger length,
+        MTLResourceOptions options) {
+    NSUInteger native_options =
+        macws_geekbench_native_buffer_options(options);
+    id result = g_macws_geekbench_new_buffer_length_orig
+        ? g_macws_geekbench_new_buffer_length_orig(
+              self, selector, length, native_options) : nil;
+    if ((macws_runtime_diagnostics_enabled() ||
+         access("/tmp/macws_geekbench_numeric_diag", F_OK) == 0) &&
+        native_options != options) {
+        static _Atomic unsigned sequence;
+        unsigned observation = atomic_fetch_add_explicit(
+            &sequence, 1, memory_order_relaxed) + 1;
+        if (observation <= 32) {
+            NSUInteger returned_mode = result &&
+                [result respondsToSelector:@selector(storageMode)]
+                ? [(id<MTLBuffer>)result storageMode] : NSUIntegerMax;
+            dprintf(STDERR_FILENO,
+                "#### GEEKBENCH-TRANSFER-BUFFER observation=%u "
+                "length=%#lx callerOptions=%#lx nativeOptions=%#lx "
+                "result=%p class=%s returnedStorageMode=%lu\n",
+                observation, (unsigned long)length,
+                (unsigned long)options, (unsigned long)native_options,
+                (__bridge void *)result,
+                result ? class_getName([result class]) : "(nil)",
+                (unsigned long)returned_mode);
+        }
+    }
+    return result;
+}
+
+static BOOL macws_geekbench_has_unified_memory_compat(
+        id self, SEL selector) {
+    BOOL native_value = g_macws_geekbench_has_unified_memory_orig
+        ? g_macws_geekbench_has_unified_memory_orig(self, selector) : YES;
+    if (macws_runtime_diagnostics_enabled()) {
+        static _Atomic unsigned sequence;
+        unsigned observation = atomic_fetch_add(&sequence, 1) + 1;
+        if (observation > 32) return NO;
+        dprintf(STDERR_FILENO,
+            "#### GEEKBENCH-TRANSFER-MEMORY-COMPAT observation=%u device=%p "
+            "class=%s native=%d exposed=0\n",
+            observation, (__bridge void *)self,
+            class_getName([self class]), native_value);
+    }
+    return NO;
+}
+
+static void macws_install_geekbench_transfer_memory_compatibility(void) {
+    if (!macws_is_verified_geekbench_worker() ||
+        g_macws_geekbench_has_unified_memory_orig) return;
+    Class device_class = objc_getClass("AGXG13GFamilyDevice");
+    SEL selector = @selector(hasUnifiedMemory);
+    Method method = device_class
+        ? class_getInstanceMethod(device_class, selector) : NULL;
+    if (!method) return;
+    g_macws_geekbench_has_unified_memory_orig =
+        (macws_has_unified_memory_fn)method_getImplementation(method);
+    const char *types = method_getTypeEncoding(method);
+    if (!class_addMethod(device_class, selector,
+                         (IMP)macws_geekbench_has_unified_memory_compat,
+                         types)) {
+        Method concrete = class_getInstanceMethod(device_class, selector);
+        method_setImplementation(
+            concrete, (IMP)macws_geekbench_has_unified_memory_compat);
+    }
+
+    SEL buffer_selector = @selector(newBufferWithLength:options:);
+    Method buffer_method = class_getInstanceMethod(
+        device_class, buffer_selector);
+    if (buffer_method) {
+        g_macws_geekbench_new_buffer_length_orig =
+            (macws_geekbench_new_buffer_length_fn)
+                method_getImplementation(buffer_method);
+        const char *buffer_types = method_getTypeEncoding(buffer_method);
+        if (!class_addMethod(
+                device_class, buffer_selector,
+                (IMP)macws_geekbench_new_buffer_with_length_compat,
+                buffer_types)) {
+            Method concrete = class_getInstanceMethod(
+                device_class, buffer_selector);
+            method_setImplementation(
+                concrete,
+                (IMP)macws_geekbench_new_buffer_with_length_compat);
+        }
+    }
+    if (macws_runtime_diagnostics_enabled())
+        dprintf(STDERR_FILENO,
+            "#### GEEKBENCH-TRANSFER-MEMORY-COMPAT installed "
+            "class=%s unifiedOriginal=%p bufferOriginal=%p\n",
+            class_getName(device_class),
+            (void *)g_macws_geekbench_has_unified_memory_orig,
+            (void *)g_macws_geekbench_new_buffer_length_orig);
+}
+
+// Command-line Metal clients such as Geekbench's worker do not service the
+// main dispatch queue while the benchmark is running.  The former main-queue
+// installer therefore never ran in that process.  Install at the concrete
+// AGX image boundary as well; dyld calls this callback for already-loaded
+// images and for a later device-triggered load.  The actual installer remains
+// dispatch_once protected and every swizzle is still diagnostics-only.
+static void macws_install_iogpu_callback_diagnostics_for_image(
+        const struct mach_header *header, intptr_t slide) {
+    (void)slide;
+    BOOL callback_diagnostics = macws_runtime_diagnostics_enabled() ||
+        macws_iogpu_callback_diag_enabled();
+    BOOL geekbench_memory_compat = macws_is_verified_geekbench_worker();
+    if (!callback_diagnostics && !geekbench_memory_compat) return;
+    Dl_info image = {0};
+    if (!dladdr(header, &image) || !image.dli_fname ||
+        !strstr(image.dli_fname, "AGXMetal13_3")) return;
+    if (callback_diagnostics)
+        macws_install_iogpu_callback_diagnostics();
+    if (geekbench_memory_compat)
+        macws_install_geekbench_transfer_memory_compatibility();
+}
+
+// Read-only Geekbench numeric validation witness.  A completed Metal command
+// buffer is not proof that its payload is numerically correct, and the public
+// CLI only reports the workload id after base::similar() has rejected an
+// image.  For the exact, UUID-verified Geekbench 6.7.1 arm64 worker, observe
+// that comparison boundary and persist both operands when the explicit
+// /tmp/macws_geekbench_numeric_diag sentinel existed at process start.  The
+// benchmark's compare function still runs unchanged and its boolean result is
+// returned verbatim.
+typedef BOOL (*macws_geekbench_similar_fn)(
+    const void *reference, const void *actual, int maximum_delta,
+    float required_fraction);
+typedef BOOL (*macws_geekbench_particle_validate_fn)(
+    const void *reference, const void *actual);
+typedef BOOL (*macws_geekbench_face_validate_fn)(void *workload);
+typedef uint64_t (*macws_geekbench_face_download_fn)(void *workload);
+typedef void (*macws_geekbench_metal_buffer_read_fn)(
+    void *buffer, void *destination, size_t length);
+
+// std::vector<ml::Tensor *> is returned through x8 on arm64.  Describing the
+// real 24-byte return value here makes clang generate the same sret ABI for
+// the diagnostic trampoline; the vector remains owned and destroyed by the
+// unmodified Geekbench caller.
+struct macws_geekbench_tensor_vector {
+    void **begin;
+    void **end;
+    void **capacity;
+};
+typedef struct macws_geekbench_tensor_vector
+    (*macws_geekbench_network_outputs_fn)(void *network);
+
+static macws_geekbench_similar_fn g_macws_geekbench_similar_orig;
+static macws_geekbench_particle_validate_fn
+    g_macws_geekbench_particle_validate_orig;
+static macws_geekbench_face_validate_fn
+    g_macws_geekbench_face_validate_orig;
+static macws_geekbench_face_download_fn
+    g_macws_geekbench_face_download_orig;
+static macws_geekbench_metal_buffer_read_fn
+    g_macws_geekbench_metal_buffer_read_orig;
+static macws_geekbench_network_outputs_fn
+    g_macws_geekbench_network_outputs_orig;
+static _Atomic unsigned g_macws_geekbench_numeric_sequence;
+static _Thread_local void *g_macws_geekbench_face_validate_workload;
+static _Thread_local unsigned g_macws_geekbench_face_download_depth;
+
+struct macws_geekbench_image_u8 {
+    int32_t width;
+    int32_t height;
+    int32_t channels;
+    int32_t field_0c;
+    int32_t field_10;
+    int32_t row_bytes;
+    const unsigned char *pixels;
+};
+
+static void macws_write_all(int fd, const void *bytes, size_t length) {
+    const unsigned char *cursor = bytes;
+    while (length) {
+        ssize_t written = write(fd, cursor, length);
+        if (written <= 0) return;
+        cursor += written;
+        length -= (size_t)written;
+    }
+}
+
+static void macws_geekbench_dump_image(
+        unsigned sequence, const char *role,
+        const struct macws_geekbench_image_u8 *image) {
+    if (!image || !role) return;
+    int32_t width = image->width;
+    int32_t height = image->height;
+    int32_t channels = image->channels;
+    int32_t row_bytes = image->row_bytes;
+    size_t active_row = width > 0 && channels > 0
+        ? (size_t)width * (size_t)channels : 0;
+    size_t span = height > 0 && row_bytes > 0 && active_row > 0 &&
+                  active_row <= (size_t)row_bytes &&
+                  (size_t)height <= 32768 && (size_t)row_bytes <= 1u << 22
+        ? (size_t)(height - 1) * (size_t)row_bytes + active_row : 0;
+    uint64_t hash = 1469598103934665603ULL;
+    size_t zero_count = 0;
+    unsigned minimum = 255, maximum = 0;
+    if (image->pixels && span) {
+        for (size_t offset = 0; offset < span; offset++) {
+            unsigned value = image->pixels[offset];
+            hash = (hash ^ value) * 1099511628211ULL;
+            zero_count += value == 0;
+            if (value < minimum) minimum = value;
+            if (value > maximum) maximum = value;
+        }
+    }
+    dprintf(STDERR_FILENO,
+        "#### GEEKBENCH-NUMERIC image sequence=%u role=%s "
+        "width=%d height=%d channels=%d field0c=%d field10=%d "
+        "rowBytes=%d pixels=%p span=%#zx hash=%016llx zeros=%zu "
+        "min=%u max=%u\n",
+        sequence, role, width, height, channels, image->field_0c,
+        image->field_10, row_bytes, image->pixels, span,
+        (unsigned long long)hash, zero_count,
+        span ? minimum : 0, span ? maximum : 0);
+    if (!image->pixels || !span) return;
+    char path[PATH_MAX] = {0};
+    snprintf(path, sizeof(path),
+             "/tmp/macws_geekbench_numeric_%u_%s.bin", sequence, role);
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+    if (fd < 0) return;
+    macws_write_all(fd, image->pixels, span);
+    close(fd);
+}
+
+static BOOL macws_geekbench_similar(
+        const void *reference_object, const void *actual_object,
+        int maximum_delta, float required_fraction) {
+    unsigned sequence = atomic_fetch_add(
+        &g_macws_geekbench_numeric_sequence, 1) + 1;
+    const struct macws_geekbench_image_u8 *reference = reference_object;
+    const struct macws_geekbench_image_u8 *actual = actual_object;
+    macws_geekbench_dump_image(sequence, "reference", reference);
+    macws_geekbench_dump_image(sequence, "actual", actual);
+    BOOL result = g_macws_geekbench_similar_orig
+        ? g_macws_geekbench_similar_orig(
+              reference_object, actual_object, maximum_delta,
+              required_fraction) : NO;
+    dprintf(STDERR_FILENO,
+        "#### GEEKBENCH-NUMERIC compare sequence=%u maxDelta=%d "
+        "requiredFraction=%.9g result=%d\n",
+        sequence, maximum_delta, required_fraction, result);
+    return result;
+}
+
+static void macws_geekbench_dump_float_vector(
+        unsigned sequence, const char *role, const void *object) {
+    if (!object || !role) return;
+    const uintptr_t *words = object;
+    for (unsigned vector = 0; vector < 2; vector++) {
+        const float *begin = (const float *)words[vector * 3 + 0];
+        const float *end = (const float *)words[vector * 3 + 1];
+        size_t count = begin && end && end >= begin
+            ? (size_t)(end - begin) : 0;
+        if (count > (1u << 24)) count = 0;
+        double sum = 0.0;
+        float minimum = INFINITY, maximum = -INFINITY;
+        size_t finite_count = 0, zero_count = 0;
+        for (size_t index = 0; begin && index < count; index++) {
+            float value = begin[index];
+            if (isfinite(value)) {
+                finite_count++;
+                sum += value;
+                if (value < minimum) minimum = value;
+                if (value > maximum) maximum = value;
+            }
+            zero_count += value == 0.0f;
+        }
+        dprintf(STDERR_FILENO,
+            "#### GEEKBENCH-NUMERIC particle sequence=%u role=%s "
+            "vector=%u begin=%p end=%p count=%zu finite=%zu zeros=%zu "
+            "min=%.9g max=%.9g sum=%.17g\n",
+            sequence, role, vector, begin, end, count, finite_count,
+            zero_count, count && finite_count ? minimum : 0.0,
+            count && finite_count ? maximum : 0.0, sum);
+        if (!begin || !count) continue;
+        char path[PATH_MAX] = {0};
+        snprintf(path, sizeof(path),
+                 "/tmp/macws_geekbench_numeric_%u_%s_v%u.bin",
+                 sequence, role, vector);
+        int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+        if (fd < 0) continue;
+        macws_write_all(fd, begin, count * sizeof(*begin));
+        close(fd);
+    }
+}
+
+static BOOL macws_geekbench_particle_validate(
+        const void *reference, const void *actual) {
+    unsigned sequence = atomic_fetch_add(
+        &g_macws_geekbench_numeric_sequence, 1) + 1;
+    macws_geekbench_dump_float_vector(sequence, "particle_reference",
+                                       reference);
+    macws_geekbench_dump_float_vector(sequence, "particle_actual", actual);
+    BOOL result = g_macws_geekbench_particle_validate_orig
+        ? g_macws_geekbench_particle_validate_orig(reference, actual) : NO;
+    dprintf(STDERR_FILENO,
+        "#### GEEKBENCH-NUMERIC particle-compare sequence=%u result=%d\n",
+        sequence, result);
+    return result;
+}
+
+static uint64_t macws_geekbench_float_hash(
+        const float *values, size_t count) {
+    const unsigned char *bytes = (const unsigned char *)values;
+    size_t length = count * sizeof(*values);
+    uint64_t hash = 1469598103934665603ULL;
+    for (size_t index = 0; values && index < length; index++)
+        hash = (hash ^ bytes[index]) * 1099511628211ULL;
+    return hash;
+}
+
+static void macws_geekbench_log_face_pair(
+        unsigned sequence, unsigned output_index,
+        const float *actual, size_t actual_count,
+        const float *reference) {
+    size_t mismatch_count = 0;
+    size_t nonfinite_actual = 0;
+    size_t nonfinite_reference = 0;
+    float maximum_delta = 0.0f;
+    size_t maximum_delta_index = 0;
+    size_t first_mismatch = SIZE_MAX;
+    for (size_t index = 0; actual && reference && index < actual_count;
+         index++) {
+        float actual_value = actual[index];
+        float reference_value = reference[index];
+        BOOL actual_finite = isfinite(actual_value);
+        BOOL reference_finite = isfinite(reference_value);
+        nonfinite_actual += !actual_finite;
+        nonfinite_reference += !reference_finite;
+        float delta = actual_finite && reference_finite
+            ? fabsf(actual_value - reference_value) : INFINITY;
+        if (!(delta <= 0.0001f)) {
+            if (first_mismatch == SIZE_MAX) first_mismatch = index;
+            mismatch_count++;
+        }
+        if (delta > maximum_delta) {
+            maximum_delta = delta;
+            maximum_delta_index = index;
+        }
+    }
+    size_t first = first_mismatch == SIZE_MAX ? 0 : first_mismatch;
+    dprintf(STDERR_FILENO,
+        "#### GEEKBENCH-FACE pair sequence=%u output=%u count=%zu "
+        "actual=%p reference=%p actualHash=%016llx referenceHash=%016llx "
+        "mismatches=%zu first=%zu actualFirst=%.9g referenceFirst=%.9g "
+        "maxDelta=%.9g maxDeltaIndex=%zu nonfiniteActual=%zu "
+        "nonfiniteReference=%zu\n",
+        sequence, output_index, actual_count, actual, reference,
+        (unsigned long long)macws_geekbench_float_hash(
+            actual, actual_count),
+        (unsigned long long)macws_geekbench_float_hash(
+            reference, actual_count),
+        mismatch_count, first,
+        actual && actual_count ? actual[first] : 0.0f,
+        reference && actual_count ? reference[first] : 0.0f,
+        maximum_delta, maximum_delta_index, nonfinite_actual,
+        nonfinite_reference);
+}
+
+static BOOL macws_geekbench_face_validate(void *workload) {
+    void *previous = g_macws_geekbench_face_validate_workload;
+    g_macws_geekbench_face_validate_workload = workload;
+    BOOL result = g_macws_geekbench_face_validate_orig
+        ? g_macws_geekbench_face_validate_orig(workload) : NO;
+    g_macws_geekbench_face_validate_workload = previous;
+    dprintf(STDERR_FILENO,
+        "#### GEEKBENCH-FACE validate workload=%p result=%d\n",
+        workload, result);
+    return result;
+}
+
+static struct macws_geekbench_tensor_vector
+macws_geekbench_network_outputs(void *network) {
+    struct macws_geekbench_tensor_vector result = {0};
+    if (g_macws_geekbench_network_outputs_orig)
+        result = g_macws_geekbench_network_outputs_orig(network);
+    void *workload = g_macws_geekbench_face_validate_workload;
+    size_t tensor_count = result.begin && result.end &&
+                          result.end >= result.begin
+        ? (size_t)(result.end - result.begin) : 0;
+    if (!workload || tensor_count != 3) return result;
+    unsigned sequence = atomic_fetch_add(
+        &g_macws_geekbench_numeric_sequence, 1) + 1;
+    const uintptr_t *words = (const uintptr_t *)workload;
+    for (unsigned output = 0; output < 3; output++) {
+        const float *actual = (const float *)words[
+            (0x198 / sizeof(uintptr_t)) + output * 3];
+        const float *actual_end = (const float *)words[
+            (0x1a0 / sizeof(uintptr_t)) + output * 3];
+        size_t actual_count = actual && actual_end && actual_end >= actual
+            ? (size_t)(actual_end - actual) : 0;
+        if (actual_count > (1u << 24)) actual_count = 0;
+        const unsigned char *tensor = (const unsigned char *)result.begin[output];
+        const float *reference = NULL;
+        if (tensor) memcpy(&reference, tensor + 0x60, sizeof(reference));
+        macws_geekbench_log_face_pair(
+            sequence, output, actual, actual_count, reference);
+    }
+    return result;
+}
+
+static uint64_t macws_geekbench_face_download(void *workload) {
+    g_macws_geekbench_face_download_depth++;
+    uint64_t result = g_macws_geekbench_face_download_orig
+        ? g_macws_geekbench_face_download_orig(workload) : 0;
+    g_macws_geekbench_face_download_depth--;
+    dprintf(STDERR_FILENO,
+        "#### GEEKBENCH-FACE download workload=%p nanoseconds=%llu\n",
+        workload, (unsigned long long)result);
+    return result;
+}
+
+static void macws_geekbench_metal_buffer_read(
+        void *buffer_object, void *destination, size_t length) {
+    if (!g_macws_geekbench_face_download_depth) {
+        if (g_macws_geekbench_metal_buffer_read_orig)
+            g_macws_geekbench_metal_buffer_read_orig(
+                buffer_object, destination, length);
+        return;
+    }
+    const unsigned char *buffer = buffer_object;
+    id metal_buffer = nil;
+    void *original_pointer = NULL;
+    unsigned unified_path = 0;
+    if (buffer) {
+        memcpy(&metal_buffer, buffer + 0x18, sizeof(metal_buffer));
+        memcpy(&unified_path, buffer + 0x38, sizeof(uint8_t));
+        memcpy(&original_pointer, buffer + 0x40, sizeof(original_pointer));
+    }
+    void *contents = metal_buffer &&
+                     [metal_buffer respondsToSelector:@selector(contents)]
+        ? [metal_buffer contents] : NULL;
+    NSUInteger storage_mode = metal_buffer &&
+                              [metal_buffer respondsToSelector:
+                                  @selector(storageMode)]
+        ? [metal_buffer storageMode] : NSUIntegerMax;
+    uint64_t before = macws_geekbench_float_hash(
+        destination, length / sizeof(float));
+    if (g_macws_geekbench_metal_buffer_read_orig)
+        g_macws_geekbench_metal_buffer_read_orig(
+            buffer_object, destination, length);
+    uint64_t after = macws_geekbench_float_hash(
+        destination, length / sizeof(float));
+    dprintf(STDERR_FILENO,
+        "#### GEEKBENCH-FACE read object=%p metalBuffer=%p class=%s "
+        "destination=%p length=%zu unifiedPath=%u original=%p "
+        "contents=%p storageMode=%lu before=%016llx after=%016llx\n",
+        buffer_object, (__bridge void *)metal_buffer,
+        metal_buffer ? class_getName([metal_buffer class]) : "(nil)",
+        destination, length, unified_path, original_pointer, contents,
+        (unsigned long)storage_mode,
+        (unsigned long long)before, (unsigned long long)after);
+}
+
+static void macws_install_geekbench_numeric_diagnostics(void) {
+    if (access("/tmp/macws_geekbench_numeric_diag", F_OK) != 0) return;
+    const char *program = getprogname();
+    if (!program || strcmp(program, "geekbench_aarch64") != 0) return;
+    static const uint8_t geekbench_6_7_1_uuid[16] = {
+        0x49, 0x12, 0x4c, 0x96, 0x2d, 0xb4, 0x31, 0x9d,
+        0xb0, 0x83, 0x3b, 0x90, 0xc2, 0x07, 0x47, 0x77
+    };
+    const struct mach_header *header = NULL;
+    uint32_t image_count = _dyld_image_count();
+    for (uint32_t index = 0; index < image_count; index++) {
+        const struct mach_header *candidate = _dyld_get_image_header(index);
+        if (macws_macho_has_uuid(candidate, geekbench_6_7_1_uuid)) {
+            header = candidate;
+            break;
+        }
+    }
+    if (!header) {
+        dprintf(STDERR_FILENO,
+            "#### GEEKBENCH-NUMERIC refused: executable UUID not loaded "
+            "images=%u image0=%s\n", image_count,
+            image_count ? (_dyld_get_image_name(0) ?: "(nil)") : "(none)");
+        return;
+    }
+    uintptr_t base = (uintptr_t)header;
+    MSHookFunction((void *)(base + 0x246040),
+        (void *)macws_geekbench_similar,
+        (void **)&g_macws_geekbench_similar_orig);
+    MSHookFunction((void *)(base + 0x0ad7a4),
+        (void *)macws_geekbench_particle_validate,
+        (void **)&g_macws_geekbench_particle_validate_orig);
+    MSHookFunction((void *)(base + 0x17efe0),
+        (void *)macws_geekbench_face_validate,
+        (void **)&g_macws_geekbench_face_validate_orig);
+    MSHookFunction((void *)(base + 0x17eef0),
+        (void *)macws_geekbench_face_download,
+        (void **)&g_macws_geekbench_face_download_orig);
+    MSHookFunction((void *)(base + 0x081bf0),
+        (void *)macws_geekbench_network_outputs,
+        (void **)&g_macws_geekbench_network_outputs_orig);
+    MSHookFunction((void *)(base + 0x1a8c68),
+        (void *)macws_geekbench_metal_buffer_read,
+        (void **)&g_macws_geekbench_metal_buffer_read_orig);
+    dprintf(STDERR_FILENO,
+        "#### GEEKBENCH-NUMERIC installed base=%p similar=%p particle=%p "
+        "faceValidate=%p faceDownload=%p networkOutputs=%p bufferRead=%p\n",
+        (void *)base, (void *)(base + 0x246040),
+        (void *)(base + 0x0ad7a4), (void *)(base + 0x17efe0),
+        (void *)(base + 0x17eef0), (void *)(base + 0x081bf0),
+        (void *)(base + 0x1a8c68));
 }
 
 static void macws_log_command_buffer_ivars(id commandBuffer) {
@@ -19583,6 +20205,8 @@ static const void *kMacWSMetal2MetalFunctionRouteKey =
     &kMacWSMetal2MetalFunctionRouteKey;
 static const void *kMacWSMetal2MetalCompanionKey =
     &kMacWSMetal2MetalCompanionKey;
+static const void *kMacWSMetal2MetalCompanionFunctionKey =
+    &kMacWSMetal2MetalCompanionFunctionKey;
 static const void *kMacWSMetal2MetalRouteCheckedKey =
     &kMacWSMetal2MetalRouteCheckedKey;
 static NSArray<NSMutableDictionary *> *g_macws_metal2metal_routes = nil;
@@ -19623,6 +20247,7 @@ typedef struct {
     NSString *needsFunctionConstants;
     NSString *checkedMarker;
     NSString *companionMarker;
+    NSString *dagCacheSuffix;
 } MacWSMetal2MetalRuntimeObjects;
 
 static NSString *macws_metal2metal_runtime_string(const char *text) {
@@ -19666,6 +20291,14 @@ macws_metal2metal_runtime_objects(void) {
             "needs_function_constants");
         MACWS_M2M_STRING(checkedMarker, "macws-metal2metal-checked");
         MACWS_M2M_STRING(companionMarker, "macws-metal2metal-companion");
+        // Runtime-confirmed on 2026-09-13: after every MTLCompilerService
+        // instance was terminated, a fresh probe still returned the old
+        // platform-incompatible library without launching a compiler service
+        // or emitting a compiler request.  The v1 client cache therefore
+        // contains an artifact produced before the Catalyst target-context
+        // fix.  Version only the already-validated all-companion DAG key so
+        // native, mixed and unattributed Metal requests retain their cache.
+        MACWS_M2M_STRING(dagCacheSuffix, "\n\t \t\t \t\n \n"); // Catalyst DAG ABI v2
 #undef MACWS_M2M_STRING
     });
     return &objects;
@@ -20021,6 +20654,9 @@ static id macws_skylight_function_compat(
         function = macws_half_float_record_function(
             library, selector, name, function);
         if (function) {
+            objc_setAssociatedObject(function, kMacWSMetal2MetalCompanionFunctionKey,
+                macws_metal2metal_runtime_objects()->companionMarker,
+                OBJC_ASSOCIATION_RETAIN_NONATOMIC);
             if (macws_runtime_diagnostics_enabled()) {
                 dprintf(STDERR_FILENO,
                     "#### MACWS-METAL-TARGET base-function selector=%s "
@@ -20035,6 +20671,10 @@ static id macws_skylight_function_compat(
         ? g_macws_skylight_function_orig(self, selector, name) : nil;
     original = macws_half_float_record_function(
         self, selector, name, original);
+    if (original && objc_getAssociatedObject(self, kMacWSMetal2MetalCompanionKey))
+        objc_setAssociatedObject(original, kMacWSMetal2MetalCompanionFunctionKey,
+            macws_metal2metal_runtime_objects()->companionMarker,
+            OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     if (original && contract) {
         objc_setAssociatedObject(
             original, kMacWSMetal2MetalFunctionRouteKey, route,
@@ -20048,6 +20688,9 @@ static id macws_qc_specialization_result(
         MTLFunctionConstantValues *constant_values, NSError **error,
         NSError *compatibility_error) {
     if (function) {
+        objc_setAssociatedObject(function, kMacWSMetal2MetalCompanionFunctionKey,
+            macws_metal2metal_runtime_objects()->companionMarker,
+            OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         if (error) *error = nil;
         if (macws_runtime_diagnostics_enabled()) {
             dprintf(STDERR_FILENO,
@@ -20103,6 +20746,9 @@ static id macws_desktop_specialized_function_compat(
                 base_function, selector, descriptor, destination_archive,
                 function_cache, &compatibility_error);
             if (specialized) {
+                objc_setAssociatedObject(specialized, kMacWSMetal2MetalCompanionFunctionKey,
+                    macws_metal2metal_runtime_objects()->companionMarker,
+                    OBJC_ASSOCIATION_RETAIN_NONATOMIC);
                 if (error) *error = nil;
                 if (macws_runtime_diagnostics_enabled()) {
                     dprintf(STDERR_FILENO,
@@ -20128,11 +20774,16 @@ static id macws_desktop_specialized_function_compat(
             }
         }
     }
-    return g_macws_desktop_function_specialize_orig
+    id result = g_macws_desktop_function_specialize_orig
         ? g_macws_desktop_function_specialize_orig(
               self, selector, descriptor, destination_archive,
               function_cache, error)
         : nil;
+    if (result && objc_getAssociatedObject(self, kMacWSMetal2MetalCompanionFunctionKey))
+        objc_setAssociatedObject(result, kMacWSMetal2MetalCompanionFunctionKey,
+            macws_metal2metal_runtime_objects()->companionMarker,
+            OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    return result;
 }
 
 static void macws_desktop_specialized_function_async_compat(
@@ -20306,6 +20957,31 @@ static id macws_qc_specialize_named_compat(
         : nil;
 }
 
+typedef id (*macws_new_dag_library_fn)(id, SEL, NSString *, NSArray *, NSError **)
+    __attribute__((ns_returns_retained));
+static macws_new_dag_library_fn g_macws_new_dag_library_orig;
+
+// Runtime-confirmed via mps-graph-dag-context-20260913.log: the client cache
+// can retain a previously stitched, incorrectly iOS-tagged result even after
+// the compiler target fix. Version ONLY DAGs composed entirely of functions
+// actually obtained from validated companion libraries. Lexer whitespace
+// changes the cache identity, not graph nodes, dependencies or shader code.
+// Native/mixed/unattributed inputs preserve their original cache and request.
+static id macws_new_dag_library_compat(id self, SEL selector, NSString *dag,
+        NSArray *functions, NSError **error) __attribute__((ns_returns_retained));
+static id macws_new_dag_library_compat(id self, SEL selector, NSString *dag,
+        NSArray *functions, NSError **error) {
+    BOOL all_companions = dag && functions.count > 0 && functions.count <= 4096;
+    for (id function in functions) {
+        if (!all_companions) break;
+        all_companions = objc_getAssociatedObject(
+            function, kMacWSMetal2MetalCompanionFunctionKey) != nil;
+    }
+    if (all_companions)
+        dag = [dag stringByAppendingString:macws_metal2metal_runtime_objects()->dagCacheSuffix];
+    return g_macws_new_dag_library_orig(self, selector, dag, functions, error);
+}
+
 static void macws_install_qc_desktop_function_compatibility(void) {
     if (!getenv("MACWS_AGX_NATIVE")) return;
     const char *program = getprogname();
@@ -20315,13 +20991,26 @@ static void macws_install_qc_desktop_function_compatibility(void) {
     BOOL is_stray = program &&
         strcmp(program, "Stray-Mac-Shipping") == 0 && stray_compat &&
         stray_compat[0] != '\0' && strcmp(stray_compat, "0") != 0;
+    // Host launch admission selects native Metal for the verified Geekbench
+    // bundle. Keep this additional process gate exact; every shader still
+    // requires the manifest's complete source/hash/function identity.
+    BOOL is_geekbench = NO;
+    if (program && (strcmp(program, "Geekbench 6") == 0 ||
+                    strcmp(program, "geekbench_aarch64") == 0 ||
+                    strcmp(program, "geekbench6") == 0)) {
+        char executable[PATH_MAX] = {0};
+        is_geekbench = proc_pidpath(getpid(), executable, sizeof(executable)) > 0 &&
+            (strcmp(executable, "/Applications/Geekbench 6.app/Contents/MacOS/Geekbench 6") == 0 ||
+             strcmp(executable, "/Applications/Geekbench 6.app/Contents/Resources/geekbench_aarch64") == 0 ||
+             strcmp(executable, "/Applications/Geekbench 6.app/Contents/Resources/geekbench6") == 0);
+    }
     // The Steam launcher injects MACWS_STRAY_AGX_COMPAT only into the exact
     // Stray child.  Its MetalFX default.metallib now has a complete verified
     // route and the paired native/chroot submission A/B completes status=4,
     // error=nil.  Admit that production child here; every actual library and
     // function replacement remains constrained by the route manifest's
     // source path, byte length, hash and full function inventory below.
-    if (!is_window_server && !is_stray &&
+    if (!is_window_server && !is_stray && !is_geekbench &&
         !getenv("MACWS_METAL2METAL_NON_WS_DIAGNOSTIC")) return;
     Class library_class = objc_getClass("_MTLLibrary");
     if (!library_class) return;
@@ -20458,6 +21147,14 @@ static void macws_install_qc_desktop_function_compatibility(void) {
             "#### MACWS-METAL-TARGET missing class/selector class=%p "
             "selector=%s\n", (void *)function_class,
             sel_getName(async_selector));
+    }
+    Class device_class = objc_getClass("_MTLDevice");
+    SEL dag_selector = sel_registerName("newLibraryWithDAG:functions:error:");
+    Method dag_method = device_class
+        ? class_getInstanceMethod(device_class, dag_selector) : NULL;
+    if (dag_method && method_getImplementation(dag_method) != (IMP)macws_new_dag_library_compat) {
+        g_macws_new_dag_library_orig = (macws_new_dag_library_fn)method_getImplementation(dag_method);
+        method_setImplementation(dag_method, (IMP)macws_new_dag_library_compat);
     }
 }
 
@@ -21353,8 +22050,10 @@ static void install_agx_init_redirect(Class agx) {
                             (unsigned long long)pinnedGPUAddress,
                             (unsigned long)length, (unsigned long)opt);
                     }
+                    NSUInteger native_opt =
+                        macws_geekbench_native_buffer_options(opt);
                     id<MTLBuffer> ios_buf = [(id<MTLDevice>)dev
-                        newBufferWithLength:length options:opt];
+                        newBufferWithLength:length options:native_opt];
                     if (ios_buf) {
                         if (bytes && length > 0) {
                             void *contents = [ios_buf contents];
@@ -22113,6 +22812,9 @@ __attribute__((constructor)) static void InitMetalHooks() {
     // already-loaded images, so it is race-free for Metal-linked clients.
     _dyld_register_func_for_add_image(
         macws_install_metal_library_boundary_diagnostics);
+    _dyld_register_func_for_add_image(
+        macws_install_iogpu_callback_diagnostics_for_image);
+    macws_install_geekbench_numeric_diagnostics();
 
     // QuartzCore and SkyLight specialize their base MTLFunction objects as
     // soon as the first AGX device becomes available. Installing this adapter

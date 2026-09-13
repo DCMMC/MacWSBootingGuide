@@ -74,6 +74,7 @@
 @property(nonatomic) uint32_t subscribedWindowID;
 @property(nonatomic) BOOL subscriptionActive;
 @property(nonatomic) NSData *lastWindowCatalog;
+@property(nonatomic, readwrite, copy) NSArray<MacWSStreamWindow *> *systemInputWindows;
 // DisplayStream is a realtime transport.  If UIKit's main thread is still
 // presenting frame N when N+1/N+2 arrive, replaying every stale frame adds
 // latency without adding visible information.  Keep only the newest base and
@@ -123,6 +124,7 @@
 - (void)publishStatus:(NSString *)status connected:(BOOL)connected {
     self.connected = connected;
     dispatch_async(dispatch_get_main_queue(), ^{
+        if (!connected) self.systemInputWindows = @[];
         [self.delegate streamClient:self statusChanged:status connected:connected];
     });
 }
@@ -702,6 +704,31 @@
     if (!array || xpc_get_type(array) != XPC_TYPE_ARRAY) return;
     NSMutableArray<MacWSStreamWindow *> *windows = [NSMutableArray array];
     NSMutableData *fingerprint = [NSMutableData data];
+    NSMutableArray<MacWSStreamWindow *> *systemWindows = [NSMutableArray array];
+    xpc_object_t systemArray = xpc_dictionary_get_value(event,
+        MACWS_STREAM_KEY_SYSTEM_INPUT_WINDOWS);
+    if (systemArray && xpc_get_type(systemArray) == XPC_TYPE_ARRAY) {
+        xpc_array_apply(systemArray, ^bool(size_t index, xpc_object_t value) {
+            if (index >= 8) return false;
+            if (xpc_get_type(value) != XPC_TYPE_DATA) return true;
+            size_t count = xpc_data_get_length(value);
+            const void *bytes = xpc_data_get_bytes_ptr(value);
+            if (count != sizeof(MacWSStreamWindowDescriptor) ||
+                !MacWSStreamWindowDescriptorIsValid(bytes, count)) return true;
+            MacWSStreamWindowDescriptor descriptor;
+            memcpy(&descriptor, bytes, sizeof(descriptor));
+            if ((descriptor.flags & MacWSStreamWindowOnScreen) == 0) return true;
+            [systemWindows addObject:[[MacWSStreamWindow alloc]
+                initWithDescriptor:descriptor title:@""]];
+            return true;
+        });
+    }
+    uint32_t systemCount = (uint32_t)systemWindows.count;
+    [fingerprint appendBytes:&systemCount length:sizeof(systemCount)];
+    for (MacWSStreamWindow *window in systemWindows) {
+        MacWSStreamWindowDescriptor descriptor = window.descriptor;
+        [fingerprint appendBytes:&descriptor length:sizeof(descriptor)];
+    }
     NSMutableDictionary<NSString *, NSData *> *limitsByIdentity =
         [NSMutableDictionary dictionary];
     xpc_object_t limitsArray = xpc_dictionary_get_value(
@@ -750,6 +777,7 @@
     if ([self.lastWindowCatalog isEqualToData:fingerprint]) return;
     self.lastWindowCatalog = [fingerprint copy];
     dispatch_async(dispatch_get_main_queue(), ^{
+        self.systemInputWindows = systemWindows;
         [self.delegate streamClient:self receivedWindows:windows];
     });
 }

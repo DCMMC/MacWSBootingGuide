@@ -10,6 +10,10 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include "../include/macws_settings_paths.h"
+#if defined(MACWS_WEBKIT_PROXY_EXPERIMENT)
+#include "../include/macws_webkit_services.h"
+#endif
 
 #define MACWS_SYS_exit    1
 #define MACWS_SYS_fork    2
@@ -107,17 +111,7 @@ static const char *MacWSEnvironmentValue(char *envp[], const char *key) {
 }
 
 static int MacWSIsSettingsExtensionTarget(const char *target) {
-    static const char prefix[] =
-        "/System/Library/ExtensionKit/Extensions/";
-    if (!target || MacWSStringContains(target, "..") ||
-        !MacWSStringContains(target, "/Contents/MacOS/")) return 0;
-    const char *left = target;
-    const char *right = prefix;
-    while (*right && *left == *right) {
-        left++;
-        right++;
-    }
-    return !*right;
+    return MacWSIsStockSettingsExecutable(target);
 }
 
 static int MacWSIsAuthdTarget(const char *target) {
@@ -129,6 +123,11 @@ static int MacWSIsAuthdTarget(const char *target) {
 }
 
 static const char *MacWSTargetForProxy(const char *program, char *envp[]) {
+#if defined(MACWS_WEBKIT_PROXY_EXPERIMENT)
+    for (unsigned i = 0; i < sizeof(MacWSWebKitServices) / sizeof(MacWSWebKitServices[0]); ++i)
+        if (MacWSStringContains(program, MacWSWebKitServices[i].proxy))
+            return MacWSWebKitServices[i].target;
+#endif
     // RunningBoard cannot submit a macOS .appex path to the iPadOS launchd
     // service cache.  MacWSCatalystLaunch therefore submits this already
     // registered iOS proxy and carries the original executable path in the

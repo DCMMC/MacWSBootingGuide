@@ -1175,8 +1175,32 @@ static int WriteFileThumbnail(const char *pathBytes,
     return 0;
 }
 
+static int ResolveDocumentApplication(const char *path, const char *output) {
+    NSURL *document = [NSURL fileURLWithPath:@(path)];
+    NSURL *application = [NSWorkspace.sharedWorkspace
+        URLForApplicationToOpenURL:document];
+    if (!application.isFileURL || !application.path.isAbsolutePath) {
+        fprintf(stderr, "resolve-document: no handler for %s\n", path);
+        return 1;
+    }
+    NSDictionary *result = @{@"document_path": document.path,
+                              @"application_path": application.path};
+    NSError *error = nil;
+    NSData *data = [NSPropertyListSerialization dataWithPropertyList:result
+        format:NSPropertyListBinaryFormat_v1_0 options:0 error:&error];
+    if (![data writeToFile:@(output) options:NSDataWritingAtomic error:&error]) {
+        fprintf(stderr, "resolve-document: %s\n", error.description.UTF8String);
+        return 1;
+    }
+    fprintf(stdout, "resolve-document: %s -> %s\n", path,
+            application.path.fileSystemRepresentation);
+    return 0;
+}
+
 int main(int argc, const char *argv[]) {
     @autoreleasepool {
+        if (argc == 4 && strcmp(argv[1], "resolve-document") == 0)
+            return ResolveDocumentApplication(argv[2], argv[3]);
         if (argc >= 2 && strcmp(argv[1], "set-wallpaper") == 0) {
             const char *path = argc >= 3 ? argv[2] :
                 "/System/Library/Desktop Pictures/Solid Colors/Blue Violet.png";
@@ -1254,7 +1278,8 @@ int main(int argc, const char *argv[]) {
                 "session-status | activate-process PID | list-windows PID | "
                 "reopen-process PID | inspect-appkit-reopen | "
                 "inspect-uikitmac | file-icon PATH OUTPUT.png | "
-                "file-thumbnail PATH OUTPUT.png\n");
+                "file-thumbnail PATH OUTPUT.png | "
+                "resolve-document PATH OUTPUT.plist\n");
         return 64;
     }
 }

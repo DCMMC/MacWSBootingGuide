@@ -138,11 +138,80 @@ static int capture(char *const argv[], char *out, size_t outsz) {
     return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
 }
 
+static int stat_matches(const struct stat *left, const struct stat *right);
+
+// Cache only immutable Mach-O metadata, never a successful admission or the
+// live trustcache inventory. Runtime socket timings on 2026-09-13 measured
+// 0.386..0.399 s for an unchanged true/sysctl, versus 0.000082 s for PING.
+// Each request invoked otool twice and ldid three times despite unchanged
+// file identity. Re-resolve dependency paths and verify live trust as before.
+typedef struct {
+    char *key;
+    char *output;
+    struct stat identity;
+} MetadataCapture;
+enum { METADATA_CACHE_ENTRIES = 128 };
+static MetadataCapture g_metadata[METADATA_CACHE_ENTRIES];
+static size_t g_metadata_next;
+static size_t g_metadata_bytes;
+
+static int capture_macho_metadata(char *const argv[], const char *path,
+                                  char *output, size_t capacity) {
+    struct stat before, after;
+    if (!output || !capacity || stat(path, &before) != 0 ||
+        !S_ISREG(before.st_mode)) return -1;
+    char key[PATH_MAX + 256] = {0};
+    size_t used = 0;
+    for (size_t index = 0; argv[index]; index++) {
+        size_t length = strlen(argv[index]) + 1;
+        if (length > sizeof(key) - used) return capture(argv, output, capacity);
+        memcpy(key + used, argv[index], length);
+        // Argument boundaries cannot collide with spaces in a pathname.
+        key[used + length - 1] = '\n';
+        used += length;
+    }
+    if (used >= sizeof(key)) return capture(argv, output, capacity);
+    key[used] = '\0';
+    for (size_t index = 0; index < METADATA_CACHE_ENTRIES; index++) {
+        MetadataCapture *entry = &g_metadata[index];
+        if (entry->key && strcmp(entry->key, key) == 0 &&
+            stat_matches(&entry->identity, &before) &&
+            strlen(entry->output) < capacity) {
+            strlcpy(output, entry->output, capacity);
+            return 0;
+        }
+    }
+    output[0] = '\0';
+    int result = capture(argv, output, capacity);
+    if (result != 0) return result;
+    size_t length = strlen(output) + 1;
+    if (result != 0 || length >= capacity || length > 64 * 1024 ||
+        stat(path, &after) != 0 || !stat_matches(&before, &after)) return result;
+    // At most 128 entries and 1 MiB of actual output; oversized metadata is
+    // simply uncached. No process-lifetime growth from a package build.
+    MetadataCapture *entry = &g_metadata[g_metadata_next++ % METADATA_CACHE_ENTRIES];
+    if (entry->output) g_metadata_bytes -= strlen(entry->output) + 1;
+    free(entry->key);
+    free(entry->output);
+    memset(entry, 0, sizeof(*entry));
+    if (g_metadata_bytes + length > 1024 * 1024) return result;
+    entry->key = strdup(key);
+    entry->output = strdup(output);
+    if (!entry->key || !entry->output) {
+        free(entry->key); free(entry->output);
+        memset(entry, 0, sizeof(*entry));
+        return result;
+    }
+    entry->identity = after;
+    g_metadata_bytes += length;
+    return result;
+}
+
 // Extract the "CDHash=<hex>" value (if any) for one arch slice into hash[].
 static int cdhash_for_arch(const char *path, const char *arch, char *hash, size_t hsz) {
     char buf[8192];
     char *const argv[] = { (char *)LDID, "-arch", (char *)arch, "-h", (char *)path, NULL };
-    if (capture(argv, buf, sizeof(buf)) < 0) return 0;
+    if (capture_macho_metadata(argv, path, buf, sizeof(buf)) != 0) return 0;
     char *p = strstr(buf, "CDHash=");
     if (!p) return 0;
     p += 7;
@@ -618,7 +687,7 @@ static size_t load_rpaths(const char *path, const char *loader_dir,
     char *output = calloc(1, output_size);
     if (!output) return 0;
     char *const argv[] = { (char *)OTOOL, "-l", (char *)path, NULL };
-    if (capture(argv, output, output_size) != 0) {
+    if (capture_macho_metadata(argv, path, output, output_size) != 0) {
         free(output);
         return 0;
     }
@@ -675,7 +744,7 @@ static void process_dependencies(const char *realpath,
     size_t rpath_count = load_rpaths(realpath, loader_dir, executable_dir,
                                      rpaths);
     char *const argv[] = { (char *)OTOOL, "-L", (char *)realpath, NULL };
-    if (capture(argv, output, output_size) != 0) {
+    if (capture_macho_metadata(argv, realpath, output, output_size) != 0) {
         free(output);
         free(rpaths);
         return;

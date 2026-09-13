@@ -15,6 +15,7 @@
 #include <notify.h>
 #include "../include/macws_resize_gesture.h"
 #include "../include/macws_switcher_selection.h"
+#include "../include/macws_diagnostics_policy.h"
 
 // Source-confirmed against TrollPad 1.3 and RE-confirmed against the target
 // iPadOS 16.3.1 SpringBoard: SBSwitcherChamoisLayoutAttributes stores the
@@ -122,7 +123,17 @@ typedef MacWSDisplayItemAttributedSize (*MacWSInferAttributedSizeFn)(
     CGFloat screenEdgePadding);
 typedef NSUInteger (*MacWSSizingPolicyFn)(NSUInteger supportedPolicies);
 
-static void MacWSWindowingLogLine(NSString *line) {
+static BOOL MacWSWindowingDiagnosticsEnabled(void) {
+    static dispatch_once_t once;
+    static BOOL enabled;
+    dispatch_once(&once, ^{
+        enabled = MacWSDiagnosticSwitchEnabled(
+            getenv("MACWS_WINDOWING_DIAGNOSTICS"));
+    });
+    return enabled;
+}
+
+static void MacWSWindowingWriteDiagnosticLine(NSString *line) {
     int fd = open(MacWSWindowingLog,
                   O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
     if (fd < 0) return;
@@ -132,6 +143,13 @@ static void MacWSWindowingLogLine(NSString *line) {
             (long long)(now.tv_nsec / 1000000), line.UTF8String ?: "");
     close(fd);
 }
+
+// The resize transaction/result files are functional and remain unconditional.
+// Only human-readable traces and their argument construction are opt-in.
+#define MacWSWindowingLogLine(...) do { \
+    if (MacWSWindowingDiagnosticsEnabled()) \
+        MacWSWindowingWriteDiagnosticLine(__VA_ARGS__); \
+} while (0)
 
 static id MacWSMessageObject(id receiver, SEL selector) {
     if (!receiver || ![receiver respondsToSelector:selector]) return nil;
@@ -1775,6 +1793,7 @@ static void MacWSHandleInitialSizeRequest(
 static void MacWSWriteDenseGridWitness(const char *axis, NSUInteger original,
                                        NSUInteger expanded, double minimum,
                                        double maximum) {
+    if (!MacWSWindowingDiagnosticsEnabled()) return;
     char path[PATH_MAX] = {0};
     snprintf(path, sizeof(path),
              "/var/mobile/Library/Preferences/com.macwsguide.dense-grid.%s",

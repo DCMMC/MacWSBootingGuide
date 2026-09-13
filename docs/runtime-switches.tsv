@@ -63,6 +63,7 @@ env	MACWS_APP_DISPLAY_SETTLE_MS	on	Terminal=750	Bounded Terminal redraw settleme
 env	MACWS_BLUR_TRACE	off	diagnostic	Blur pipeline trace.
 env	MACWS_BLUR_XPC	off	diagnostic experiment	Blur texture XPC experiment.
 env	MACWS_CHROMIUM_COMPOSITE_OVERLAYS	on	VS Code,Chrome	Mark Chromium's real AggregatedRenderPass video_capture_enabled field before native CALayer processing so its normal primary-plane fallback remains in the AGX scanout captured by MacWS/VNC.
+env	MACWS_COMMAND_ERROR_DIAGNOSTICS	off	diagnostic	Installs command-buffer completion/error observers for bounded Metal failure correlation; production leaves it unset.
 env	MACWS_BUFFER_SUBALLOC_DIAG	off	IOGPU buffer diagnostic	Installs the exact IOGPUMetalBuffer primary-buffer initializer observer and records real suballocation metadata without changing the returned buffer.
 env	MACWS_CHROOT_HOST_ROOT	auto	launchdchrootexec descendants	Canonical host path captured before chroot and used to translate kernel file-ID paths into the process-visible root namespace.
 env	MACWS_COEXIST_PACE_US	off	environment override	Production uses the documented /tmp/macws_coexist_pace_us file instead.
@@ -98,6 +99,12 @@ env	MACWS_LAUNCHPAD_TRACE	off	diagnostic	Dock-only Launchpad source validation/b
 env	MACWS_LOCATIOND_MIG_TRACE	off	diagnostic	Bounded 256-record locationd dispatch-MIG receive/demux trace; production leaves the native callback unchanged.
 env	MACWS_LSD_ROLE	auto	private LaunchServices daemons	Explicitly selects the system-store or session-catalog endpoint family; ordinary GUI clients leave it unset and use the session family.
 env	MACWS_LSD_SESSION_USER_DIR	auto	private LaunchServices session daemon	Absolute isolated Darwin user directory used only by the MACWS_LSD_ROLE=session daemon so it cannot clean the system daemon's csstore.
+env	MACWS_MPS_PROBE_COMPACT_COMPUTE	off	standalone MPS probe	Selects the compact compute fixture for an explicit protocol experiment; never read by production clients.
+env	MACWS_MPS_PROBE_FRESH_DAG	off	standalone MPS probe	Selects a fresh DAG cache identity for a bounded compiler-cache comparison.
+env	MACWS_MPS_PROBE_MATRIX	off	standalone MPS probe	Runs the probe's bounded MPS operation matrix instead of its single default workload.
+env	MACWS_MPS_PROBE_METAL_RANGE	off	standalone MPS probe	Selects the explicit Metal feature-range value used by a bounded MPSGraph comparison.
+env	MACWS_MPS_PROBE_TRACE_STITCH	off	standalone MPS probe	Logs bounded MPS graph stitching boundaries without changing results.
+env	MACWS_MPS_PROBE_TRACE_SUBMIT	off	standalone MPS probe	Logs bounded command submission/completion witnesses without changing results.
 env	MACWS_CATALYST_REGISTER_APPLICATION	on	Maps UIKit carrier child	Completes Maps' stock UIKitServices application-support handshake; UIKitSystem validates the real child audit token and complete exec generation before FrontBoard registration.
 env	MACWS_CATALYST_REQUEST_INITIAL_SCENE	on	Maps UIKit carrier child	Requests Maps' initial UIKitMac scene after the validated UIKitServices registration; set only by MacWSCatalystLauncher, not globally.
 env	MACWS_CATALYST_DIRECT_DRAWABLE	on	generic Catalyst carrier child	Publishes completed CAMetalLayer IOSurfaces through a typed Mach message when SkyLight exact-window capture omits the client area; Host imports and composites the same native AGX surface without RFB or CPU readback.
@@ -214,6 +221,8 @@ env	MACWS_PROBE_SUBMIT	off	standalone OSLaunchdJob probe	Submits the bounded pri
 env	MACWS_PREVIEW_CI_DIAGNOSTICS	off	Preview diagnostic	Logs the exact ImageKit CIImage extent, source-image cache decision and render duration without changing the render result.
 env	MACWS_RESTORE_OUTBUMP	off	A/B control	Restores historical selector output-count mutation.
 env	MACWS_RUNTIME_DIAGNOSTICS	off	diagnostic master	Enables high-overhead flight recorders.
+env	MACWS_HOST_DIAGNOSTICS	off	Host diagnostic	Explicit affirmative process-start switch for Host geometry/clipboard traces only; does not enable AGX flight recorders.
+env	MACWS_WINDOWING_DIAGNOSTICS	off	SpringBoard windowing diagnostic	Explicit affirmative process-start switch for resize traces and method inventories; functional observer/transaction witnesses remain enabled.
 env	MACWS_SUBMIT_FAST_RING	off	diagnostic	Fixed-memory AGX submit recorder.
 env	MACWS_SURF_FILL_IOS	off	diagnostic	IOSurface fill probe.
 env	MACWS_SUSPEND_AT_EXEC	off	diagnostic	SIGSTOP immediately after injection for LLDB attach.
@@ -269,6 +278,7 @@ flag	/tmp/macws_cancel_completion	on	WindowServer	Required virtual-display cance
 flag	/tmp/macws_catalyst_direct_drawable_active	transient	Stray performance harness	Activates direct drawable publication only after the harness runtime-confirms real gameplay; the renderer latches the marker for that process.
 flag	/tmp/macws_capture_final	transient	VNC startup	One-shot validated post-client frame request; removed after acknowledgement.
 flag	/tmp/macws_command_error_diag	off	diagnostic	Metal command-buffer error introspection.
+flag	/tmp/macws_geekbench_numeric_diag	off	Geekbench diagnostic	Installs UUID-verified read-only numeric comparator witnesses and bounded operand dumps; benchmark validation and return values remain unchanged.
 flag	/tmp/macws_cvdl_trace	off	diagnostic	CVDisplayLink callback trace.
 flag	/tmp/macws_disp_copy	off	legacy diagnostic	Display CPU-copy probe.
 flag	/tmp/macws_disp_dump	off	diagnostic	Display backing raw dump.

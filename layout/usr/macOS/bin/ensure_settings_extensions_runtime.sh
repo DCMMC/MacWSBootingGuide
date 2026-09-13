@@ -5,6 +5,7 @@ set -e
 
 ROOTFS=/var/mnt/rootfs
 EXTENSIONS_ROOT="$ROOTFS/System/Library/ExtensionKit/Extensions"
+SETTINGS_PLUGINS_ROOT="$ROOTFS/System/Applications/System Settings.app/Contents/PlugIns"
 LIBMACHOOK=/var/jb/usr/macOS/lib/libmachook.dylib
 SUBSTRATE=/var/jb/usr/lib/libellekit.dylib
 TRAMPOLINES="$ROOTFS/usr/lib/libobjc-trampolines.dylib"
@@ -46,6 +47,14 @@ if [ ! -f "$BASE_CARRIER_APP/Info.plist" ] ||
    [ ! -x "$BASE_CARRIER_EXECUTABLE" ]; then
     echo "[ERROR] Settings extension carrier is missing: $BASE_CARRIER_APP" >&2
     exit 1
+fi
+
+# Single-process complete verifier: real signatures, per-pane identity/setuid,
+# iOS registration and current trustcache membership. A mismatch returns to
+# macwshostd's existing repair path; never accept a stale boot marker instead.
+if [ "$#" -eq 1 ] && [ "$1" = "--verify" ] &&
+   [ -f /var/jb/usr/macOS/bin/macws_settings_verify.py ]; then
+    exec /var/jb/usr/bin/python3 /var/jb/usr/macOS/bin/macws_settings_verify.py
 fi
 
 selected_cdhash() {
@@ -130,7 +139,8 @@ write_runtime_trust_manifest() {
     local temporary="${TRUST_MANIFEST}.new-$$" marker=""
     {
         printf '%s\n' "$RUNTIME_BASE_FINGERPRINT"
-        for marker in "$EXTENSIONS_ROOT"/*.appex/Contents/Frameworks/.macws-settings-runtime; do
+        for marker in "$EXTENSIONS_ROOT"/*.appex/Contents/Frameworks/.macws-settings-runtime \
+            "$SETTINGS_PLUGINS_ROOT"/*.appex/Contents/Frameworks/.macws-settings-runtime; do
             [ -f "$marker" ] || continue
             awk -F'|' '{ for (field = 5; field <= 9; field++) if ($field != "") print $field }' \
                 "$marker"
@@ -383,7 +393,7 @@ verify_current_runtime() {
     local marker_schema marker_base_hook marker_base_substrate marker_base_tramp
     local marker_executable marker_carrier marker_hook marker_substrate marker_tramp marker_extra
     verified_count=0
-    for bundle in "$EXTENSIONS_ROOT"/*.appex; do
+    for bundle in "$EXTENSIONS_ROOT"/*.appex "$SETTINGS_PLUGINS_ROOT"/*.appex; do
         [ -d "$bundle" ] || continue
         contents="$bundle/Contents"
         info="$contents/Info.plist"
@@ -463,7 +473,7 @@ repair_dependency_runtime() {
 
     ensure_trust_hash "$RUNTIME_HOOK_HASH" || return 1
     ensure_trust_hash "$RUNTIME_TRAMPOLINES_HASH" || return 1
-    for bundle in "$EXTENSIONS_ROOT"/*.appex; do
+    for bundle in "$EXTENSIONS_ROOT"/*.appex "$SETTINGS_PLUGINS_ROOT"/*.appex; do
         [ -d "$bundle" ] || continue
         contents="$bundle/Contents"
         info="$contents/Info.plist"
@@ -584,7 +594,7 @@ elif [ "$#" -eq 1 ] && [ "$1" = "--repair-dependencies" ]; then
 elif [ "$#" -gt 0 ]; then
     for bundle in "$@"; do
         case "$bundle" in
-            "$EXTENSIONS_ROOT"/*.appex) ;;
+            "$EXTENSIONS_ROOT"/*.appex|"$SETTINGS_PLUGINS_ROOT"/*.appex) ;;
             *)
                 echo "[ERROR] Settings extension path is outside the stock directory: $bundle" >&2
                 exit 64
@@ -597,7 +607,7 @@ elif [ "$#" -gt 0 ]; then
         prepare_extension "$bundle"
     done
 else
-    for bundle in "$EXTENSIONS_ROOT"/*.appex; do
+    for bundle in "$EXTENSIONS_ROOT"/*.appex "$SETTINGS_PLUGINS_ROOT"/*.appex; do
         [ -d "$bundle" ] || continue
         prepare_extension "$bundle"
     done

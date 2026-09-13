@@ -1,4 +1,5 @@
 ARCHS = arm64
+include ../config/production.mk
 include $(THEOS)/makefiles/common.mk
 
 TOOL_NAME = launchdchrootexec

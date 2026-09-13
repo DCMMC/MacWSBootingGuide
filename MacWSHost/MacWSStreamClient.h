@@ -55,6 +55,8 @@ NS_ASSUME_NONNULL_BEGIN
 @property(nonatomic, readonly, getter=isConnected) BOOL connected;
 @property(nonatomic, readonly) MacWSStreamMode mode;
 @property(nonatomic, readonly) uint32_t windowID;
+// Main-queue snapshot, separate from the user-facing AppKit window catalog.
+@property(nonatomic, readonly, copy) NSArray<MacWSStreamWindow *> *systemInputWindows;
 
 - (void)subscribeToMode:(MacWSStreamMode)mode windowID:(uint32_t)windowID;
 - (void)requestWindowList;

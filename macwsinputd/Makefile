@@ -1,6 +1,7 @@
 TARGET := macosx:clang:latest:13.0
 ARCHS = arm64
 
+include ../config/production.mk
 include $(THEOS)/makefiles/common.mk
 
 TOOL_NAME = macwsinputd

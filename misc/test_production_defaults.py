@@ -1,0 +1,135 @@
+"""Production guardrails; not a substitute for on-device performance tests."""
+from pathlib import Path
+import os
+import plistlib
+import shutil
+import subprocess
+import sys
+import tempfile
+import unittest
+
+import audit_runtime_switches as audit
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+class ProductionDefaults(unittest.TestCase):
+    def test_all_application_subprojects_load_defaults_before_theos(self):
+        for path in [ROOT / 'Makefile', *ROOT.glob('*/Makefile')]:
+            source = path.read_text()
+            if 'include $(THEOS)/makefiles/common.mk' not in source:
+                continue
+            with self.subTest(path=path.relative_to(ROOT)):
+                self.assertLess(source.index('config/production.mk'),
+                                source.index('include $(THEOS)/makefiles/common.mk'))
+
+    @unittest.skipUnless(shutil.which('gmake') or shutil.which('make'), 'make required')
+    def test_build_defaults_and_explicit_overrides(self):
+        make = shutil.which('gmake') or shutil.which('make')
+        fixture = (f'include {ROOT}/config/production.mk\n'
+                   'all:\n\t@echo $(FINALPACKAGE) $(OPTFLAG) $(DEBUG)\n')
+        environment = os.environ.copy()
+        for name in ('FINALPACKAGE', 'OPTFLAG', 'DEBUG', 'MAKEFLAGS', 'MFLAGS'):
+            environment.pop(name, None)
+        for flags, expected in (([], '1 -O2'),
+                                (['STRIP=0'], '1 -O2'),
+                                (['DEBUG=1', 'OPTFLAG=-O0'], '1 -O0 1'),
+                                (['FINALPACKAGE=0'], '0 -O2')):
+            with self.subTest(flags=flags):
+                result = subprocess.run([make, '--no-print-directory', '-f', '-', *flags],
+                                        input=fixture, text=True, capture_output=True,
+                                        env=environment, check=True)
+                self.assertEqual(result.stdout.strip(), expected)
+
+    def test_shipped_plists_have_no_off_switches(self):
+        self.assertFalse(audit.production_environment_errors(
+            audit.load_manifest(), audit.production_plists()))
+        self.assertIn(ROOT / 'misc/com.macwsguide.vscode.plist', audit.production_plists())
+
+    def test_off_switch_is_rejected_even_when_set_to_zero(self):
+        manifest = {('env', 'MACWS_HOST_DIAGNOSTICS'): ('off', 'test', 'test')}
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'job.plist'
+            for value in ('0', '1', ''):
+                path.write_bytes(plistlib.dumps({'EnvironmentVariables': {
+                    'MACWS_HOST_DIAGNOSTICS': value}}))
+                self.assertEqual(len(audit.production_environment_errors(manifest, [path])), 1)
+
+    def test_invalid_shipped_plist_fails_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'job.plist'
+            path.write_text('not a plist')
+            self.assertEqual(len(audit.production_environment_errors({}, [path])), 1)
+
+    def test_functional_sdl_disable_requires_exact_zero(self):
+        manifest = {('env', 'SDL_JOYSTICK_HIDAPI'): ('off', 'test', 'test')}
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'job.plist'
+            for value, count in (('0', 0), ('1', 1), ('', 1)):
+                path.write_bytes(plistlib.dumps({'EnvironmentVariables': {
+                    'SDL_JOYSTICK_HIDAPI': value}}))
+                self.assertEqual(len(audit.production_environment_errors(manifest, [path])), count)
+
+    def test_source_scan_excludes_temporary_and_generated_trees(self):
+        self.assertTrue({'tmp', '.theos', '.git', 'evidence'} <= audit.EXCLUDED_PARTS)
+
+    def test_logging_is_bounded_and_file_io_is_off_caller(self):
+        source = (ROOT / 'MacWSHost/Support/MacWSHostDiagnostics.m').read_text()
+        logger = source.split('void MacWSLog(', 1)[1]
+        caller, worker = logger.split('dispatch_async(queue, ^{', 1)
+        for call in ('open(', 'stat(', 'dprintf(', 'rename(', 'NSLog('):
+            self.assertNotIn(call, caller)
+        self.assertIn('>= 128', caller)
+        self.assertIn('message.length > 4096', caller)
+        self.assertIn('4 * 1024 * 1024', worker)
+        self.assertIn('log-overflow dropped=', worker)
+        self.assertNotIn('NSLog(', logger)
+
+    def test_inactive_frame_instrumentation_returns_before_lock(self):
+        source = (ROOT / 'MacWSHost/MacWSPerformanceMonitor.m').read_text()
+        method = source.split('- (void)recordBaseTransportFinalComposite:', 1)[1]
+        self.assertLess(method.index('if (!atomic_load(&_instrumentationActive)) return;'),
+                        method.index('os_unfair_lock_lock'))
+
+    @unittest.skipUnless(sys.platform == 'darwin' and shutil.which('xcrun'),
+                         'Apple Foundation/clang required')
+    def test_compiled_switch_parser_and_lazy_log_arguments(self):
+        # Execute the real C parser and real public macro, not a Python model.
+        fixture = r'''
+#import "MacWSHostDiagnostics.h"
+#include "macws_diagnostics_policy.h"
+#include <assert.h>
+static BOOL enabled;
+static int calls, arguments;
+BOOL MacWSHostDiagnosticsEnabled(void) { return enabled; }
+void MacWSLog(NSString *format, ...) { calls++; }
+static NSString *expensive(void) { arguments++; return @"trace"; }
+int main(void) {
+    const char *off[] = {NULL, "", "0", "false", "FALSE", "no", "off", "garbage", "10"};
+    const char *on[] = {"1", "true", "TRUE", "yes", "YES", "on", "ON"};
+    for (unsigned i = 0; i < sizeof(off)/sizeof(*off); i++)
+        assert(!MacWSDiagnosticSwitchEnabled(off[i]));
+    for (unsigned i = 0; i < sizeof(on)/sizeof(*on); i++)
+        assert(MacWSDiagnosticSwitchEnabled(on[i]));
+    @autoreleasepool {
+        MacWSDiagnosticLog(@"%@", expensive());
+        assert(calls == 0 && arguments == 0);
+        enabled = YES;
+        MacWSDiagnosticLog(@"%@", expensive());
+        assert(calls == 1 && arguments == 1);
+    }
+    return 0;
+}
+'''
+        with tempfile.TemporaryDirectory() as directory:
+            binary = Path(directory) / 'diagnostic-policy-test'
+            subprocess.run(['xcrun', 'clang', '-x', 'objective-c', '-', '-O2',
+                            '-fobjc-arc', '-framework', 'Foundation',
+                            '-I', str(ROOT / 'include'),
+                            '-I', str(ROOT / 'MacWSHost/Support'), '-o', str(binary)],
+                           input=fixture, text=True, capture_output=True, check=True)
+            subprocess.run([str(binary)], capture_output=True, check=True)
+
+
+if __name__ == '__main__':
+    unittest.main()

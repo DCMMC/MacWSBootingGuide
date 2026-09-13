@@ -51,7 +51,16 @@ static void macws_dump_segment_list(id<MTLCommandBuffer> command_buffer,
     // while preserving the exact bytes submitted by the native producer.
     uintptr_t object = (uintptr_t)(__bridge void *)command_buffer;
     uintptr_t storage_raw = 0;
-    memcpy(&storage_raw, (const void *)(object + 0x1f0), sizeof(storage_raw));
+    // The concrete iOS class stores `_storage` at +0x1f0, while the macOS
+    // producer can place the inherited ivar at another offset.  Resolve the
+    // real runtime ivar first so one source captures both sides of the same
+    // experiment; retain +0x1f0 only as the native fallback documented above.
+    Ivar storage_ivar = class_getInstanceVariable(
+        object_getClass(command_buffer), "_storage");
+    ptrdiff_t storage_offset = storage_ivar
+        ? ivar_getOffset(storage_ivar) : 0x1f0;
+    memcpy(&storage_raw, (const void *)(object + storage_offset),
+           sizeof(storage_raw));
     uintptr_t storage = macws_strip_pointer(storage_raw);
     if (!storage) {
         fprintf(stderr, "IOS-AGX-SEGMENT mode=%s missing-storage\n", mode);
@@ -72,9 +81,10 @@ static void macws_dump_segment_list(id<MTLCommandBuffer> command_buffer,
     size_t length = start && start <= current && current <= limit
         ? (size_t)(current - start) : 0;
     fprintf(stderr,
-        "IOS-AGX-SEGMENT mode=%s storage=%p start=%p current=%p "
+        "IOS-AGX-SEGMENT mode=%s storage-offset=%#tx storage=%p "
+        "start=%p current=%p "
         "limit=%p length=%#zx segment-mode=%d\n",
-        mode, (void *)storage, (void *)start, (void *)current,
+        mode, storage_offset, (void *)storage, (void *)start, (void *)current,
         (void *)limit, length, segment_mode);
     if (!length || length > 0x10000) return;
 
@@ -313,9 +323,14 @@ static int macws_encode_compute(id<MTLDevice> device,
                   sourceTexture:source
              destinationTexture:destination];
 
+    // MPS defers its compute encoder until commit.  A pre-commit snapshot is
+    // therefore empty on both the native iOS driver and the macOS producer
+    // (`start == current`).  Commit first, then copy the still-live finalized
+    // command storage before waiting for completion.  This is read-only and
+    // matches the already proven statistics probe ordering below.
+    [command_buffer commit];
     int dump_status = macws_dump_kcmd(command_buffer, "compute");
     if (getenv("MACWS_IOS_KCMD_HOLD")) raise(SIGSTOP);
-    [command_buffer commit];
     [command_buffer waitUntilCompleted];
     fprintf(stderr, "IOS-AGX-KCMD mode=compute status=%ld error=%s dump=%d\n",
         (long)command_buffer.status,

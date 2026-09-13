@@ -7,3 +7,5 @@ misc/sel9_test
 __pycache__/
 *.pyc
 .ldid.entitlements.plist
+tmp/
+macws-preview-*

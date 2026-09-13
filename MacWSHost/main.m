@@ -298,6 +298,7 @@ static NSString *MacWSLocalizedPhase(NSString *phase) {
 - (void)performURLAction:(NSString *)action;
 - (void)resetPerformanceMeasurementForTargetPID:(int32_t)targetPID;
 - (void)launchApplicationIdentifier:(NSString *)identifier;
+- (void)openExternalDocumentURL:(NSURL *)url;
 - (void)setFullscreenWorkspaceEnabled:(BOOL)enabled;
 - (void)openWindowInCurrentScene:(MacWSStreamWindow *)window
                           reason:(NSString *)reason;
@@ -819,7 +820,7 @@ static BOOL MacWSRequestNativeSceneSizeWithRole(UIWindowScene *scene,
         return NO;
     }
 
-    MacWSLog(@"scene-native-size requested id=%@ fbs=%@ requested=%.1fx%.1f minimum=%.1fx%.1f fixed=%@x%@ windowed-role=%@ route=SBMainWorkspace",
+    MacWSDiagnosticLog(@"scene-native-size requested id=%@ fbs=%@ requested=%.1fx%.1f minimum=%.1fx%.1f fixed=%@x%@ windowed-role=%@ route=SBMainWorkspace",
              scene.session.persistentIdentifier, sceneIdentifier,
              preferredSize.width, preferredSize.height,
              minimumSize.width, minimumSize.height,
@@ -830,7 +831,7 @@ static BOOL MacWSRequestNativeSceneSizeWithRole(UIWindowScene *scene,
         CFNotificationCenterGetDarwinNotifyCenter(),
         MacWSRequestResizeNotification, NULL, NULL, true);
     if (policyOnly) {
-        MacWSLog(@"scene-native-policy published id=%@ minimum=%.1fx%.1f maximum=%.1fx%.1f action=constraints-only",
+        MacWSDiagnosticLog(@"scene-native-policy published id=%@ minimum=%.1fx%.1f maximum=%.1fx%.1f action=constraints-only",
                  scene.session.persistentIdentifier, minimumSize.width,
                  minimumSize.height, maximumSize.width, maximumSize.height);
         return YES;
@@ -863,7 +864,7 @@ static BOOL MacWSRequestNativeSceneSizeWithRole(UIWindowScene *scene,
         BOOL landed =
             fabs(sceneBounds.size.width - preferredSize.width) <= 1.5 &&
             fabs(sceneBounds.size.height - preferredSize.height) <= 1.5;
-        MacWSLog(@"scene-native-size result id=%@ fbs=%@ requested=%.1fx%.1f windowed-role=%@ fills-screen=%@ bounds=%.1fx%.1f landed=%@ stage=%@",
+        MacWSDiagnosticLog(@"scene-native-size result id=%@ fbs=%@ requested=%.1fx%.1f windowed-role=%@ fills-screen=%@ bounds=%.1fx%.1f landed=%@ stage=%@",
                  scene.session.persistentIdentifier, sceneIdentifier,
                  preferredSize.width, preferredSize.height,
                  requestWindowedRole ? @"YES" : @"NO",
@@ -1586,7 +1587,7 @@ typedef void (^MacWSCompactMenuSelection)(MacWSMenuItem *item);
                        dispatch_get_main_queue(), ^{
             UIWindowScene *scene = self.view.window.windowScene;
             BOOL actualStatusHidden = scene.statusBarManager.statusBarHidden;
-            MacWSLog(@"immersive-postcondition expected=%@ status-request=%@ status-hidden=%@ home-indicator-auto-hide=%@ deferred-edges=%lu bounds=%@ screen=%@ safe-insets=%@",
+            MacWSDiagnosticLog(@"immersive-postcondition expected=%@ status-request=%@ status-hidden=%@ home-indicator-auto-hide=%@ deferred-edges=%lu bounds=%@ screen=%@ safe-insets=%@",
                      expected ? @"YES" : @"NO",
                      self.prefersStatusBarHidden ? @"YES" : @"NO",
                      actualStatusHidden ? @"YES" : @"NO",
@@ -2000,7 +2001,7 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
             if (snapshot && snapshot.representedWindowID == self->_windowID &&
                 snapshot.representedOwnerPID == self->_windowOwnerPID) {
                 if (snapshot.ownerPID != snapshot.representedOwnerPID)
-                    MacWSLog(@"semantic-menu provider=%d/%u represented=%d/%u nodes=%lu",
+                    MacWSDiagnosticLog(@"semantic-menu provider=%d/%u represented=%d/%u nodes=%lu",
                         snapshot.ownerPID, snapshot.windowID,
                         snapshot.representedOwnerPID, snapshot.representedWindowID,
                         (unsigned long)snapshot.items.count);
@@ -4732,7 +4733,7 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
         statusChanged:(NSString *)status
             connected:(BOOL)connected {
     (void)client;
-    MacWSLog(@"interop-status connected=%@ message=%@",
+    MacWSDiagnosticLog(@"interop-status connected=%@ message=%@",
              connected ? @"YES" : @"NO", status ?: @"");
     _interopLabel.text = [@"互操作：" stringByAppendingString:status];
     _interopLabel.textColor = connected ? UIColor.systemGreenColor
@@ -4852,6 +4853,21 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
         canHandleSession:(id<UIDropSession>)session {
     (void)interaction;
     return session.items.count > 0;
+}
+
+- (void)dropInteraction:(UIDropInteraction *)interaction
+       sessionDidEnter:(id<UIDropSession>)session {
+    if (MacWSHostTouchDiagnosticsEnabled())
+        MacWSLog(@"interop-drop-session entered window=%u items=%lu view=%@",
+            _windowID, (unsigned long)session.items.count, interaction.view);
+}
+
+- (void)dropInteraction:(UIDropInteraction *)interaction
+         sessionDidEnd:(id<UIDropSession>)session {
+    (void)interaction;
+    if (MacWSHostTouchDiagnosticsEnabled())
+        MacWSLog(@"interop-drop-session ended window=%u items=%lu",
+            _windowID, (unsigned long)session.items.count);
 }
 
 - (UIDropProposal *)dropInteraction:(UIDropInteraction *)interaction
@@ -5656,8 +5672,9 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
             BOOL ok = [reply[@"ok"] boolValue];
             [self setNotice:reply[@"message"] ?: @"操作完成" success:ok];
             [self applyStatus:reply];
-            if (ok && [operation isEqualToString:@MACWS_CONTROL_OP_LAUNCH_APP]) {
-                NSString *identifier = arguments[@MACWS_CONTROL_KEY_APP_ID];
+            if (ok && ([operation isEqualToString:@MACWS_CONTROL_OP_LAUNCH_APP] ||
+                       [operation isEqualToString:@MACWS_CONTROL_OP_OPEN_DOCUMENTS])) {
+                NSString *identifier = arguments[@MACWS_CONTROL_KEY_APP_ID] ?: @"document";
                 int32_t launchedPID =
                     (int32_t)[reply[@"launched_app_pid"] intValue];
                 if (launchedPID > 1) {
@@ -5736,6 +5753,46 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
 
 - (void)launchApplication:(UIButton *)sender {
     [self launchApplicationIdentifier:sender.accessibilityIdentifier ?: @""];
+}
+
+- (void)openExternalDocumentURL:(NSURL *)url {
+    [self cancelBootstrapTerminal];
+    // Retain provider access while a stopped macOS workspace is starting.
+    // Never restart a running WindowServer for a document import.
+    BOOL scoped = [url startAccessingSecurityScopedResource];
+    [self setNotice:MacWSLocalized(@"正在导入文件副本…",
+                                   @"Importing a copy of the document…") success:YES];
+    void (^stage)(void) = ^{
+        [MacWSInteropClient importDocumentURL:url
+            completion:^(NSString *path, NSError *error) {
+                if (scoped) [url stopAccessingSecurityScopedResource];
+                if (!path.length || error) {
+                    [self setNotice:error.localizedDescription ?: @"文件导入失败"
+                             success:NO];
+                    return;
+                }
+                [self runOperation:@MACWS_CONTROL_OP_OPEN_DOCUMENTS
+                    arguments:@{@MACWS_CONTROL_KEY_DOCUMENT_PATHS: @[path]}];
+            }];
+    };
+    [_controlClient fetchStatus:^(NSDictionary<NSString *, id> *status) {
+        if ([status[@"connection_error"] boolValue]) {
+            if (scoped) [url stopAccessingSecurityScopedResource];
+            [self setNotice:status[@"message"] ?: @"控制服务不可用" success:NO];
+        } else if ([status[@"windowserver_running"] boolValue]) {
+            stage();
+        } else {
+            [self->_controlClient startWithExperimentalMode:NO
+                completion:^(NSDictionary<NSString *, id> *reply) {
+                    if ([reply[@"ok"] boolValue]) stage();
+                    else {
+                        if (scoped) [url stopAccessingSecurityScopedResource];
+                        [self setNotice:reply[@"message"] ?: @"macOS 启动失败"
+                                 success:NO];
+                    }
+                }];
+        }
+    }];
 }
 
 - (void)launchApplicationIdentifier:(NSString *)identifier {
@@ -7555,7 +7612,7 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
     // AppKit->Scene transaction and suppresses only its reciprocal configure,
     // allowing the iOS window to follow the real constrained result without
     // reintroducing that oscillation.
-    MacWSLog(@"window-size constrained-follow window=%u pid=%d requested-logical=%.1fx%.1f applied-logical=%.1fx%.1f",
+    MacWSDiagnosticLog(@"window-size constrained-follow window=%u pid=%d requested-logical=%.1fx%.1f applied-logical=%.1fx%.1f",
              _windowID, _windowOwnerPID, requestedSize.width,
              requestedSize.height, appliedSize.width, appliedSize.height);
     [self followNativeSceneSizeForAppliedLogicalSize:appliedSize
@@ -8017,6 +8074,13 @@ static void MacWSDeduplicateWindowScenes(void) {
 
 - (void)scene:(UIScene *)scene openURLContexts:(NSSet<UIOpenURLContext *> *)URLContexts {
     for (UIOpenURLContext *context in URLContexts) {
+        if (context.URL.isFileURL) {
+            [(MacWSViewController *)self.window.rootViewController
+                openExternalDocumentURL:context.URL];
+            continue;
+        }
+        if (![context.URL.scheme.lowercaseString isEqualToString:@"macwshost"])
+            continue;
         if ([context.URL.host isEqualToString:@"toggle-workspace"]) {
             MacWSViewController *controller =
                 [self.window.rootViewController

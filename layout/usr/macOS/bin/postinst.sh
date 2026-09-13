@@ -1197,6 +1197,8 @@ add_all_trustcache /var/mnt/rootfs/usr/bin/log
 add_all_trustcache /var/mnt/rootfs/bin/launchctl
 add_all_trustcache /var/mnt/rootfs/usr/bin/open
 add_all_trustcache /var/jb/usr/macOS/bin/PingMTLCompilerService
+add_all_trustcache /var/jb/usr/macOS/bin/macws-llvm-dis
+add_all_trustcache /var/jb/usr/macOS/bin/macws-llvm-as
 add_all_trustcache /var/jb/usr/macOS/bin/launchdchrootexec
 add_all_trustcache /var/jb/Library/Frameworks/CydiaSubstrate.framework/CydiaSubstrate
 add_all_trustcache /var/mnt/rootfs/System/Library/Frameworks/CydiaSubstrate.framework/CydiaSubstrate

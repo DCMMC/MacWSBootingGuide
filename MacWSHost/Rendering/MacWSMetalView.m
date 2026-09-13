@@ -689,7 +689,7 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
             if (!strongSelf || !strongSelf->_nativeResizeGestureRegistered ||
                 token != strongSelf->_nativeResizeGestureToken) return;
             BOOL active = strongSelf.nativeWindowResizeGestureActive;
-            MacWSLog(@"native-resize-gesture scene=%@ window=%u active=%@",
+            MacWSDiagnosticLog(@"native-resize-gesture scene=%@ window=%u active=%@",
                 strongSelf->_nativeResizeGestureScene, strongSelf.targetWindowID,
                 active ? @"YES" : @"NO");
             if (active) {
@@ -1230,7 +1230,7 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
     _windowConfigurationAwaitingAcknowledgement = NO;
     _windowConfigurationSettlementSerial++;
     _windowConfigurationRequestSequence = 0;
-    MacWSLog(@"window-configuration ack window=%u pid=%d sequence=%u request-time=%.6f requested=%.1fx%.1f applied=%.1fx%.1f queued=%.1fx%.1f result=%@",
+    MacWSDiagnosticLog(@"window-configuration ack window=%u pid=%d sequence=%u request-time=%.6f requested=%.1fx%.1f applied=%.1fx%.1f queued=%.1fx%.1f result=%@",
              self.targetWindowID, self.targetPID, sampleSequence, timestamp,
              requestedSize.width, requestedSize.height,
              appliedSize.width, appliedSize.height,
@@ -1316,7 +1316,7 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
     _windowConfigurationSettlementSerial++;
     _windowConfigurationAwaitingAcknowledgement = NO;
     _windowConfigurationRequestSequence = 0;
-    MacWSLog(@"window-configuration scene-follow armed window=%u pid=%d target-logical=%.1fx%.1f",
+    MacWSDiagnosticLog(@"window-configuration scene-follow armed window=%u pid=%d target-logical=%.1fx%.1f",
              self.targetWindowID, self.targetPID,
              logicalSize.width, logicalSize.height);
 }
@@ -1402,7 +1402,7 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
             // layout pass does not echo it back as a new configure request.
             _lastRequestedWindowSize = requested;
             _lastRequestedDensityScale = density;
-            MacWSLog(@"window-configuration scene-follow reached window=%u pid=%d logical=%.1fx%.1f after-deadline=%@",
+            MacWSDiagnosticLog(@"window-configuration scene-follow reached window=%u pid=%d logical=%.1fx%.1f after-deadline=%@",
                      self.targetWindowID, self.targetPID,
                      visibleLogicalSize.width, visibleLogicalSize.height,
                      now > _sceneResizeFollowDeadline ? @"YES" : @"NO");
@@ -1444,7 +1444,7 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
         // has just been armed. Runtime-confirmed for Finder Get Info at
         // MacWSHost.log 1789067847.504-1789067847.622.
         if (self->_sceneResizeFollowingTargetWindow) {
-            MacWSLog(@"window-configuration queued-request-superseded window=%u pid=%d target-logical=%.1fx%.1f",
+            MacWSDiagnosticLog(@"window-configuration queued-request-superseded window=%u pid=%d target-logical=%.1fx%.1f",
                      self.targetWindowID, self.targetPID,
                      self->_sceneResizeTargetWindowLogicalSize.width,
                      self->_sceneResizeTargetWindowLogicalSize.height);
@@ -1598,7 +1598,7 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
     if (fabs(previous.width - target.width) < 0.5 &&
         fabs(previous.height - target.height) < 0.5) return;
     self.drawableSize = target;
-    MacWSLog(@"host-drawable-policy window=%u bounds=%.2fx%.2f previous=%.0fx%.0f "
+    MacWSDiagnosticLog(@"host-drawable-policy window=%u bounds=%.2fx%.2f previous=%.0fx%.0f "
              "source=%ux%u drawable=%.0fx%.0f display-scale=%.3f "
              "backing=%.3f density=%.3f policy=%@ "
              "fullscreen-canvas=%@",
@@ -3648,6 +3648,36 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
                                   pid:(int32_t *)pidOut
                              windowID:(uint32_t *)windowIDOut
                            descriptor:(MacWSStreamFrameDescriptor *)descriptorOut {
+    // Input-only system surfaces are above the AppKit catalog. Their current
+    // WindowServer visibility, not a stale independent texture, owns the hit.
+    if (_streamConnected) for (MacWSStreamWindow *window in
+                               _streamClient.systemInputWindows) {
+        MacWSStreamWindowDescriptor candidate = window.descriptor;
+        CGFloat scale = candidate.backingScale;
+        CGRect bounds = CGRectMake(candidate.logicalX * scale,
+            candidate.logicalY * scale, candidate.logicalWidth * scale,
+            candidate.logicalHeight * scale);
+        if (candidate.ownerPID != [self dockSystemGestureTargetPID] ||
+            !CGRectContainsPoint(bounds, point)) continue;
+        if (pidOut) *pidOut = candidate.ownerPID;
+        if (windowIDOut) *windowIDOut = candidate.windowID;
+        if (descriptorOut) *descriptorOut = (MacWSStreamFrameDescriptor){
+            .magic = MACWS_STREAM_MAGIC, .version = MACWS_STREAM_VERSION,
+            .size = sizeof(MacWSStreamFrameDescriptor),
+            .flags = MacWSStreamFrameGlobalSystemSurface,
+            .width = candidate.pixelWidth, .height = candidate.pixelHeight,
+            .backingScale = scale,
+            .contentWidth = candidate.pixelWidth,
+            .contentHeight = candidate.pixelHeight,
+            .layerWindowID = candidate.windowID,
+            .layerOwnerPID = candidate.ownerPID,
+            .destinationX = (int32_t)llround(bounds.origin.x),
+            .destinationY = (int32_t)llround(bounds.origin.y),
+            .destinationWidth = candidate.pixelWidth,
+            .destinationHeight = candidate.pixelHeight,
+        };
+        return YES;
+    }
     // A live FinalComposite is the surface drawInMTKView actually presents.
     // Resolve it against displayd's live front-to-back OnScreenOnly catalog
     // before consulting independent layer captures. Those captures are
@@ -3957,7 +3987,8 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
     // and the frozen End route as runtime evidence.
     BOOL diagnostic =
         record->contactID == MACWS_INPUT_CONTACT_DIAGNOSTIC ||
-        (record->flags & MacWSInputFlagLatencyDiagnostic) != 0;
+        (record->flags & MacWSInputFlagLatencyDiagnostic) != 0 ||
+        ((begins || terminal) && MacWSHostTouchDiagnosticsEnabled());
     BOOL diagnosticEdge = diagnostic &&
         (!continuation || begins || terminal);
     if (diagnosticEdge) {
@@ -4094,6 +4125,17 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
         _fullscreenGestureRouteWindowID = 0;
         _fullscreenGestureRouteDescriptor =
             (MacWSStreamFrameDescriptor){0};
+    }
+    if (resolved && record->kind == MacWSInputKindScroll &&
+        (descriptor.flags & MacWSStreamFrameGlobalSystemSurface) &&
+        ownerPID == [self dockSystemGestureTargetPID]) {
+        // Launchpad is a Dock/WindowServer surface, not an NSWindow. Keep
+        // the frozen descriptor above for gesture ownership, but deliver its
+        // precise wheel stream through the same global session as pointers.
+        // AppKit windows (including fullscreen VSCode) retain their existing
+        // process-local scroll route and calibration.
+        record->sceneID = MacWSInputSceneForWindow(0,
+            MacWSInputModifiersForScene(record->sceneID));
     }
     if (diagnostic) {
         MacWSLog(@"fullscreen-route-exit view=%p kind=%u resolved=%@ active=%@ owner-contact=%u destination=(%d,%d %ux%u)",
@@ -6522,7 +6564,7 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
         layerWindowID:retiredDescriptor.layerWindowID
         ownerPID:retiredDescriptor.layerOwnerPID
         captureTime:retirementTime receiptTime:retirementTime];
-    MacWSLog(@"display-stream overlay-retire-ui layer=%u immediate=YES",
+    MacWSDiagnosticLog(@"display-stream overlay-retire-ui layer=%u immediate=YES",
              layerWindowID);
     [self setNeedsDisplay];
     // Layer retirement is the authoritative edge that can invalidate the
@@ -6533,7 +6575,7 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
     if (retiredOwnerPID > 1 && retiredOwnerPID == self.targetPID &&
         !_targetRetirementCatalogRequeryScheduled) {
         _targetRetirementCatalogRequeryScheduled = YES;
-        MacWSLog(@"display-stream catalog-requery-scheduled reason=target-layer-retired pid=%d layer=%u",
+        MacWSDiagnosticLog(@"display-stream catalog-requery-scheduled reason=target-layer-retired pid=%d layer=%u",
                  retiredOwnerPID, layerWindowID);
         // WindowServer commonly retires every layer in one transaction.  One
         // catalog snapshot after that batch is authoritative; requesting once
@@ -6543,7 +6585,7 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
                        dispatch_get_main_queue(), ^{
             self->_targetRetirementCatalogRequeryScheduled = NO;
             if (!self->_streamConnected) return;
-            MacWSLog(@"display-stream catalog-requery reason=target-layer-retirement-batch");
+            MacWSDiagnosticLog(@"display-stream catalog-requery reason=target-layer-retirement-batch");
             [self->_streamClient requestWindowList];
         });
     }

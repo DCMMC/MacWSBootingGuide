@@ -12,6 +12,7 @@
 #include <pthread.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include "../include/macws_metal_dag_request.h"
 
 // The rootless iOS 16 Theos SDK used by this project omits xpc/xpc.h.  This
 // is the exact public C ABI needed by the UUID-locked reply observer.
@@ -410,6 +411,67 @@ typedef uintptr_t (*MTLCodeGenServiceBuildRequestFn)(
 static MTLCodeGenServiceBuildRequestFn OrigMTLCodeGenServiceBuildRequest = NULL;
 static uintptr_t StripPAC(const void *p);
 
+// RE-confirmed libGPUCompilerImpl UUID 41d2f0618da83cfa8c4ac3e9d7009604:
+// GPUCompiler::stitch +0xa8 calls getDefaultTargetTriple(None), dropping the
+// Catalyst context of its inputs. Runtime reply raw-48059-001-e produced an
+// iOS MTLB (01 00 / 82), rejected by macOS Metal. A native isolated replay
+// passing Optional(PLATFORM_MACCATALYST=6) into the ORIGINAL Triple builder
+// produced 01 80 / 86 and macOS loaded it without changing its validation.
+// Both the stitcher and its archive writer use this same target constructor.
+// Preserve the 48-byte indirect return ABI and Apple's construction/ownership.
+typedef struct { uint64_t storage[6]; } MacWSTripleABI;
+typedef MacWSTripleABI (*MacWSDefaultTripleFn)(uint64_t);
+static MacWSDefaultTripleFn gOriginalDefaultTriple = NULL;
+static _Thread_local bool gMacWSCatalystDAGRequest = false;
+static bool gCatalystDAGTargetAttempted = false;
+static bool gCatalystDAGTargetReady = false;
+
+static MacWSTripleABI MacWSDefaultTripleForRequest(uint64_t optionalPlatform) {
+    if (gMacWSCatalystDAGRequest && optionalPlatform == 0)
+        optionalPlatform = (UINT64_C(1) << 32) | 6;
+    return gOriginalDefaultTriple(optionalPlatform);
+}
+
+// Called lazily under the existing compiler-request write lock, exclusively
+// after a well-formed Catalyst DAG. No stock iOS service installs this hook
+// merely by starting up; non-Catalyst requests retain the original arguments.
+static bool InstallCatalystDAGTargetContext(void) {
+    if (gCatalystDAGTargetAttempted) return gCatalystDAGTargetReady;
+    gCatalystDAGTargetAttempted = true;
+    void *image = dlopen("/System/Library/PrivateFrameworks/GPUCompiler.framework/Libraries/libGPUCompilerImpl.dylib", RTLD_NOW | RTLD_LOCAL);
+    void *function = image ? dlsym(image,
+        "_ZN7metalfe11GPUCompiler22getDefaultTargetTripleEN4llvm8OptionalINS1_5MachO12PlatformTypeEEE") : NULL;
+    Dl_info info = {0};
+    const uint8_t uuid[16] = {0x41,0xd2,0xf0,0x61,0x8d,0xa8,0x3c,0xfa,0x8c,0x4a,0xc3,0xe9,0xd7,0x00,0x96,0x04};
+    if (!function || !dladdr((void *)StripPAC(function), &info)) return false;
+    const struct mach_header_64 *header = info.dli_fbase;
+    if (!header || header->magic != MH_MAGIC_64 || header->sizeofcmds > 1048576)
+        return false;
+    bool matched = false;
+    const uint8_t *cursor = (const void *)(header + 1), *end = cursor + header->sizeofcmds;
+    for (uint32_t i = 0; i < header->ncmds && cursor + sizeof(struct load_command) <= end; i++) {
+        const struct load_command *cmd = (const void *)cursor;
+        if (cmd->cmdsize < sizeof(*cmd) || cmd->cmdsize > (size_t)(end - cursor)) return false;
+        if (cmd->cmd == LC_UUID && cmd->cmdsize >= sizeof(struct uuid_command))
+            matched = !memcmp(((const struct uuid_command *)cmd)->uuid, uuid, 16);
+        cursor += cmd->cmdsize;
+    }
+    const uint32_t expected[] = {0xd503237f, 0xd10283ff, 0xa9065ff8, 0xa90757f6};
+    void *entry = (void *)StripPAC(function);
+    if (!matched || memcmp(entry, expected, sizeof(expected))) {
+        MTLPatchLog("Catalyst DAG target context: unsupported compiler ABI; original retained");
+        return false;
+    }
+    MSHookFunction(function, (void *)MacWSDefaultTripleForRequest,
+                   (void **)&gOriginalDefaultTriple);
+    kern_return_t protection = vm_protect(mach_task_self(), (vm_address_t)entry,
+        sizeof(expected), false, VM_PROT_READ | VM_PROT_EXECUTE);
+    gCatalystDAGTargetReady = gOriginalDefaultTriple && protection == KERN_SUCCESS;
+    MTLPatchLog("Catalyst DAG target context installed=%d restore-rx=%d",
+                gCatalystDAGTargetReady, protection);
+    return gCatalystDAGTargetReady;
+}
+
 static uint64_t MacWSFNV1a64(const void *data, size_t length) {
     const uint8_t *bytes = (const uint8_t *)data;
     uint64_t hash = UINT64_C(1469598103934665603);
@@ -529,6 +591,7 @@ static void DumpRawCompilerRequest(uint32_t sequence, uintptr_t discriminator,
 // records the returned container verbatim, then calls the real XPC API.  No
 // result bytes or status are changed.
 static void *MacWSCompilerReplyDataCreate(const void *bytes, size_t length) {
+    if (!MacWSCompilerDiagnosticsEnabled()) return xpc_data_create(bytes, length);
     static _Atomic uint32_t replySequence = 0;
     uint32_t sequence = atomic_fetch_add(&replySequence, 1) + 1;
     uint64_t hash = MacWSFNV1a64(bytes, length);
@@ -740,7 +803,8 @@ static uintptr_t MacWSMTLCodeGenServiceBuildRequest(
 
     if (!OrigMTLCodeGenServiceBuildRequest) return (uintptr_t)-1;
 
-    if (adapted)
+    bool catalystDAG = a2 == 14 && MacWSMetalDAGHasCatalystInputs(request, requestSize);
+    if (adapted || catalystDAG)
         pthread_rwlock_wrlock(&gMetalBuildRequestLock);
     else
         pthread_rwlock_rdlock(&gMetalBuildRequestLock);
@@ -755,8 +819,13 @@ static uintptr_t MacWSMTLCodeGenServiceBuildRequest(
     }
     atomic_store_explicit(&gMacWSMetalBuildRequestActive, needsCacheAdapter,
                           memory_order_release);
+    bool previousDAGContext = gMacWSCatalystDAGRequest;
+    gMacWSCatalystDAGRequest = catalystDAG && InstallCatalystDAGTargetContext();
+    if (diagnostics && catalystDAG)
+        MTLPatchLog("Catalyst DAG request target-context=%d size=%zu", gMacWSCatalystDAGRequest, requestSize);
     uintptr_t result = OrigMTLCodeGenServiceBuildRequest(
         a0, a1, a2, request, requestSize, a5);
+    gMacWSCatalystDAGRequest = previousDAGContext;
     atomic_store_explicit(&gMacWSMetalBuildRequestActive, false,
                           memory_order_release);
     pthread_rwlock_unlock(&gMetalBuildRequestLock);

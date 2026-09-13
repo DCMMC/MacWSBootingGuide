@@ -1,6 +1,7 @@
 ARCHS = arm64e
 TARGET = iphone:clang:latest:14.0
 
+include ../config/production.mk
 include $(THEOS)/makefiles/common.mk
 
 BUNDLE_NAME = SettingsExtensionProxy

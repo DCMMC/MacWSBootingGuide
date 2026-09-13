@@ -1133,8 +1133,31 @@ static void SendWindowList(MacWSDisplayClient *client) {
     NSUInteger emitted = 0;
     NSMutableDictionary<NSNumber *, NSDictionary *> *metricsByPID =
         [NSMutableDictionary dictionary];
-    NSArray<NSDictionary *> *onScreenWindowInfo = CopyOnScreenWindowInfo();
+    // Do not exclude desktop-owned elements before extracting system input
+    // surfaces. The AppKit metrics/layer checks below still restrict Scenes.
+    NSArray<NSDictionary *> *onScreenWindowInfo = CopyCompleteDesktopWindowInfo();
     NSArray<NSDictionary *> *catalogWindowInfo = CopyCatalogWindowInfo();
+    // Runtime-confirmed: Dock's LPSpringboard is OnScreen at level 27 while
+    // Launchpad is visible, and absent from OnScreenOnly after dismissal.
+    // It has no AppKit metrics and must not become a selectable iPad Scene.
+    // Publish its real identity/geometry separately, even when final-composite
+    // rendering has suspended the redundant per-window capture surfaces.
+    xpc_object_t systemInput = xpc_array_create(NULL, 0);
+    for (NSDictionary *info in onScreenWindowInfo) {
+        if (xpc_array_get_count(systemInput) >= 8) break;
+        if (![info[(id)kCGWindowOwnerName] isEqual:@"Dock"] ||
+            ![info[(id)kCGWindowName] isEqual:@"LPSpringboard"] ||
+            ![info[(id)kCGWindowIsOnscreen] boolValue] ||
+            [info[(id)kCGWindowLayer] integerValue] <= 0 ||
+            [info[(id)kCGWindowAlpha] doubleValue] <= 0.01) continue;
+        MacWSStreamWindowDescriptor descriptor = WindowDescriptor(info, NULL);
+        if (!MacWSStreamWindowDescriptorIsValid(&descriptor, sizeof(descriptor)))
+            continue;
+        xpc_array_append_value(systemInput,
+            xpc_data_create(&descriptor, sizeof(descriptor)));
+    }
+    xpc_dictionary_set_value(event, MACWS_STREAM_KEY_SYSTEM_INPUT_WINDOWS,
+                             systemInput);
     // The Host uses this array for hit-testing pixels from FinalComposite, so
     // preserve WindowServer's live front-to-back OnScreenOnly order. Append
     // OptionAll-only entries afterward to retain lifecycle/fullscreen

@@ -12,10 +12,12 @@ ROOTFS=/var/mnt/rootfs
 METAL2METAL=/var/jb/usr/macOS/bin/metal2metal.py
 LLVM_DIS=/var/jb/usr/lib/llvm-16/bin/llvm-dis
 LLVM_AS=/var/jb/usr/lib/llvm-16/bin/llvm-as
+APPLE_LLVM_DIS=/var/jb/usr/macOS/bin/macws-llvm-dis
+APPLE_LLVM_AS=/var/jb/usr/macOS/bin/macws-llvm-as
 ROUTE_DIR="$ROOTFS/usr/local/share/macws/metal2metal/routes"
 BOOT_READY_MARKER=/var/jb/var/mobile/macws-metal2metal.boot-ready
 
-# Full manifest verification reads and hashes four source/output metallib
+# Full manifest verification reads and hashes six source/output metallib
 # pairs and starts Python once per route. That remains the authoritative
 # deployment/update boundary. During one live iPad boot, reuse its success
 # only while the exact scripts, sources, outputs and manifests retain their
@@ -27,11 +29,12 @@ metal2metal_runtime_stamp() {
 		/var/jb/usr/bin/tr -d '[:space:]')
 	[ -n "$boot_id" ] || return 1
 	{
-		printf 'schema=1 boot=%s\n' "$boot_id"
+		printf 'schema=2 boot=%s\n' "$boot_id"
 		for path in \
 			/var/jb/usr/macOS/bin/ensure_metal2metal_compat.sh \
 			/var/jb/usr/macOS/bin/ensure_quartzcore_compat.sh \
 			"$METAL2METAL" \
+			"$APPLE_LLVM_DIS" "$APPLE_LLVM_AS" \
 			"$ROOTFS/System/Library/Frameworks/QuartzCore.framework/Versions/A/Resources/default.metallib" \
 			"$ROOTFS/System/Library/Frameworks/QuartzCore.framework/Versions/A/Resources/default.metallib.macws-macos13.4-original" \
 			"$ROOTFS/usr/local/share/macws/quartzcore/default-desktop-effects-macabi.metallib" \
@@ -44,7 +47,13 @@ metal2metal_runtime_stamp() {
 			"$ROUTE_DIR/mpsimage-default.route.plist" \
 			"$ROOTFS/System/Library/Frameworks/MetalFX.framework/Versions/A/Resources/default.metallib" \
 			"$ROOTFS/usr/local/share/macws/metalfx/default-temporal-macabi.metallib" \
-			"$ROUTE_DIR/metalfx-default.route.plist"; do
+			"$ROUTE_DIR/metalfx-default.route.plist" \
+			"$ROOTFS/System/Library/Frameworks/MetalPerformanceShaders.framework/Versions/A/Frameworks/MPSCore.framework/Versions/A/Resources/default.metallib" \
+			"$ROOTFS/usr/local/share/macws/mpscore/default-compute-macabi.metallib" \
+			"$ROUTE_DIR/mpscore-default.route.plist" \
+			"$ROOTFS/System/Library/Frameworks/MetalPerformanceShaders.framework/Versions/A/Frameworks/MPSNDArray.framework/Versions/A/Resources/default.metallib" \
+			"$ROOTFS/usr/local/share/macws/mpsndarray/default-compute-macabi.metallib" \
+			"$ROUTE_DIR/mpsndarray-default.route.plist"; do
 			[ -f "$path" ] || return 1
 			/var/jb/usr/bin/stat -c '%d:%i:%s:%Y:%Z' "$path" || return 1
 		done
@@ -56,8 +65,8 @@ metal2metal_sha256() {
 }
 
 if [ ! -f "$METAL2METAL" ] || [ ! -x "$LLVM_DIS" ] ||
-   [ ! -x "$LLVM_AS" ]; then
-	echo "[ERROR] metal2metal or device LLVM 16 is unavailable." >&2
+   [ ! -x "$LLVM_AS" ] || [ ! -x "$APPLE_LLVM_DIS" ] || [ ! -x "$APPLE_LLVM_AS" ]; then
+	echo "[ERROR] metal2metal or its packaged LLVM tools are unavailable." >&2
 	exit 1
 fi
 
@@ -82,9 +91,12 @@ provision_route() {
 	runtime_output="$7"
 	expected_output_sha256="$8"
 	auto_lower="$9"
+	local route_dis="${10:-$LLVM_DIS}" route_as="${11:-$LLVM_AS}"
 
 	if python3 "$METAL2METAL" verify-runtime-manifest "$manifest" \
-	     --source "$source" --output "$output" >/dev/null 2>&1; then
+	     --source "$source" --output "$output" >/dev/null 2>&1 &&
+	   { [ -z "$expected_output_sha256" ] ||
+	     [ "$(metal2metal_sha256 "$output")" = "$expected_output_sha256" ]; }; then
 		echo "[INFO] complete $name metal2metal route already installed"
 		return 0
 	fi
@@ -97,7 +109,7 @@ provision_route() {
 	output_tmp="$output.new.$$"
 	manifest_tmp="$manifest.new.$$"
 	args=(translate "$source" "$output_tmp"
-		--llvm-dis "$LLVM_DIS" --llvm-as "$LLVM_AS"
+		--llvm-dis "$route_dis" --llvm-as "$route_as"
 		--runtime-manifest "$manifest_tmp"
 		--runtime-source-path "$runtime_source"
 		--runtime-output-path "$runtime_output")
@@ -144,8 +156,8 @@ provision_route \
 	"$ROUTE_DIR/mpsimage-default.route.plist" \
 	"/System/Library/Frameworks/MetalPerformanceShaders.framework/Versions/A/Frameworks/MPSImage.framework/Versions/A/Resources/default.metallib" \
 	"/usr/local/share/macws/mpsimage/default-desktop-effects-macabi.metallib" \
-	"" \
-	1 || exit 1
+	84973060c51620471389178f7f00d6bde68f3fdf1609cda48072db46f7663916 \
+	1 "$APPLE_LLVM_DIS" "$APPLE_LLVM_AS" || exit 1
 
 # Ventura MetalFX ships its temporal scaler network as one desktop-targeted
 # library.  Route the complete library through the same manifest contract as
@@ -163,6 +175,34 @@ provision_route \
 	"/usr/local/share/macws/metalfx/default-temporal-macabi.metallib" \
 	"" \
 	1 || exit 1
+
+# MPS DAG input must retain the installed Apple compiler's AIR dialect.
+# Runtime: upstream LLVM16 writes bitcode rejected as Invalid value / Unknown
+# attribute kind (71). Do not replace the already validated image/effect
+# routes' backend; use matching native reader/writer only for these complete
+# compute libraries. Pinned outputs also reject older, self-consistent but
+# compiler-incompatible manifests. Conversion is offline, never per launch.
+provision_route \
+	MPSCore \
+	"$ROOTFS/System/Library/Frameworks/MetalPerformanceShaders.framework/Versions/A/Frameworks/MPSCore.framework/Versions/A/Resources/default.metallib" \
+	ff2cca382dc21e3cdb4f5b567d6770917a32f388d36e64dffae595ea1601322b \
+	"$ROOTFS/usr/local/share/macws/mpscore/default-compute-macabi.metallib" \
+	"$ROUTE_DIR/mpscore-default.route.plist" \
+	"/System/Library/Frameworks/MetalPerformanceShaders.framework/Versions/A/Frameworks/MPSCore.framework/Versions/A/Resources/default.metallib" \
+	"/usr/local/share/macws/mpscore/default-compute-macabi.metallib" \
+	bc05c6dfc851d5d6acf760c9edde8bb3f449af5e0834cdab81f9e2f4092a0187 \
+	1 "$APPLE_LLVM_DIS" "$APPLE_LLVM_AS" || exit 1
+
+provision_route \
+	MPSNDArray \
+	"$ROOTFS/System/Library/Frameworks/MetalPerformanceShaders.framework/Versions/A/Frameworks/MPSNDArray.framework/Versions/A/Resources/default.metallib" \
+	575c89ae7415c58fb39d41f5278c25458d62bc0cf622e09bae44cf661f1075d1 \
+	"$ROOTFS/usr/local/share/macws/mpsndarray/default-compute-macabi.metallib" \
+	"$ROUTE_DIR/mpsndarray-default.route.plist" \
+	"/System/Library/Frameworks/MetalPerformanceShaders.framework/Versions/A/Frameworks/MPSNDArray.framework/Versions/A/Resources/default.metallib" \
+	"/usr/local/share/macws/mpsndarray/default-compute-macabi.metallib" \
+	ff2d5117039292640d234037b4bc6f0081bb10d79d63a152ea72b1ec0de71ab1 \
+	1 "$APPLE_LLVM_DIS" "$APPLE_LLVM_AS" || exit 1
 
 runtime_stamp=$(metal2metal_runtime_stamp 2>/dev/null || true)
 if [ -n "$runtime_stamp" ]; then

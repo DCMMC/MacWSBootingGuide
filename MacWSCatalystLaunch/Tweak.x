@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
+#include "../include/macws_settings_paths.h"
 
 // Runtime-confirmed on iPadOS 16.3.1 (RunningBoard 803.120.4):
 // RBLaunchdInterface's ABI is @48@0:8@16@24@32o^@40 and System Settings
@@ -38,18 +39,13 @@ static BOOL MacWSStringHasSuffix(const char *string, const char *suffix) {
         memcmp(string + stringLength - suffixLength, suffix, suffixLength) == 0;
 }
 
-static const char *const MacWSSettingsExtensionPrefix =
-    "/System/Library/ExtensionKit/Extensions/";
-
 static BOOL MacWSIsSettingsExtensionExecutable(const char *executable) {
     if (!executable || strstr(executable, "..")) return NO;
     if (strcmp(executable, MacWSAppearanceExecutable) == 0 ||
         MacWSStringHasSuffix(executable, MacWSAppearanceMetadataSuffix)) {
         return YES;
     }
-    size_t prefixLength = strlen(MacWSSettingsExtensionPrefix);
-    return strncmp(executable, MacWSSettingsExtensionPrefix, prefixLength) == 0 &&
-        strstr(executable + prefixLength, ".appex/Contents/MacOS/") != NULL;
+    return MacWSIsStockSettingsExecutable(executable);
 }
 
 static BOOL MacWSCopyCFString(id object, char output[PATH_MAX]) {
@@ -186,7 +182,7 @@ static void MacWSPublishRunningBoardBridgeReadiness(void) {
     int descriptor = open(temporary,
                           O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
     if (descriptor < 0) return;
-    dprintf(descriptor, "schema=1\npid=%d\n", getpid());
+    dprintf(descriptor, "schema=2\npid=%d\n", getpid());
     (void)fsync(descriptor);
     close(descriptor);
     (void)rename(temporary, marker);

@@ -1,6 +1,7 @@
 ARCHS = arm64
 TARGET = iphone:clang:latest:16.0
 
+include ../config/production.mk
 include $(THEOS)/makefiles/common.mk
 
 APPLICATION_NAME = MacWSCatalystLauncher

@@ -124,6 +124,16 @@ static NSDictionary<NSString *, id> *MacWSDictionaryFromReply(xpc_object_t reply
             if ([value isKindOfClass:NSString.class])
                 xpc_dictionary_set_string(request, key.UTF8String,
                                           [value UTF8String]);
+            else if ([key isEqualToString:@MACWS_CONTROL_KEY_DOCUMENT_PATHS] &&
+                     [value isKindOfClass:NSArray.class]) {
+                xpc_object_t paths = xpc_array_create(NULL, 0);
+                for (id path in value) {
+                    if ([path isKindOfClass:NSString.class])
+                        xpc_array_set_string(paths, XPC_ARRAY_APPEND,
+                                             [path UTF8String]);
+                }
+                xpc_dictionary_set_value(request, key.UTF8String, paths);
+            }
             else if ([value isKindOfClass:NSNumber.class]) {
                 // Most historical numeric arguments are protocol booleans.
                 // A process identity must retain its complete value so hostd

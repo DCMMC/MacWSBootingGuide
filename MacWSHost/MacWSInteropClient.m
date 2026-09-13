@@ -17,6 +17,7 @@
 
 #include "macws_control_protocol.h"
 #include "macws_interop_protocol.h"
+#include "macws_file_copy.h"
 
 static NSString *const MacWSImportsHostRoot =
     @"/var/mnt/rootfs/Users/Shared/MacWS Imports";
@@ -69,6 +70,22 @@ static BOOL MacWSSharedTransferPath(NSString *path) {
             return YES;
     }
     return NO;
+}
+
+// Only unpublished copies made for this provider transaction are disposable.
+// Never remove an export or a provider's original on a failed multi-item drop.
+static void MacWSRemoveUnpublishedProviderFiles(NSArray<NSArray *> *slots) {
+    for (NSArray *slot in slots) {
+        for (NSDictionary *representation in slot) {
+            NSString *path = representation[MacWSArchiveFilePathKey];
+            NSString *standard = path.stringByStandardizingPath;
+            if (![standard hasPrefix:@"/Users/Shared/MacWS Imports/"])
+                continue;
+            NSString *hostPath = [MacWSRootFSHostPrefix
+                stringByAppendingString:standard];
+            [NSFileManager.defaultManager removeItemAtPath:hostPath error:nil];
+        }
+    }
 }
 
 // Treat the archive as untrusted input on both sides of the bridge. Returning
@@ -363,7 +380,7 @@ static BOOL MacWSProviderPOSIXCopyRegularFile(NSURL *sourceURL,
     NSString *destinationRoot =
         [MacWSImportsHostRoot.stringByStandardizingPath
             stringByAppendingString:@"/"];
-    if (!MacWSProviderPOSIXFallbackSourcePath(sourcePath) ||
+    if (!sourceURL.isFileURL ||
         ![destinationPath hasPrefix:destinationRoot]) {
         if (error) *error = MacWSError(24,
             @"项目文件不在受支持的 iOS 提供器目录中");
@@ -388,7 +405,7 @@ static BOOL MacWSProviderPOSIXCopyRegularFile(NSURL *sourceURL,
     }
 
     int destinationFD = open(destinationPath.fileSystemRepresentation,
-        O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
+        O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
     if (destinationFD < 0) {
         int savedErrno = errno;
         close(sourceFD);
@@ -397,37 +414,12 @@ static BOOL MacWSProviderPOSIXCopyRegularFile(NSURL *sourceURL,
         return NO;
     }
 
-    BOOL copied = YES;
-    int savedErrno = 0;
-    uint8_t buffer[128 * 1024];
-    for (;;) {
-        ssize_t count = read(sourceFD, buffer, sizeof(buffer));
-        if (count == 0) break;
-        if (count < 0) {
-            if (errno == EINTR) continue;
-            copied = NO;
-            savedErrno = errno;
-            break;
-        }
-        ssize_t offset = 0;
-        while (offset < count) {
-            ssize_t written = write(destinationFD, buffer + offset,
-                                    (size_t)(count - offset));
-            if (written < 0 && errno == EINTR) continue;
-            if (written <= 0) {
-                copied = NO;
-                savedErrno = written < 0 ? errno : EIO;
-                break;
-            }
-            offset += written;
-        }
-        if (!copied) break;
-    }
-    if (copied && fsync(destinationFD) != 0) {
+    BOOL copied = MacWSCopyStableRegularFile(sourceFD, destinationFD, NULL) == 0;
+    int savedErrno = copied ? 0 : errno;
+    if (close(destinationFD) != 0 && copied) {
         copied = NO;
         savedErrno = errno;
     }
-    close(destinationFD);
     close(sourceFD);
     if (!copied) {
         unlink(destinationPath.fileSystemRepresentation);
@@ -516,9 +508,12 @@ static BOOL MacWSStageProviderURL(NSURL *url, NSString *suggestedName,
         [batch stringByAppendingPathComponent:name]];
     BOOL scoped = [url startAccessingSecurityScopedResource];
     NSError *foundationError = nil;
-    BOOL copied = [NSFileManager.defaultManager copyItemAtURL:url
-                                                        toURL:destination
-                                                        error:&foundationError];
+    NSNumber *regular = nil;
+    [url getResourceValue:&regular forKey:NSURLIsRegularFileKey error:nil];
+    BOOL copied = regular.boolValue
+        ? MacWSProviderPOSIXCopyRegularFile(url, destination, &foundationError)
+        : [NSFileManager.defaultManager copyItemAtURL:url toURL:destination
+                                               error:&foundationError];
     NSError *fallbackError = nil;
     if (!copied && MacWSProviderPOSIXFallbackSourcePath(url.path)) {
         // The destination may exist partially after a failed coordinated
@@ -542,6 +537,8 @@ static BOOL MacWSStageProviderURL(NSURL *url, NSString *suggestedName,
     }
     if (scoped) [url stopAccessingSecurityScopedResource];
     if (!copied) {
+        // This UUID batch belongs only to this failed import, never the source.
+        [NSFileManager.defaultManager removeItemAtPath:batch error:nil];
         if (error) *error = rootStageError ?: fallbackError ?: foundationError ?:
             MacWSError(25, @"无法复制项目提供器文件");
         return NO;
@@ -555,7 +552,8 @@ static BOOL MacWSStageProviderURL(NSURL *url, NSString *suggestedName,
 static BOOL MacWSStageProviderData(NSData *data, NSString *suggestedName,
                                    NSString *type, NSUInteger index,
                                    NSString **chrootPath, NSError **error) {
-    if (![data isKindOfClass:NSData.class] || !data.length) return NO;
+    if (![data isKindOfClass:NSData.class] || !data.length ||
+        data.length > MACWS_INTEROP_MAX_INLINE_BYTES) return NO;
     NSString *batch = [MacWSImportsHostRoot stringByAppendingPathComponent:
         NSUUID.UUID.UUIDString];
     if (![NSFileManager.defaultManager createDirectoryAtPath:batch
@@ -704,6 +702,37 @@ static NSURL *MacWSResolvedProviderFileURL(id item) {
 
 @implementation MacWSInteropClient
 
++ (void)importDocumentURL:(NSURL *)url
+              completion:(void (^)(NSString *, NSError *))completion {
+    // Acquire the extension on receipt, not after dispatching the copy.
+    BOOL scoped = [url startAccessingSecurityScopedResource];
+    static dispatch_queue_t imports;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        imports = dispatch_queue_create("com.macwsguide.host.open-in",
+                                         DISPATCH_QUEUE_SERIAL);
+    });
+    dispatch_async(imports, ^{
+        __block NSString *path = nil;
+        __block NSError *stageError = nil;
+        NSError *coordinationError = nil;
+        NSFileCoordinator *coordinator = [[NSFileCoordinator alloc]
+            initWithFilePresenter:nil];
+        [coordinator coordinateReadingItemAtURL:url options:0
+            error:&coordinationError byAccessor:^(NSURL *readableURL) {
+                MacWSStageProviderURL(readableURL, url.lastPathComponent,
+                    UTTypeData.identifier, 0, &path, &stageError);
+            }];
+        if (scoped) [url stopAccessingSecurityScopedResource];
+        MacWSLog(@"open-in stage source=%@ destination=%@ result=%@ error=%@",
+            url.lastPathComponent, path ?: @"", path ? @"ready" : @"failed",
+            coordinationError ?: stageError ?: @"nil");
+        dispatch_async(dispatch_get_main_queue(), ^{
+            completion(path, coordinationError ?: stageError);
+        });
+    });
+}
+
 - (instancetype)init {
     self = [super init];
     if (self) {
@@ -828,7 +857,7 @@ static NSURL *MacWSResolvedProviderFileURL(id item) {
     UIApplicationState state =
         UIApplication.sharedApplication.applicationState;
     NSInteger change = UIPasteboard.generalPasteboard.changeCount;
-    MacWSLog(@"interop-local-pasteboard notification=%@ change=%ld last=%ld "
+    MacWSDiagnosticLog(@"interop-local-pasteboard notification=%@ change=%ld last=%ld "
         "state=%ld applying-remote=%@ publisher=%@",
         notification.name ?: @"manual", (long)change,
         (long)self.lastLocalPasteboardChange, (long)state,
@@ -1004,16 +1033,18 @@ static NSURL *MacWSResolvedProviderFileURL(id item) {
         NSMutableDictionary *textItem = pasteItems[textItemIndex];
         textItem[UTTypeUTF8PlainText.identifier] = plainText;
     }
-    NSMutableArray<NSString *> *typeSummaries = [NSMutableArray array];
-    for (NSDictionary *item in pasteItems)
-        [typeSummaries addObject:[[item.allKeys
-            sortedArrayUsingSelector:@selector(compare:)]
-            componentsJoinedByString:@","]];
-    MacWSLog(@"interop-local-publish change=%ld items=%lu types=%@ "
-        "canonical-text=%@", (long)pasteboard.changeCount,
-        (unsigned long)pasteItems.count,
-        [typeSummaries componentsJoinedByString:@" | "],
-        plainText ? @"added" : (hasUTF8Text ? @"present" : @"none"));
+    if (MacWSHostDiagnosticsEnabled()) {
+        NSMutableArray<NSString *> *typeSummaries = [NSMutableArray array];
+        for (NSDictionary *item in pasteItems)
+            [typeSummaries addObject:[[item.allKeys
+                sortedArrayUsingSelector:@selector(compare:)]
+                componentsJoinedByString:@","]];
+        MacWSLog(@"interop-local-publish change=%ld items=%lu types=%@ "
+            "canonical-text=%@", (long)pasteboard.changeCount,
+            (unsigned long)pasteItems.count,
+            [typeSummaries componentsJoinedByString:@" | "],
+            plainText ? @"added" : (hasUTF8Text ? @"present" : @"none"));
+    }
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         NSError *error = nil;
         NSArray *items = [self archiveItemsForUIKitItems:pasteItems
@@ -1038,7 +1069,7 @@ static NSURL *MacWSResolvedProviderFileURL(id item) {
             }
             if (self.pendingLocalPasteboardChange == snapshotChange)
                 self.pendingLocalPasteboardChange = -1;
-            MacWSLog(@"interop-local-publish-result change=%ld applied=%@ "
+            MacWSDiagnosticLog(@"interop-local-publish-result change=%ld applied=%@ "
                 "current=%ld pending=%ld", (long)snapshotChange,
                 applied ? @"YES" : @"NO",
                 (long)UIPasteboard.generalPasteboard.changeCount,
@@ -1124,11 +1155,17 @@ static NSURL *MacWSResolvedProviderFileURL(id item) {
         }];
     }
     NSError *error = nil;
-    NSData *archive = archiveItems.count
+    // A successful drop must account for every requested item, including
+    // providers which returned errors (not just providers which timed out).
+    // A missing format must not silently turn a multi-file drop into a subset.
+    BOOL complete = archiveItems.count == slots.count && slots.count > 0;
+    NSData *archive = complete
         ? MacWSArchiveData(archiveItems, &error) : nil;
     if (!archive) {
+        MacWSRemoveUnpublishedProviderFiles(slots);
         dispatch_async(dispatch_get_main_queue(), ^{
-            completion(NO, error ?: MacWSError(31, @"没有可用的拖放格式"));
+            completion(NO, error ?: MacWSError(31,
+                @"部分项目没有可用的拖放格式；没有交付部分文件"));
         });
         return;
     }
@@ -1141,7 +1178,11 @@ static NSURL *MacWSResolvedProviderFileURL(id item) {
         completion(NO, MacWSError(30, @"拖放内容为空"));
         return;
     }
-    NSUInteger itemLimit = MIN(providers.count, MACWS_INTEROP_MAX_ITEMS);
+    if (providers.count > MACWS_INTEROP_MAX_ITEMS) {
+        completion(NO, MacWSError(30, @"拖放项目过多，请分批传输"));
+        return;
+    }
+    NSUInteger itemLimit = providers.count;
     NSMutableArray *slots = [NSMutableArray arrayWithCapacity:itemLimit];
     for (NSUInteger i = 0; i < itemLimit; i++)
         [slots addObject:[NSMutableArray array]];
@@ -1262,8 +1303,8 @@ static NSURL *MacWSResolvedProviderFileURL(id item) {
     // NSItemProvider is allowed to call every representation loader on a
     // different queue. Starting all 128 at once can transiently materialize
     // gigabytes even though the final archive is capped at 64 MiB. Load one
-    // representation at a time and cap the whole acquisition at fifteen
-    // seconds (Photos/iCloud may need to materialize an asset);
+    // representation at a time. A provider gets its own acquisition deadline;
+    // a callback-scoped file copy must finish before any result is published.
     // this keeps peak retained payload bounded to the accepted archive plus
     // the single active provider result.
     dispatch_queue_t loadQueue = dispatch_queue_create(
@@ -1271,6 +1312,11 @@ static NSURL *MacWSResolvedProviderFileURL(id item) {
     __block NSUInteger jobIndex = 0;
     __block NSUInteger acceptedInlineBytes = 0;
     __block BOOL finished = NO;
+    NSObject *gate = [[NSObject alloc] init];
+    __block BOOL callbackActive = NO;
+    __block CFAbsoluteTime jobStarted = CFAbsoluteTimeGetCurrent();
+    __block dispatch_source_t deadlineTimer = dispatch_source_create(
+        DISPATCH_SOURCE_TYPE_TIMER, 0, 0, loadQueue);
     __block void (^loadNext)(void) = nil;
     __block __weak void (^weakLoadNext)(void) = nil;
     loadNext = ^{
@@ -1287,9 +1333,17 @@ static NSURL *MacWSResolvedProviderFileURL(id item) {
             jobIndex++;
         }
         if (jobIndex >= jobs.count) {
-            finished = YES;
+            @synchronized (gate) { finished = YES; }
+            dispatch_source_cancel(deadlineTimer);
+            dispatch_source_set_event_handler(deadlineTimer, nil);
+            deadlineTimer = nil;
             [self sendLoadedProviderSlots:slots completion:completion];
+            loadNext = nil;
             return;
+        }
+        @synchronized (gate) {
+            callbackActive = NO;
+            jobStarted = CFAbsoluteTimeGetCurrent();
         }
         NSDictionary *job = jobs[jobIndex];
         NSItemProvider *provider = job[@"provider"];
@@ -1299,6 +1353,10 @@ static NSURL *MacWSResolvedProviderFileURL(id item) {
         if ([kind isEqualToString:@"direct-item"]) {
             [provider loadItemForTypeIdentifier:type options:nil
                 completionHandler:^(id item, NSError *providerError) {
+                @synchronized (gate) {
+                    if (finished) return;
+                    callbackActive = YES;
+                }
                 // Keep every URL operation inside the provider callback: the
                 // security extension and temporary file are not promised to
                 // remain valid after this block returns.
@@ -1354,6 +1412,10 @@ static NSURL *MacWSResolvedProviderFileURL(id item) {
         if ([kind isEqualToString:@"file-url"]) {
             [provider loadItemForTypeIdentifier:type options:nil
                 completionHandler:^(id item, NSError *providerError) {
+                @synchronized (gate) {
+                    if (finished) return;
+                    callbackActive = YES;
+                }
                 // Provider URLs can be temporary for only this callback.
                 // Resolve and copy synchronously before returning to UIKit.
                 NSURL *url = providerError ? nil :
@@ -1398,6 +1460,10 @@ static NSURL *MacWSResolvedProviderFileURL(id item) {
             [provider loadInPlaceFileRepresentationForTypeIdentifier:type
                 completionHandler:^(NSURL *url, BOOL inPlace,
                                     NSError *providerError) {
+                @synchronized (gate) {
+                    if (finished) return;
+                    callbackActive = YES;
+                }
                 NSString *path = nil;
                 NSError *stageError = nil;
                 if (!providerError && url) MacWSStageProviderURL(url,
@@ -1438,6 +1504,10 @@ static NSURL *MacWSResolvedProviderFileURL(id item) {
             [provider loadObjectOfClass:UIImage.class
                 completionHandler:^(id<NSItemProviderReading> object,
                                     NSError *providerError) {
+                @synchronized (gate) {
+                    if (finished) return;
+                    callbackActive = YES;
+                }
                 UIImage *providerImage = [object isKindOfClass:UIImage.class]
                     ? (UIImage *)object : nil;
                 NSData *data = providerImage
@@ -1477,6 +1547,10 @@ static NSURL *MacWSResolvedProviderFileURL(id item) {
             }
             [provider loadFileRepresentationForTypeIdentifier:type
                 completionHandler:^(NSURL *url, NSError *providerError) {
+                @synchronized (gate) {
+                    if (finished) return;
+                    callbackActive = YES;
+                }
                 // loadFileRepresentation's URL is explicitly callback-scoped.
                 NSString *path = nil;
                 NSError *stageError = nil;
@@ -1511,6 +1585,10 @@ static NSURL *MacWSResolvedProviderFileURL(id item) {
         }
         [provider loadDataRepresentationForTypeIdentifier:type
             completionHandler:^(NSData *data, NSError *providerError) {
+            @synchronized (gate) {
+                if (finished) return;
+                callbackActive = YES;
+            }
             dispatch_async(loadQueue, ^{
                 if (finished) return;
                 if (!providerError && data && data.length <=
@@ -1550,20 +1628,31 @@ static NSURL *MacWSResolvedProviderFileURL(id item) {
         }];
     };
     weakLoadNext = loadNext;
+    dispatch_source_set_timer(deadlineTimer,
+        dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC),
+        5 * NSEC_PER_SEC, NSEC_PER_SEC);
+    dispatch_source_set_event_handler(deadlineTimer, ^{
+        @synchronized (gate) {
+            if (finished || callbackActive ||
+                CFAbsoluteTimeGetCurrent() - jobStarted < 90.0) return;
+            finished = YES;
+        }
+        dispatch_source_cancel(deadlineTimer);
+        dispatch_source_set_event_handler(deadlineTimer, nil);
+        deadlineTimer = nil;
+        loadNext = nil;
+        // Never report a partially acquired multi-file drop as success. No
+        // active copy can race this cleanup: callback ownership is gated.
+        MacWSRemoveUnpublishedProviderFiles(slots);
+        dispatch_async(dispatch_get_main_queue(), ^{
+            completion(NO, MacWSError(32, @"文件提供器等待超时，请下载文件后重试；没有交付部分文件"));
+        });
+    });
+    dispatch_resume(deadlineTimer);
     // Initiate the primary representation before UIDropInteraction returns
     // from performDrop:. Subsequent work stays serialized on loadQueue, but
     // this first request is now inside the source endpoint's owned lifetime.
     loadNext();
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 15 * NSEC_PER_SEC), loadQueue, ^{
-        if (!finished) {
-            finished = YES;
-            [self sendLoadedProviderSlots:slots completion:completion];
-        }
-        // The timeout owns the recursion block for the bounded acquisition
-        // lifetime. Clearing it here also releases provider/job captures when
-        // all callbacks completed earlier.
-        loadNext = nil;
-    });
 }
 
 - (NSData *)archivePayloadFromMessage:(xpc_object_t)message

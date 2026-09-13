@@ -391,6 +391,7 @@ static NSString *MacWSPerfThermalStateName(NSProcessInfoThermalState state) {
                                   streamID:(uint64_t)streamID
                                   sequence:(uint64_t)sequence
                                  surfaceID:(uint32_t)surfaceID {
+    if (!atomic_load(&_instrumentationActive)) return;
     os_unfair_lock_lock(&_lock);
     _finalCompositeActive = finalComposite;
     _baseTransportStreamID = streamID;

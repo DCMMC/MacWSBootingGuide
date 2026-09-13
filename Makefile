@@ -1,10 +1,12 @@
 TARGET := iphone:clang:latest:14.0
 ARCHS = arm64
 
+include $(dir $(lastword $(MAKEFILE_LIST)))config/production.mk
 include $(THEOS)/makefiles/common.mk
 
 # iOS subprojects
 SUBPROJECTS += MTLCompilerBypassOSCheck MacWSWindowing MacWSCatalystLaunch MTLSimDriverHost launchdchrootexec autosignd macwsallocd macwshostd macwscontrolprobe macwskeychaind macwsthermal macwslocationd mountdevfs ViewBridgeChrootProxy HIServicesChrootProxy OpenAndSavePanelChrootProxy QuickLookUIServiceChrootProxy DockHelperChrootProxy ExtensionKitChrootProxy SettingsExtensionChrootProxy FileCoordinationChrootProxy FileCoordinationMachBridge GeodChrootProxy WriteConfigChrootProxy LocationdChrootProxy mtl_keepalive MacWSHost MacWSCatalystLauncher SettingsExtensionMetadata misc/PingMTLCompilerService
+SUBPROJECTS += macwsairtools
 # macOS subprojects
 SUBPROJECTS += launchservicesd libmachook macwsinputd macwsdisplayd macwsinteropd macwsworkspacectl
 

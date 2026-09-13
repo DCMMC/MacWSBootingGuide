@@ -1,6 +1,7 @@
 TARGET := macosx:clang:latest:13.0
 ARCHS = arm64
 
+include ../config/production.mk
 include $(THEOS)/makefiles/common.mk
 
 # Theos's legacy vendor IOKit headers define IOPhysicalRange differently from

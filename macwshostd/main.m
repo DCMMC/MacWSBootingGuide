@@ -39,6 +39,7 @@
 // left beside main.m must never shadow a newly synchronized protocol through
 // quoted-include search order.
 #include "../include/macws_control_protocol.h"
+#include "../include/macws_file_copy.h"
 #include "../include/macws_host_protocol.h"
 #include "../include/macws_steam_mach_rendezvous_protocol.h"
 #include "../include/macws_steam_semaphore_protocol.h"
@@ -1514,6 +1515,15 @@ static BOOL WaitForAppInputEndpoint(pid_t pid, NSTimeInterval timeout) {
     return NO;
 }
 
+// Race two real readiness witnesses instead of withholding the launch event
+// for three seconds: a window may already exist, otherwise send exactly one
+// native reopen as soon as the target's input endpoint has been published.
+// Runtime-confirmed 2026-09-12: Excel 21855, PowerPoint 23558 and Sublime
+// 23729 waited ~3.05 s before application-reopen was sent. No visible metrics
+// or protocol checks are relaxed by this admission policy.
+static BOOL WaitForInitialApplicationWindow(pid_t pid, NSTimeInterval timeout,
+                                            int *exitStatusOut);
+
 static BOOL SendAppInputRecord(pid_t pid, MacWSInputRecord *record,
                                int *errorOut) {
     if (pid <= 1 || !record) {
@@ -1622,6 +1632,27 @@ static BOOL RequestApplicationReopen(pid_t pid, NSTimeInterval timeout) {
             (unsigned long long)previousGeneration,
             (unsigned long long)ReadWindowMetricsGeneration(pid), exitStatus);
     return ready;
+}
+
+static BOOL WaitForInitialApplicationWindow(pid_t pid, NSTimeInterval timeout,
+                                            int *exitStatusOut) {
+    CFAbsoluteTime deadline = CFAbsoluteTimeGetCurrent() + timeout;
+    char endpoint[PATH_MAX];
+    snprintf(endpoint, sizeof(endpoint),
+        "/var/mnt/rootfs/private/tmp/macws_app_input.%d.sock", pid);
+    while (CFAbsoluteTimeGetCurrent() < deadline) {
+        NSTimeInterval remaining = deadline - CFAbsoluteTimeGetCurrent();
+        if (WaitForWindowMetrics(pid, MIN(remaining, 0.05), exitStatusOut))
+            return YES;
+        if (exitStatusOut && *exitStatusOut >= 0) return NO;
+        if (IsSocket(endpoint)) {
+            remaining = deadline - CFAbsoluteTimeGetCurrent();
+            if (remaining <= 0) return NO;
+            HostLog(@"launch-app lifecycle-ready pid=%d route=endpoint-driven-reopen", pid);
+            return RequestApplicationReopen(pid, remaining);
+        }
+    }
+    return NO;
 }
 
 // Return a live, real Ventura Settings UI extension. System Settings persists
@@ -2411,7 +2442,7 @@ static pid_t RunningBoardSettingsBridgeMarkerPID(void) {
     payload[count] = '\0';
     int pid = 0;
     char trailing = '\0';
-    if (sscanf(payload, "schema=1\npid=%d\n%c", &pid, &trailing) != 1 ||
+    if (sscanf(payload, "schema=2\npid=%d\n%c", &pid, &trailing) != 1 ||
         pid <= 1) return 0;
     return (pid_t)pid;
 }
@@ -3154,6 +3185,64 @@ static BOOL LaunchSteam(NSString **message) {
     return YES;
 }
 
+static BOOL PrepareSystemApplicationCode(NSString *rootPath,
+                                         NSString **message) {
+    // Runtime-confirmed: Calculator's BasicAndSci.calcview failed NSBundle
+    // preflight, leaving normalSize: nil and a real 0x0 CalcWindow. Registering
+    // the two stock plugin CodeDirectories (without altering either image)
+    // made NSBundle load and the full calculator appear. Exec admission alone
+    // cannot cover plugins dynamically selected by NSBundle later in launch.
+    // TextEdit separately had a trusted stock main image but died in sandbox
+    // exec policy; merging the existing MacWS profile admitted its real UI.
+    BOOL systemApp = [rootPath hasPrefix:@"/System/Applications/"] ||
+        [rootPath hasPrefix:@"/System/Library/CoreServices/"] ||
+        [rootPath hasPrefix:@"/System/Volumes/Preboot/Cryptexes/App/System/Applications/"];
+    if (!systemApp) return YES;
+    NSRange mainImage = [rootPath rangeOfString:@".app/Contents/MacOS/"
+                                      options:NSBackwardsSearch];
+    if (mainImage.location == NSNotFound) return YES;
+    NSString *bundle = [rootPath substringToIndex:mainImage.location + 4];
+    // The helper preserves already-converted main images and all plugin
+    // signatures. Only a main image missing the existing chroot profile gets
+    // a backed-up, atomic first-use conversion; live trust is checked each
+    // time. No rootfs scan or process-lifetime pathname success cache.
+    const char *prepare[] = {
+        "/var/jb/usr/bin/timeout", "-k", "2", "20",
+        "/var/jb/usr/bin/python3", "/var/jb/usr/macOS/bin/macws_system_app_prepare.py",
+        rootPath.fileSystemRepresentation, NULL,
+    };
+    CFAbsoluteTime began = CFAbsoluteTimeGetCurrent();
+    int result = RunCommandToLog(prepare, YES,
+        "/var/mobile/Library/Logs/AppPluginTrust.host.log");
+    HostLog(@"launch-app code-admission bundle=%@ result=%d seconds=%.3f",
+            bundle, result, CFAbsoluteTimeGetCurrent() - began);
+    if (result != 0) {
+        *message = @"系统应用的启动策略或插件准入未完成，请查看 AppPluginTrust 日志";
+        return NO;
+    }
+    return YES;
+}
+
+static BOOL RootApplicationRequiresNativeMetal(NSString *rootPath) {
+    NSString *macOSDirectory = rootPath.stringByDeletingLastPathComponent;
+    NSString *contents = macOSDirectory.stringByDeletingLastPathComponent;
+    if (![macOSDirectory.lastPathComponent isEqualToString:@"MacOS"] ||
+        ![contents.lastPathComponent isEqualToString:@"Contents"]) return NO;
+    NSString *plistPath = [[@(kRootFS) stringByAppendingString:contents]
+        stringByAppendingPathComponent:@"Info.plist"];
+    NSDictionary *info = [NSDictionary dictionaryWithContentsOfFile:plistPath];
+    // Runtime-confirmed 2026-09-13: official Geekbench 6.7.1's GPU-name
+    // query throws fmt::format_error without an actual Metal device. The
+    // existing native AGX launch contract completes sysinfo and the full CPU
+    // benchmark. Supply that contract, not a fake device/name or a patched
+    // benchmark. Other applications keep their validated rendering profiles.
+    BOOL native = [info[@"CFBundleIdentifier"] isEqual:@"com.primatelabs.Geekbench6"];
+    if (native)
+        HostLog(@"launch-metal-profile executable=%@ bundle=%@ native=YES",
+                rootPath, info[@"CFBundleIdentifier"]);
+    return native;
+}
+
 static BOOL LaunchRootExecutable(const char *identifier,
                                  NSString *rootPath,
                                  const char *logPath,
@@ -3258,6 +3347,8 @@ static BOOL LaunchRootExecutable(const char *identifier,
         }
     }
 
+    if (!PrepareSystemApplicationCode(rootPath, message)) return NO;
+
     posix_spawn_file_actions_t actions;
     posix_spawn_file_actions_init(&actions);
     int logFD = open(logPath, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
@@ -3309,11 +3400,13 @@ static BOOL LaunchRootExecutable(const char *identifier,
             return NO;
         }
         childEnvironment = ownedEnvironment;
-    } else if (strcmp(identifier, "glassdemo") == 0) {
+    } else if (strcmp(identifier, "glassdemo") == 0 ||
+               RootApplicationRequiresNativeMetal(rootPath)) {
         static const char *const nativeAGXEnvironment[] = {
             "MACWS_AGX_NATIVE=1",
             "MACWS_AGX_REGISTER_CLASSES=1",
             "MACWS_PIN_FALLBACK=1",
+            "MACWS_APP_MOUNT_COMPAT=1",
         };
         ownedEnvironment = CopyEnvironmentAdding(
             nativeAGXEnvironment,
@@ -3418,18 +3511,13 @@ static BOOL LaunchRootExecutable(const char *identifier,
             // while its valid metrics catalog stayed at entryCount=0 for more
             // than one minute.  A bare executable launch has no LaunchServices
             // AppleEvent to perform the ordinary Dock/open lifecycle.  Give a
-            // third-party app a short chance to publish its initial NSWindow,
-            // then deliver the real NSApplication reopen inside that owning
+            // third-party app a chance to publish its initial NSWindow while
+            // waiting for its endpoint, then deliver NSApplication reopen
             // process.  This is the same generic lifecycle used when reusing a
             // windowless process above, not an app-name exception or a
             // synthetic window-success witness.
-            NSTimeInterval initialWindowTimeout = MIN(timeout, 3.0);
-            windowReady = WaitForWindowMetrics(
-                pid, initialWindowTimeout, &exitStatus);
-            if (!windowReady && exitStatus < 0) {
-                windowReady = RequestApplicationReopen(
-                    pid, MAX(1.0, timeout - initialWindowTimeout));
-            }
+            windowReady = WaitForInitialApplicationWindow(pid, timeout,
+                                                           &exitStatus);
         } else {
             windowReady = WaitForWindowMetrics(pid, timeout, &exitStatus);
         }
@@ -3786,12 +3874,54 @@ static BOOL WaitForOpenDocumentAck(pid_t targetPID, uint64_t nonce,
     return accepted;
 }
 
+static NSString *ResolveImportedDocumentApplication(NSString *path,
+                                                     NSString **message) {
+    // Resolve inside macOS LaunchServices, not against iOS's file handlers.
+    // This subprocess only resolves; it must not call hostd while hostd waits.
+    NSString *output = [@"/tmp/macws-document-handler-"
+        stringByAppendingFormat:@"%@.plist", NSUUID.UUID.UUIDString];
+    NSString *hostOutput = [@(kRootFS) stringByAppendingString:output];
+    const char *arguments[] = {
+        "/var/jb/usr/bin/timeout", "-k", "2", "15",
+        "/var/jb/usr/macOS/bin/launchdchrootexec", "0", "0", kRootFS,
+        "/usr/local/bin/macwsworkspacectl", "resolve-document",
+        path.fileSystemRepresentation, output.fileSystemRepresentation, NULL
+    };
+    int result = RunCommand(arguments, YES);
+    NSDictionary *resolved = result == 0
+        ? [NSDictionary dictionaryWithContentsOfFile:hostOutput] : nil;
+    (void)unlink(hostOutput.fileSystemRepresentation);
+    NSString *application = [resolved[@"application_path"]
+        isKindOfClass:NSString.class] ? resolved[@"application_path"] : nil;
+    if (![resolved[@"document_path"] isEqual:path] ||
+        !application.isAbsolutePath) {
+        if (message) *message = @"macOS 没有找到此文件的打开方式；导入副本仍保留在 MacWS Imports 中";
+        return nil;
+    }
+    HostLog(@"open-in resolve document=%@ application=%@", path, application);
+    return application;
+}
+
 static BOOL OpenDocumentsRequest(xpc_object_t request, pid_t *targetPIDOut,
                                  NSString **message) {
     NSArray<NSString *> *paths = ValidatedDocumentPaths(request, message);
     if (!paths) return NO;
     const char *applicationPath = xpc_dictionary_get_string(
         request, MACWS_CONTROL_KEY_APP_PATH);
+    NSString *resolvedApplication = nil;
+    if (!applicationPath || !*applicationPath) {
+        // Open-In submits one imported document per transaction. Finder's
+        // existing explicit-app, multi-document transaction is unchanged.
+        if (paths.count != 1 ||
+            ![paths.firstObject hasPrefix:@"/Users/Shared/MacWS Imports/"]) {
+            if (message) *message = @"自动打开方式仅接受一个已导入的文稿";
+            return NO;
+        }
+        resolvedApplication = ResolveImportedDocumentApplication(
+            paths.firstObject, message);
+        if (!resolvedApplication) return NO;
+        applicationPath = resolvedApplication.fileSystemRepresentation;
+    }
     if (!LaunchRequestedPath(applicationPath, YES, message)) return NO;
     os_unfair_lock_lock(&gStateLock);
     pid_t targetPID = gActiveAppPID;
@@ -5534,11 +5664,9 @@ static BOOL CopyProviderFileForHost(NSString *sourcePath,
         return NO;
     }
     struct stat sourceStat = {0};
-    static const off_t maximumBytes = 64 * 1024 * 1024;
     if (fstat(sourceFD, &sourceStat) != 0 ||
-        !S_ISREG(sourceStat.st_mode) || sourceStat.st_size < 0 ||
-        sourceStat.st_size > maximumBytes) {
-        int savedErrno = errno ?: EFBIG;
+        !S_ISREG(sourceStat.st_mode) || sourceStat.st_size < 0) {
+        int savedErrno = errno ?: EINVAL;
         close(sourceFD);
         if (message) *message = [NSString stringWithFormat:
             @"提供器文件类型或大小不受支持（errno=%d）", savedErrno];
@@ -5546,7 +5674,7 @@ static BOOL CopyProviderFileForHost(NSString *sourcePath,
     }
 
     int destinationFD = open(destinationPath.fileSystemRepresentation,
-        O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
+        O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
     if (destinationFD < 0) {
         int savedErrno = errno;
         close(sourceFD);
@@ -5555,38 +5683,13 @@ static BOOL CopyProviderFileForHost(NSString *sourcePath,
         return NO;
     }
 
-    BOOL copied = YES;
-    int savedErrno = 0;
     uint64_t total = 0;
-    uint8_t buffer[128 * 1024];
-    while (copied) {
-        ssize_t count = read(sourceFD, buffer, sizeof(buffer));
-        if (count == 0) break;
-        if (count < 0) {
-            if (errno == EINTR) continue;
-            copied = NO;
-            savedErrno = errno;
-            break;
-        }
-        ssize_t offset = 0;
-        while (offset < count) {
-            ssize_t written = write(destinationFD, buffer + offset,
-                                    (size_t)(count - offset));
-            if (written < 0 && errno == EINTR) continue;
-            if (written <= 0) {
-                copied = NO;
-                savedErrno = written < 0 ? errno : EIO;
-                break;
-            }
-            offset += written;
-            total += (uint64_t)written;
-        }
-    }
-    if (copied && fsync(destinationFD) != 0) {
+    BOOL copied = MacWSCopyStableRegularFile(sourceFD, destinationFD, &total) == 0;
+    int savedErrno = copied ? 0 : errno;
+    if (close(destinationFD) != 0 && copied) {
         copied = NO;
         savedErrno = errno;
     }
-    close(destinationFD);
     close(sourceFD);
     if (!copied) {
         unlink(destinationPath.fileSystemRepresentation);

@@ -35,6 +35,7 @@
 #import "macws_host_protocol.h"
 #import "macws_control_protocol.h"
 #import "macws_steam_mach_rendezvous_protocol.h"
+#include "macws_agx_compute_abi.h"
 
 // These macOS code-signing entry points are present in the iPadOS shared
 // cache and used by Ventura's CoreLocationAgent, but the iPhoneOS SDK omits
@@ -3068,6 +3069,9 @@ static void macws_schedule_uttype_coretypes_compatibility(void) {
 static id (*g_macws_orig_settings_symbol_image)(id, SEL, CGSize, double);
 static id (*g_macws_orig_settings_concrete_icon_image)(id, SEL, id);
 static id (*g_macws_orig_graphic_variant_with_options)(id, SEL, id);
+static CGImageRef (*g_macws_orig_settings_variant_raster)(id, SEL, double, CGSize);
+static __thread id g_macws_settings_raster_descriptor;
+static __thread BOOL g_macws_settings_recipe_rendered;
 static __thread BOOL g_macws_rendering_settings_symbol;
 static __thread BOOL g_macws_rendering_settings_concrete_icon;
 static __thread BOOL g_macws_capturing_settings_graphic_variant;
@@ -3323,6 +3327,45 @@ static CGImageRef macws_create_settings_graphic_recipe_image(
     return result;
 }
 
+// Compose at CoreUI's final raster boundary, not AFTER the stock software-GL
+// compositor has rendered a second image. Runtime 2026-09-12 Settings samples
+// enter ISGraphicSymbolResource -> CI::GLContext::quad ->
+// glvmInterpretFPTransformFourInner on the main thread. All upstream resource,
+// descriptor and vector-variant resolution remains Apple's own transaction.
+static CGImageRef macws_settings_variant_raster(id self, SEL selector,
+                                                double scale, CGSize size) {
+    id descriptor = g_macws_settings_raster_descriptor;
+    CGRect contentRect = CGRectZero;
+    CGFloat corner = 0;
+    if (descriptor && isfinite(scale) && scale > 0 && scale <= 8 &&
+        isfinite(size.width) && isfinite(size.height) &&
+        size.width * scale <= 4096 && size.height * scale <= 4096 &&
+        macws_settings_graphic_variant_geometry(self, size, &contentRect, &corner)) {
+        // Prevent source rasterization/nested lookups inheriting the outer
+        // recipe. Only this exact final graphic-variant operation owns it.
+        g_macws_settings_raster_descriptor = nil;
+        CGImageRef source = macws_copy_settings_graphic_variant_source_image(
+            self, scale, contentRect.size);
+        CGImageRef background = NULL;
+        SEL backgroundSelector = sel_registerName("_createBackgroundImageOfSize:scale:");
+        if (!macws_settings_resolved_color(descriptor, "resolvedEnclosureColors") &&
+            [self respondsToSelector:backgroundSelector])
+            background = ((CGImageRef (*)(id, SEL, CGSize, double))objc_msgSend)(
+                self, backgroundSelector, size, scale);
+        CGImageRef result = source ? macws_create_settings_graphic_recipe_image(
+            descriptor, self, background, source, size, contentRect, corner, scale) : NULL;
+        if (background) CGImageRelease(background);
+        if (source) CGImageRelease(source);
+        g_macws_settings_raster_descriptor = descriptor;
+        if (result) {
+            g_macws_settings_recipe_rendered = YES;
+            return result; // same owned CGImage contract as CoreUI's rasterizer
+        }
+    }
+    return g_macws_orig_settings_variant_raster
+        ? g_macws_orig_settings_variant_raster(self, selector, scale, size) : NULL;
+}
+
 static id macws_settings_symbol_image(id self, SEL selector,
                                       CGSize size, double scale) {
     // IFSymbol's source-glyph lookup may consult another
@@ -3339,10 +3382,23 @@ static id macws_settings_symbol_image(id self, SEL selector,
         g_macws_captured_settings_graphic_variant = NULL;
     }
     g_macws_capturing_settings_graphic_variant = YES;
+    Ivar rasterDescriptorIvar = class_getInstanceVariable(object_getClass(self), "_descriptor");
+    g_macws_settings_raster_descriptor = rasterDescriptorIvar
+        ? object_getIvar(self, rasterDescriptorIvar) : nil;
+    g_macws_settings_recipe_rendered = NO;
     id image = g_macws_orig_settings_symbol_image
         ? g_macws_orig_settings_symbol_image(self, selector, size, scale)
         : nil;
+    g_macws_settings_raster_descriptor = nil;
     g_macws_capturing_settings_graphic_variant = NO;
+    if (image && g_macws_settings_recipe_rendered) {
+        if (g_macws_captured_settings_graphic_variant) {
+            CFRelease(g_macws_captured_settings_graphic_variant);
+            g_macws_captured_settings_graphic_variant = NULL;
+        }
+        g_macws_rendering_settings_symbol = NO;
+        return image; // retain Apple's IFImage wrapper and resource cache
+    }
     id graphicVariant = (__bridge id)
         g_macws_captured_settings_graphic_variant;
     SEL cgImageSelector = sel_registerName("CGImage");
@@ -3470,11 +3526,10 @@ static id macws_settings_symbol_image(id self, SEL selector,
 
 static id macws_settings_concrete_icon_image(id self, SEL selector,
                                               id imageDescriptor) {
-    id image = g_macws_orig_settings_concrete_icon_image
-        ? g_macws_orig_settings_concrete_icon_image(
-              self, selector, imageDescriptor) : nil;
     if (g_macws_rendering_settings_concrete_icon || !self ||
-        !imageDescriptor) return image;
+        !imageDescriptor)
+        return g_macws_orig_settings_concrete_icon_image
+            ? g_macws_orig_settings_concrete_icon_image(self, selector, imageDescriptor) : nil;
     g_macws_rendering_settings_concrete_icon = YES;
 
     SEL providerSelector = sel_registerName("makeSymbolResourceProvider");
@@ -3529,7 +3584,11 @@ static id macws_settings_concrete_icon_image(id self, SEL selector,
         fflush(stderr);
     }
     g_macws_rendering_settings_concrete_icon = NO;
-    return replacement ?: image;
+    // Do not synchronously generate a placeholder which is then discarded.
+    // Non-graphic providers and failed real-resource resolution retain the
+    // complete original path, including its error/placeholder semantics.
+    return replacement ?: (g_macws_orig_settings_concrete_icon_image
+        ? g_macws_orig_settings_concrete_icon_image(self, selector, imageDescriptor) : nil);
 }
 
 static void macws_install_settings_symbol_raster_compatibility(void) {
@@ -3539,6 +3598,12 @@ static void macws_install_settings_symbol_raster_compatibility(void) {
     Method method = resourceClass
         ? class_getInstanceMethod(resourceClass, selector) : NULL;
     if (!method || g_macws_orig_settings_symbol_image) return;
+    Class graphicClass = objc_getClass("_CUIGraphicVariantVectorGlyph");
+    SEL rasterSelector = sel_registerName("rasterizeImageUsingScaleFactor:forTargetSize:");
+    Method rasterMethod = graphicClass ? class_getInstanceMethod(graphicClass, rasterSelector) : NULL;
+    if (rasterMethod && !g_macws_orig_settings_variant_raster)
+        g_macws_orig_settings_variant_raster = (CGImageRef (*)(id, SEL, double, CGSize))
+            method_setImplementation(rasterMethod, (IMP)macws_settings_variant_raster);
     Class vectorGlyphClass = objc_getClass("CUINamedVectorGlyph");
     SEL variantSelector = sel_registerName("graphicVariantWithOptions:");
     Method variantMethod = vectorGlyphClass
@@ -7692,6 +7757,12 @@ static BOOL macws_vnc_pointer_proxy_record_valid(
         record->x >= record->frameWidth ||
         record->y >= record->frameHeight) return NO;
     switch ((MacWSInputKind)record->kind) {
+        case MacWSInputKindScroll: {
+            float horizontal = 0.0f;
+            memcpy(&horizontal, &record->contactID, sizeof(horizontal));
+            return isfinite(horizontal) && fabsf(horizontal) <= 16384.0f &&
+                isfinite(record->pressure) && fabsf(record->pressure) <= 16384.0f;
+        }
         case MacWSInputKindTouchDown:
         case MacWSInputKindTouchMove:
         case MacWSInputKindTouchUp:
@@ -7730,6 +7801,51 @@ static CGPoint macws_vnc_pointer_proxy_quartz_point(
         bounds.origin.x + normalizedX * bounds.size.width,
         bounds.origin.y + normalizedY * bounds.size.height,
     };
+}
+
+// RE: the installed OSXvnc handleMouseButtons: posts pixel-unit CGEvents at
+// __TEXT+0x9e68..0x9ec0. Its root-only Host endpoint previously accepted only
+// mouse buttons, so a Launchpad finger swipe could never reach that wheel
+// boundary. Use the fixed-arity constructor (the cross-image variadic ABI
+// differs) and preserve the complete native scroll/momentum transaction.
+static BOOL macws_vnc_proxy_scroll(MacWSInputRecord record, CGPoint point) {
+    typedef CFTypeRef (*CreateScroll)(CFTypeRef, uint32_t, uint32_t,
+                                      int32_t, int32_t, int32_t);
+    typedef void (*SetInteger)(CFTypeRef, uint32_t, int64_t);
+    typedef void (*SetLocation)(CFTypeRef, CGPoint);
+    typedef void (*PostEvent)(uint32_t, CFTypeRef);
+    static CreateScroll createScroll;
+    static SetInteger setInteger;
+    static SetLocation setLocation;
+    static PostEvent postEvent;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        createScroll = (CreateScroll)dlsym(RTLD_DEFAULT,
+            "CGEventCreateScrollWheelEvent2");
+        setInteger = (SetInteger)dlsym(RTLD_DEFAULT,
+            "CGEventSetIntegerValueField");
+        setLocation = (SetLocation)dlsym(RTLD_DEFAULT, "CGEventSetLocation");
+        postEvent = (PostEvent)dlsym(RTLD_DEFAULT, "CGEventPost");
+    });
+    if (!createScroll || !setInteger || !setLocation || !postEvent) return NO;
+    float horizontal = 0.0f;
+    memcpy(&horizontal, &record.contactID, sizeof(horizontal));
+    CFTypeRef event = createScroll(NULL, 0 /* pixel */, 2,
+        (int32_t)lrintf(record.pressure), (int32_t)lrintf(horizontal), 0);
+    if (!event) return NO;
+    uint32_t phase = (record.flags & MacWSInputFlagScrollBegan) ? 1 :
+        (record.flags & MacWSInputFlagScrollChanged) ? 2 :
+        (record.flags & MacWSInputFlagScrollEnded) ? 4 :
+        (record.flags & MacWSInputFlagScrollCancelled) ? 8 : 0;
+    BOOL momentum = (record.flags & MacWSInputFlagScrollMomentum) != 0;
+    setLocation(event, point);
+    setInteger(event, 88 /* continuous */, 1);
+    setInteger(event, 99 /* CG scroll phase */, momentum ? 0 : phase);
+    setInteger(event, 123 /* CG momentum phase */,
+        momentum ? (phase >= 4 ? 3 : phase) : 0);
+    postEvent(1 /* kCGSessionEventTap */, event);
+    CFRelease(event);
+    return YES;
 }
 
 static void *macws_vnc_pointer_proxy_listener(void *unused) {
@@ -7804,6 +7920,14 @@ static void *macws_vnc_pointer_proxy_listener(void *unused) {
         int32_t firstResult = 0;
         int32_t secondResult = 0;
         switch ((MacWSInputKind)record.kind) {
+            case MacWSInputKindScroll:
+                // Scroll cannot cancel an unrelated held mouse button.
+                if (leftDown) continue;
+                if (record.flags & MacWSInputFlagScrollBegan)
+                    (void)postMouse(point, true, 3, false, false, false);
+                (void)macws_vnc_proxy_scroll(record, point);
+                macws_vnc_note_interaction();
+                continue;
             case MacWSInputKindTouchDown:
                 // A replacement contact is a real device-boundary recovery:
                 // release the prior button before starting the new stream.
@@ -18438,11 +18562,12 @@ static unsigned macws_translate_agx_segment_list_records(
         encoded_length >= 0x20 &&
         (size_t)encoded_length + 0x18 == segment_length;
     // The general single-direct path is intentionally handled by the linear
-    // walker.  Admit only the exact flag-gated Stray shape-3 A/B here because
-    // its all-ones core uses the reduction-family deletion at +0x1d0, while
-    // the older linear predicate recognizes only the distinct {1, all-ones}
-    // sentinel at +0x1dc.  The full list still has to yield one unique range
-    // below before any byte can be changed.
+    // walker.  The all-ones resource family is different: it uses the
+    // reduction-family deletion at +0x1d0, while the older linear predicate
+    // recognizes only the distinct {1, all-ones} sentinel at +0x1dc.  Admit
+    // its fully anchored producer family here so the structured walker still
+    // has to validate the one variable-size resource entry, exact [0,total)
+    // range and complete list consumption before any byte can be changed.
     static const unsigned char stray_subtype3_all_ones[12] = {
         0xff, 0xff, 0xff, 0xff,
         0xff, 0xff, 0xff, 0xff,
@@ -18564,26 +18689,29 @@ static unsigned macws_translate_agx_segment_list_records(
         *(uint32_t *)(commands + 0x21c) == 0x50 &&
         *(uint32_t *)(commands + 0x220) == 3 &&
         *(uint32_t *)(commands + 0x224) == 0x1000002;
-    // Runtime-confirmed producer invariant across every Stray subtype-3
-    // all-ones member captured so far (modes 1, 2, 4, 5, 6 and 0x10;
-    // resource topologies 3/5/7/8): the macOS complete span is exactly the
+    // Runtime-confirmed producer invariant across every captured subtype-3
+    // all-ones member (modes 1, 2, 4, 5, 6 and 0x10; resource topologies
+    // 3/5/7/8/9): the macOS complete span is exactly the
     // 0x1f8-byte core plus a 0x18-aligned resource trailer.  Paired iOS-native
     // controls for modes 1, 2 and 0x10 retain that trailer and omit only the
     // zero [0x1d0,0x1e0) producer-version window, yielding a 0x1e8-byte core.
     //
     // This family invariant replaces topology-by-topology admission for a
     // direct one-record list while retaining every independent framing/core
-    // anchor.  It remains scoped to the explicit Stray compatibility switch.
-    uint32_t stray_direct_subtype3_trailer = total >= 0x28
+    // anchor.  Geekbench 6.7.1 supplied an independent resources=9/mode=6
+    // command-buffer A/B: flag-enabled admission removed status 00000103 and
+    // all eight unmodified workload validators passed.  This establishes the
+    // layout as a producer ABI family, not a Stray-only behavior.
+    uint32_t direct_subtype3_resource_trailer = total >= 0x28
         ? *(uint32_t *)(commands + 0x24) : 0;
-    uint32_t stray_direct_subtype3_mode = total >= 0x1f8
+    uint32_t direct_subtype3_resource_mode = total >= 0x1f8
         ? *(uint32_t *)(commands + 0x1f4) : 0;
-    BOOL stray_direct_subtype3_all_ones_family =
-        macws_stray_agx_compat_enabled() && direct_list && count == 1 &&
+    BOOL direct_subtype3_all_ones_resource_family_without_opcode =
+        direct_list && count == 1 &&
         total >= 0x210 && total <= 0x800 &&
-        stray_direct_subtype3_trailer >= 0x18 &&
-        (stray_direct_subtype3_trailer % 0x18) == 0 &&
-        total == (size_t)0x1f8 + stray_direct_subtype3_trailer &&
+        direct_subtype3_resource_trailer >= 0x18 &&
+        (direct_subtype3_resource_trailer % 0x18) == 0 &&
+        total == (size_t)0x1f8 + direct_subtype3_resource_trailer &&
         *(uint32_t *)(commands + 0x00) == 0x10000 &&
         *(uint32_t *)(commands + 0x04) == total &&
         *(uint32_t *)(commands + 0x28) == 0x1e8 &&
@@ -18597,9 +18725,45 @@ static unsigned macws_translate_agx_segment_list_records(
                sizeof(stray_subtype3_all_ones)) == 0 &&
         *(uint32_t *)(commands + 0x1ec) == 0 &&
         *(uint32_t *)(commands + 0x1f0) == 0 &&
-        stray_direct_subtype3_mode >= 1 &&
-        stray_direct_subtype3_mode <= 0x10 &&
+        direct_subtype3_resource_mode >= 1 &&
+        direct_subtype3_resource_mode <= 0x10 &&
         *(uint32_t *)(commands + 0x1fc) == 0x15;
+    BOOL direct_subtype3_all_ones_resource_family =
+        direct_subtype3_all_ones_resource_family_without_opcode &&
+        *(uint32_t *)(commands + 0x08) == 4;
+    if (macws_kcmd_stray_subtype3_diag_enabled() &&
+        direct_subtype3_all_ones_resource_family_without_opcode &&
+        !direct_subtype3_all_ones_resource_family) {
+        static _Atomic unsigned direct_opcode_near_miss_sequence;
+        unsigned observation = atomic_fetch_add_explicit(
+            &direct_opcode_near_miss_sequence, 1,
+            memory_order_relaxed) + 1;
+        if (observation <= 128) {
+            fprintf(stderr,
+                "#### AGX-KCMD-SUBTYPE3-OPCODE-NEAR-MISS observation=%u "
+                "framing=direct total=%#zx opcode=%#x mode=%u "
+                "resources=%u/%#x trailer=%#x\n",
+                observation, total,
+                *(uint32_t *)(commands + 0x08),
+                direct_subtype3_resource_mode,
+                *(uint32_t *)(commands + 0x120),
+                *(uint32_t *)(commands + 0x128),
+                direct_subtype3_resource_trailer);
+        }
+    }
+    // The 11/6 mode-2 topology has an independently byte-paired helper below,
+    // but resource topology is not part of the producer-version delta.  The
+    // exact Geekbench error artifact (PID 42191, serial 971) is another fully
+    // structured mode-2 member: 0x228 bytes, resources 8/0x12, opcode 4, the
+    // same zero [0x1d0,0x1e0) window and every all-ones-family anchor above.
+    // Excluding mode 2 here left that valid macOS record untouched (fixed=0),
+    // immediately followed by MTLCommandBufferErrorDomain 00000103.  Admit
+    // the structurally validated family regardless of resource topology; the
+    // structured-list walk below still has to validate all thirteen resource
+    // entries, their three groups and the exact [0,0x228) range before the
+    // producer-only window is removed.
+    BOOL direct_subtype3_resource_compat =
+        direct_subtype3_all_ones_resource_family;
     // Runtime-confirmed by Stray PID 75296's NSError-bearing command buffer,
     // submit serial 103757 (2026-08-23).  The fixed-memory flight recorder
     // matched descriptor 0 and retained the complete, untruncated artifacts:
@@ -18624,6 +18788,10 @@ static unsigned macws_translate_agx_segment_list_records(
         *(uint32_t *)(commands + 0x2c) == 0x3c0 &&
         *(uint32_t *)(commands + 0x30) == 0x30 &&
         *(uint32_t *)(commands + 0x34) == 2;
+    BOOL direct_trailerless_compute = direct_list && count == 1 &&
+        MacWSAGXIsTrailerlessCompute(commands, total);
+    BOOL direct_mode2_resource_compute = direct_list && count == 1 &&
+        MacWSAGXIsMode2ComputeWithResourceTrailer(commands, total);
     // Runtime-confirmed by VS Code 1.130 Aquarium submit serial 155 on
     // 2026-07-30: the direct list contains 69 individually well-framed,
     // uniquely ranged records (KCMD length 0xee60, list length 0x3cf0).  The
@@ -18639,7 +18807,9 @@ static unsigned macws_translate_agx_segment_list_records(
           !stray_direct_subtype3_shape_5_diag &&
           !stray_direct_subtype3_shape_7_diag &&
           !stray_direct_subtype3_shape_7_mode_5_diag &&
-          !stray_direct_subtype3_all_ones_family &&
+          !direct_subtype3_resource_compat &&
+          !direct_trailerless_compute &&
+          !direct_mode2_resource_compute &&
           !direct_subtype2_record) ||
          (!direct_list && !trailing_wrapper_list)))
         return 0;
@@ -18649,6 +18819,7 @@ static unsigned macws_translate_agx_segment_list_records(
     uint32_t wrapper_type = 0;
     uint32_t wrapper_opcode = 0;
     uint32_t list_generation = 0;
+    BOOL structured_compute_list = NO;
     if (!fragmented_list) {
     // The runtime Objective-C type encoding for IOGPUSegmentListHeader gives
     // each direct-list entry a fixed 0x20-byte header followed by groupCount
@@ -18667,7 +18838,9 @@ static unsigned macws_translate_agx_segment_list_records(
     // each record's own type/span agreeing.  Unknown list layouts still fall
     // through to the older ID-sequence and conservative unique-search paths.
     BOOL structured_direct_list = direct_list &&
-        (count >= 2 || direct_subtype2_record);
+        (count >= 2 || direct_subtype2_record || direct_trailerless_compute ||
+         direct_mode2_resource_compute ||
+         direct_subtype3_resource_compat);
     size_t structured_entry_offset = 0x10;
     uint32_t structured_command_cursor = 0;
     for (uint32_t i = 0; structured_direct_list && i < count; i++) {
@@ -18720,6 +18893,8 @@ static unsigned macws_translate_agx_segment_list_records(
          structured_command_cursor != total)) {
         structured_direct_list = NO;
     }
+    structured_compute_list = structured_direct_list;
+    if (direct_trailerless_compute && !structured_compute_list) return 0;
 
     // Runtime-confirmed by two independent Stray NSError-matched submissions.
     // Serial 9606 has 42 fixed 0xe0-byte entries.  After that batch passed,
@@ -19019,31 +19194,13 @@ static unsigned macws_translate_agx_segment_list_records(
             macws_submit_bytes_are_zero(record + 0x1cc, 0x10) &&
             memcmp(record + 0x1dc, subtype3_sentinel,
                    sizeof(subtype3_sentinel)) == 0;
-        // Paired native control for the first stage of
-        // MPSImageStatisticsMean (the sum_rgba_columns/rows transition
-        // reduction).  WindowServer emitted a two-segment macOS command whose
-        // first subtype-3 record is 0x228 bytes and has a mode-2 dword at
-        // +0x1f4.  Unlike the previously captured compute/scale variant, this
-        // producer has no leading 1 before its twelve-byte all-ones sentinel:
-        // the macOS bytes are zero through +0x1df and the sentinel starts at
-        // +0x1e0.  The public iOS-native MPSImageStatisticsMean control
-        // completed status=4/error=nil with a 0x218-byte record.  Deleting the
-        // macOS-only zero window at +0x1d0 and normalizing the three size
-        // fields makes 502/536 bytes identical; every residual difference is
-        // outside the removed window and remains untouched.  Admit only that
-        // exact independently observed framing rather than weakening the
-        // existing generic sentinel contract.
-        int subtype3_reduction_anchors = span == 0x228 &&
-            *(uint32_t *)(record + 0x00) == 0x10000 &&
-            *(uint32_t *)(record + 0x04) == 0x228 &&
-            *(uint32_t *)(record + 0x28) == 0x1e8 &&
-            *(uint32_t *)(record + 0x2c) == 0x1b8 &&
-            *(uint32_t *)(record + 0x30) == 0x30 &&
-            *(uint32_t *)(record + 0x34) == 3 &&
-            subtype3_mode == 2 &&
-            macws_submit_bytes_are_zero(record + 0x1cc, 0x14) &&
-            memcmp(record + 0x1e0, subtype3_reduction_sentinel,
-                   sizeof(subtype3_reduction_sentinel)) == 0;
+        // The exact mode-2/resource-trailer producer is shared by the
+        // previously paired MPSImageStatisticsMean reduction and the focused
+        // MPSImageGaussianBlur reproduction above.  Keep its byte contract in
+        // one testable helper; the structured-list walker still validates all
+        // resource groups and the exact [start,end) range before mutation.
+        int subtype3_mode2_resource_compute =
+            MacWSAGXIsMode2ComputeWithResourceTrailer(record, span);
         // Runtime-confirmed UE4 compute-resource variant.  Stray's first
         // pipeline-compatible frame reached selector 0x1a and later completed
         // with MTLCommandBufferErrorDomain 0x103.  The matched flight record
@@ -19076,20 +19233,27 @@ static unsigned macws_translate_agx_segment_list_records(
             *(uint32_t *)(record + 0x1f0) == 0 &&
             *(uint32_t *)(record + 0x1f4) == 0x10 &&
             *(uint32_t *)(record + 0x1fc) == 0x15;
-        // Production-shape Stray producer invariant, scoped by
-        // MACWS_STRAY_AGX_COMPAT.  Across the independently captured
+        // macOS subtype-3 resource-record producer invariant.  Across the
+        // independently captured
         // 0x210/0x258/0x270/0x288/0x378 records, record+0x24 is always the
         // complete 0x18-aligned resource trailer size and
         // span == 0x1f8 + trailer.  The core, zero window, all-ones sentinel,
         // mode position and resource-count field are invariant while the
         // resource topology changes.  This is the upstream ABI boundary the
         // earlier exact predicates were discovering one member at a time.
-        uint32_t subtype3_stray_trailer = *(uint32_t *)(record + 0x24);
-        BOOL subtype3_stray_all_ones_family =
+        // Runtime-confirmed independently by Geekbench 6.7.1: submit serial
+        // 678 failed with MTLCommandBufferErrorDomain 00000103 on a matching
+        // 0x288 record (resources=9/0x62, mode=6).  Enabling this structured
+        // translation removed every 00000103 error, and a complete eight-
+        // workload run subsequently passed Geekbench's unmodified numeric
+        // validators.  The family therefore belongs at the producer ABI
+        // boundary rather than behind an application switch.
+        uint32_t subtype3_resource_trailer = *(uint32_t *)(record + 0x24);
+        BOOL subtype3_all_ones_resource_family_without_opcode =
             span >= 0x210 && span <= 0x800 &&
-            subtype3_stray_trailer >= 0x18 &&
-            (subtype3_stray_trailer % 0x18) == 0 &&
-            span == 0x1f8 + subtype3_stray_trailer &&
+            subtype3_resource_trailer >= 0x18 &&
+            (subtype3_resource_trailer % 0x18) == 0 &&
+            span == 0x1f8 + subtype3_resource_trailer &&
             *(uint32_t *)(record + 0x00) == 0x10000 &&
             *(uint32_t *)(record + 0x04) == span &&
             *(uint32_t *)(record + 0x28) == 0x1e8 &&
@@ -19105,6 +19269,29 @@ static unsigned macws_translate_agx_segment_list_records(
             *(uint32_t *)(record + 0x1f0) == 0 &&
             subtype3_mode >= 1 && subtype3_mode <= 0x10 &&
             *(uint32_t *)(record + 0x1fc) == 0x15;
+        BOOL subtype3_all_ones_resource_family =
+            subtype3_all_ones_resource_family_without_opcode &&
+            *(uint32_t *)(record + 0x08) == 4;
+        if (macws_kcmd_stray_subtype3_diag_enabled() &&
+            subtype3_all_ones_resource_family_without_opcode &&
+            !subtype3_all_ones_resource_family) {
+            static _Atomic unsigned opcode_near_miss_sequence;
+            unsigned observation = atomic_fetch_add_explicit(
+                &opcode_near_miss_sequence, 1,
+                memory_order_relaxed) + 1;
+            if (observation <= 128) {
+                fprintf(stderr,
+                    "#### AGX-KCMD-SUBTYPE3-OPCODE-NEAR-MISS "
+                    "observation=%u framing=structured segment=%u "
+                    "span=%#zx opcode=%#x mode=%u resources=%u/%#x "
+                    "trailer=%#x\n",
+                    observation, i, span,
+                    *(uint32_t *)(record + 0x08), subtype3_mode,
+                    *(uint32_t *)(record + 0x120),
+                    *(uint32_t *)(record + 0x128),
+                    subtype3_resource_trailer);
+            }
+        }
         // DIAGNOSTIC A/B for the first gameplay-frame batch after all exact
         // Stray metallibs compiled successfully.  The command-buffer getter
         // runtime-correlated NSError 00000103 to PID 69083, submit serial
@@ -19339,11 +19526,21 @@ static unsigned macws_translate_agx_segment_list_records(
              subtype3_stray_resource_shape_8_mode_16_49 ||
              subtype3_stray_resource_shape_7_mode_5 ||
              (macws_stray_agx_compat_enabled() &&
-              subtype3_stray_all_ones_family));
+              subtype3_all_ones_resource_family));
+        // The complete structural family is production-confirmed by both the
+        // native-iOS paired controls documented above and Geekbench's clean
+        // command/numeric A/B.  Exact Stray predicates remain only as flight-
+        // recorder diagnostics; they no longer gate the ABI translation.
+        int subtype3_resource_compat =
+            subtype3_all_ones_resource_family ||
+            subtype3_stray_resource_compat;
+        BOOL trailerless_compute = (fragmented_list || structured_compute_list) &&
+            MacWSAGXIsTrailerlessCompute(record, span);
         if (!subtype1_anchors && !subtype2_anchors && !subtype3_anchors &&
-            !subtype3_reduction_anchors &&
+            !subtype3_mode2_resource_compute &&
             !subtype3_ue4_resource_anchors &&
-            !subtype3_stray_resource_compat)
+            !trailerless_compute &&
+            !subtype3_resource_compat)
             continue;
 
         uint32_t shrink = subtype1_anchors ? 0x20 : 0x10;
@@ -19378,15 +19575,15 @@ static unsigned macws_translate_agx_segment_list_records(
             // every Aquarium mode-2 record carry the impossible {2,1}
             // mode/flag pair and the completed command buffer returned 0x103.
             size_t delete_offset =
-                (subtype3_mode == 2 || subtype3_ue4_resource_anchors ||
-                 subtype3_stray_resource_compat)
+                (subtype3_mode == 2 || trailerless_compute || subtype3_ue4_resource_anchors ||
+                 subtype3_resource_compat)
                     ? 0x1d0 : 0x1cc;
             memmove(record + delete_offset, record + delete_offset + 0x10,
                     total - ((size_t)start + delete_offset + 0x10));
             total -= 0x10;
             *(uint32_t *)(record + 0x28) = 0x1d8;
             *(uint32_t *)(record + 0x2c) = 0x1a8;
-            if (subtype3_stray_resource_compat &&
+            if (subtype3_resource_compat &&
                 macws_kcmd_stray_subtype3_diag_enabled()) {
                 fprintf(stderr,
                     "#### AGX-KCMD-STRAY-SUBTYPE3-DIAG #%u segment=%u "

@@ -6,6 +6,7 @@ ARCHS = arm64
 TARGET = iphone:clang:latest:16.0
 INSTALL_TARGET_PROCESSES = MacWSHost
 
+include ../config/production.mk
 include $(THEOS)/makefiles/common.mk
 
 APPLICATION_NAME = MacWSHost

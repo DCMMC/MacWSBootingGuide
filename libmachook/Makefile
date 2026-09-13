@@ -7,6 +7,7 @@ TARGET := iphone:clang:latest:14.0
 # the other compatible ARM64 subtype; loading both duplicates all hook state.
 # The macOS cross-compile (misc/build.sh) ships the fat binary unchanged.
 ARCHS = arm64 arm64e
+include ../config/production.mk
 include $(THEOS)/makefiles/common.mk
 
 LIBRARY_NAME = libmachook

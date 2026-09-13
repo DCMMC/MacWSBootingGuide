@@ -49,6 +49,8 @@
 #define MACWS_STREAM_KEY_SEQUENCE "sequence"
 #define MACWS_STREAM_KEY_DESCRIPTOR "descriptor"
 #define MACWS_STREAM_KEY_WINDOWS "windows"
+// Optional input-only WindowServer surfaces; never selectable iPad Scenes.
+#define MACWS_STREAM_KEY_SYSTEM_INPUT_WINDOWS "system-input-windows"
 #define MACWS_STREAM_KEY_WINDOW_LIMITS "window_limits"
 #define MACWS_STREAM_KEY_SURFACE_PORT "surface_port"
 #define MACWS_STREAM_KEY_SURFACE_ID "surface_id"

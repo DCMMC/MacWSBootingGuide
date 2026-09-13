@@ -892,7 +892,9 @@ static bool SendToVNCPointerProxy(int socketFD,
             sizeof(address.sun_path));
     bool continuous = record->kind == MacWSInputKindTouchMove ||
                       record->kind == MacWSInputKindHover ||
-                      record->kind == MacWSInputKindMenuHover;
+                      record->kind == MacWSInputKindMenuHover ||
+                      (record->kind == MacWSInputKindScroll &&
+                       (record->flags & MacWSInputFlagScrollChanged));
     unsigned attempts = continuous ? 1 : 2;
     ssize_t sent = -1;
     int savedError = 0;
@@ -1534,7 +1536,8 @@ int main(void) {
         bool fullscreenGlobalPointerRecord = record.targetPID > 1 &&
             exactWindowID == 0 &&
             (record.flags & MacWSInputFlagGlobalSystemSurface) != 0 &&
-            IsSystemPointerKind((MacWSInputKind)record.kind);
+            (IsSystemPointerKind((MacWSInputKind)record.kind) ||
+             record.kind == MacWSInputKindScroll);
         bool keyRecord = record.kind == MacWSInputKindKeyDown ||
                          record.kind == MacWSInputKindKeyUp;
         bool scrollRecord = record.kind == MacWSInputKindScroll;

@@ -1436,12 +1436,8 @@ run_watchdog() {
 # the SkyLight session port, leaving Dock and every AppKit client hung in
 # get_session_port. This bounded restore changes no binary or signature.
 BOOT_TRUSTCACHE_INFO=""
-BOOT_TRUSTCACHE_ADDED=0
-APPLICATION_TRUST_BOOT_MARKER="$LOGDIR/macws-application-trust.boot-ready"
-APPLICATION_TRUST_PROGRESS="$LOGDIR/macws-application-trust.progress"
-APPLICATION_TRUST_CLOSURE_VERSION=3
 BASE_TRUST_BOOT_MARKER="$LOGDIR/macws-base-trust.boot-ready"
-BASE_TRUST_CLOSURE_VERSION=5
+BASE_TRUST_CLOSURE_VERSION=6
 BASE_TRUST_READY=0
 WINDOWING_READY_WITNESS=/var/mobile/Library/Preferences/com.macwsguide.dense-grid.loaded
 WINDOWING_REQUIRED_VERSION=29
@@ -1506,10 +1502,15 @@ windowing_bridge_ready() {
     esac
     [ "$witness_version" -ge "$WINDOWING_REQUIRED_VERSION" ] || return 1
     [ "$witness_pid" = "$springboard_pid" ] || return 1
+    # Runtime-confirmed 2026-09-12: v59 was loaded in the current SpringBoard
+    # and had installed its observers, but the old implementation-description
+    # check rejected "initial=preactivation-lower-per-item-calculator". Every
+    # cold start then needlessly resprung and failed again. The initial-size
+    # wire protocol is the compatibility boundary, not the hook's prose name.
     grep -Fq \
         'fullscreen=exact-scene-activate-then-maximization-toggle-action-17' \
-        "$WINDOWING_READY_WITNESS" 2>/dev/null && grep -Fq \
-        'initial=preactivation-generic-app-layout-grid' \
+        "$WINDOWING_READY_WITNESS" 2>/dev/null && grep -Eq \
+        '(^|[[:space:]])initial-size-protocol=1([[:space:]]|$)' \
         "$WINDOWING_READY_WITNESS" 2>/dev/null
 }
 
@@ -1554,98 +1555,6 @@ ensure_windowing_bridge() {
     return 1
 }
 
-boot_trust_hash() {
-    local hash="$1"
-    [ -n "$hash" ] || return 0
-    if printf '%s\n' "$BOOT_TRUSTCACHE_INFO" |
-            /var/jb/usr/bin/grep -Fqi "$hash"; then
-        return 0
-    fi
-    /var/jb/usr/bin/jbctl trustcache add "$hash" >/dev/null 2>&1 || return 1
-    BOOT_TRUSTCACHE_INFO="${BOOT_TRUSTCACHE_INFO}
-$hash"
-    BOOT_TRUSTCACHE_ADDED=$((BOOT_TRUSTCACHE_ADDED + 1))
-}
-
-boot_trust_macho() {
-    local path="$1" arch="" hash=""
-    [ -f "$path" ] || return 0
-    for arch in arm64 arm64e; do
-        hash=$(/var/jb/usr/bin/ldid -arch "$arch" -h "$path" 2>/dev/null |
-            /var/jb/usr/bin/grep 'CDHash=' | /var/jb/usr/bin/cut -c8-)
-        [ -z "$hash" ] || boot_trust_hash "$hash" || return 1
-    done
-}
-
-# Emit every regular Mach-O/fat image in a tree as a NUL-delimited list.  Mode
-# bits are not a code witness: Valheim ships a real arm64 framework as 0644,
-# while Office marks many data resources executable.  Reading the four-byte
-# magic first keeps the later ldid work bounded to actual code.
-list_boot_macho_files() {
-    /var/jb/usr/bin/python3 -c '
-import os, stat, sys
-
-magics = {
-    b"\xfe\xed\xfa\xce", b"\xce\xfa\xed\xfe",
-    b"\xfe\xed\xfa\xcf", b"\xcf\xfa\xed\xfe",
-    b"\xca\xfe\xba\xbe", b"\xbe\xba\xfe\xca",
-    b"\xca\xfe\xba\xbf", b"\xbf\xba\xfe\xca",
-}
-for base, _, names in os.walk(sys.argv[1]):
-    for name in names:
-        path = os.path.join(base, name)
-        try:
-            mode = os.stat(path, follow_symlinks=False).st_mode
-            if not stat.S_ISREG(mode):
-                continue
-            with open(path, "rb") as stream:
-                if stream.read(4) not in magics:
-                    continue
-            os.write(1, os.fsencode(path) + b"\0")
-        except OSError:
-            pass
-' "$1"
-}
-
-# A completed-bundle checkpoint is reusable only while both the iPad boot and
-# the exact bundle tree are unchanged.  Walking metadata is much cheaper than
-# invoking ldid twice for every image; inode, size, mtime and ctime together
-# also invalidate the checkpoint when an updater replaces or rewrites code.
-bundle_trust_source_fingerprint() {
-    /var/jb/usr/bin/python3 -c '
-import hashlib, os, stat, sys
-
-magics = {
-    b"\xfe\xed\xfa\xce", b"\xce\xfa\xed\xfe",
-    b"\xfe\xed\xfa\xcf", b"\xcf\xfa\xed\xfe",
-    b"\xca\xfe\xba\xbe", b"\xbe\xba\xfe\xca",
-    b"\xca\xfe\xba\xbf", b"\xbf\xba\xfe\xca",
-}
-root = sys.argv[1]
-records = []
-for base, _, names in os.walk(root):
-    for name in names:
-        path = os.path.join(base, name)
-        try:
-            info = os.stat(path, follow_symlinks=False)
-            if not stat.S_ISREG(info.st_mode):
-                continue
-            with open(path, "rb") as stream:
-                if stream.read(4) not in magics:
-                    continue
-            records.append((os.path.relpath(path, root), info.st_ino,
-                            info.st_size, info.st_mtime_ns, info.st_ctime_ns))
-        except OSError:
-            pass
-digest = hashlib.sha256()
-for record in sorted(records):
-    digest.update(os.fsencode(record[0]))
-    for value in record[1:]:
-        digest.update(b"\0" + str(value).encode("ascii"))
-    digest.update(b"\n")
-print(digest.hexdigest())
-' "$1"
-}
 
 application_trust_thermally_safe() {
     if ! thermal_snapshot; then
@@ -1719,139 +1628,18 @@ base_trust_marker_value() {
     printf '%s' "$value"
 }
 
-# Restore the dependency closure of every already-signed third-party app once
-# per iPad boot.  Include Steam's updater-owned live bundle: unlike a normal
-# application it lives below ~/Library/Application Support rather than
-# /Applications. launchdchrootexec/autosignd can admit a main executable, but
-# dyld validates nested frameworks before either injected code path can run.
-# Runtime-confirmed after the 2026-08-13 reboot: Amadine stopped at Sparkle,
-# Word at Forms, and Excel/PowerPoint at ADAL4 with `code signature invalid`.
-# Runtime-confirmed after the 2026-08-17 userspace reboot: Steam's main image
-# was admitted, then dlopen rejected its updater-owned steamui.dylib with
-# `code signature invalid` because the old /Applications-only walk never
-# restored that live bundle's nested CodeDirectories. After restoring the
-# Steam bundle, the prepared Stray runtime main image CDHash
-# 31b7f2900e3979794b6150b5ba774837f5db1321 and libsteam_api CDHash
-# da197645eae103d2ec246c949d0b8b82a8afca11 were both absent from the rebooted
-# trustcache. Restoring them did not by itself resolve Steam AppError_49, but
-# it is still a required cold-launch invariant. Include every already-prepared
-# runtime shadow as well.
-# Their on-disk CodeDirectories were intact; only Dopamine's dynamic trustcache
-# entries had disappeared.  Never re-sign here, because that would mutate the
-# nested-code relationship.  A successful marker makes warm GUI restarts fast,
-# while kern.boottime invalidates it naturally after the next cold boot.
-restore_installed_application_trust() {
-    local boot_id="" marker_id="" marker_expected="" bundle="" path=""
-    local steam_live_bundle="" steam_runtime_root=""
-    local bundle_count=0 image_count=0
-    local progress_interval=50 next_progress=50 bundle_name=""
-    local progress_id="" progress_tmp="" bundle_fingerprint=""
-    local progress_entry="" image_entry=""
-    boot_id=$(boot_session_identifier)
-    marker_expected="v${APPLICATION_TRUST_CLOSURE_VERSION}:${boot_id}"
-    marker_id=$(sed -n '1p' "$APPLICATION_TRUST_BOOT_MARKER" 2>/dev/null || true)
-    if [ -n "$boot_id" ] && [ "$marker_id" = "$marker_expected" ]; then
-        log "Application trust closure already verified for this iPad boot."
-        return 0
-    fi
-
-    application_trust_thermally_safe || return 1
-    if [ -n "$boot_id" ]; then
-        progress_id=$(sed -n '1p' "$APPLICATION_TRUST_PROGRESS" \
-            2>/dev/null || true)
-        if [ "$progress_id" != "$marker_expected" ]; then
-            progress_tmp="${APPLICATION_TRUST_PROGRESS}.new.$$"
-            printf '%s\n' "$marker_expected" > "$progress_tmp" || return 1
-            mv -f "$progress_tmp" "$APPLICATION_TRUST_PROGRESS" || return 1
-        fi
-    else
-        rm -f "$APPLICATION_TRUST_PROGRESS"
-    fi
-
-    steam_live_bundle="$ROOTFS/Users/root/Library/Application Support/Steam/Steam.AppBundle/Steam"
-    steam_runtime_root="$ROOTFS/Users/root/Library/Application Support/Steam/steamapps/macws-runtime"
-    if [ -n "$boot_id" ] && [ "$marker_id" = "$boot_id" ]; then
-        # One-time v1 -> v2 migration: the legacy same-boot marker already
-        # proves /Applications was walked successfully. Restore only the two
-        # newly covered Steam locations, then publish the versioned marker.
-        log "Expanding the same-boot application trust closure for Steam runtime bundles."
-        set -- "$steam_live_bundle" "$steam_runtime_root"/*/*.app
-    else
-        set -- "$ROOTFS"/Applications/*.app "$steam_live_bundle" \
-            "$steam_runtime_root"/*/*.app
-    fi
-    for bundle in "$@"; do
-        [ -d "$bundle/Contents" ] || continue
-        bundle_count=$((bundle_count + 1))
-        bundle_name=${bundle##*/}
-        bundle_fingerprint=$(bundle_trust_source_fingerprint \
-            "$bundle/Contents") || return 1
-        progress_entry=$(printf 'bundle\t%s\t%s' \
-            "$bundle_fingerprint" "$bundle")
-        if [ -n "$boot_id" ] &&
-           /var/jb/usr/bin/grep -Fqx "$progress_entry" \
-                "$APPLICATION_TRUST_PROGRESS" 2>/dev/null; then
-            log "Application trust checkpoint reused: bundle=$bundle_count current=$bundle_name"
-            continue
-        fi
-        log "Restoring application trust: bundle=$bundle_count current=$bundle_name images=$image_count"
-        while IFS= read -r -d '' path; do
-            image_entry=$(printf 'image\t%s\t%s' \
-                "$bundle_fingerprint" "$path")
-            if [ -n "$boot_id" ] &&
-               /var/jb/usr/bin/grep -Fqx "$image_entry" \
-                    "$APPLICATION_TRUST_PROGRESS" 2>/dev/null; then
-                continue
-            fi
-            boot_trust_macho "$path" || return 1
-            image_count=$((image_count + 1))
-            if [ -n "$boot_id" ]; then
-                printf '%s\n' "$image_entry" >> \
-                    "$APPLICATION_TRUST_PROGRESS" || return 1
-            fi
-            if [ $((image_count % 25)) -eq 0 ]; then
-                application_trust_thermally_safe || return 1
-            fi
-            if [ "$image_count" -ge "$next_progress" ]; then
-                log "Application trust progress: images=$image_count current=$bundle_name"
-                next_progress=$((next_progress + progress_interval))
-            fi
-        done < <(list_boot_macho_files "$bundle/Contents")
-        if [ -n "$boot_id" ]; then
-            printf '%s\n' "$progress_entry" >> "$APPLICATION_TRUST_PROGRESS" ||
-                return 1
-        fi
-    done
-
-    if [ -n "$boot_id" ]; then
-        marker_tmp="${APPLICATION_TRUST_BOOT_MARKER}.new.$$"
-        printf '%s\n' "$marker_expected" > "$marker_tmp" || return 1
-        mv -f "$marker_tmp" "$APPLICATION_TRUST_BOOT_MARKER" || return 1
-    fi
-    rm -f "$APPLICATION_TRUST_PROGRESS"
-    log "Application trust closure ready (bundles=$bundle_count Mach-O images=$image_count)."
-}
-
 restore_cold_boot_trust() {
     local path="" marker_expected="" marker_tmp=""
+    local boot_trust_helper=/var/jb/usr/macOS/bin/macws_boot_trust.py
+    local boot_trust_cache="$ROOTFS/var/db/macws/boot-trust"
     BASE_TRUST_READY=0
     marker_expected=$(base_trust_marker_value 2>/dev/null || true)
-    if [ -n "$marker_expected" ] && [ -f "$BASE_TRUST_BOOT_MARKER" ] &&
-       [ "$(sed -n '1p' "$BASE_TRUST_BOOT_MARKER" 2>/dev/null)" = \
-         "$marker_expected" ]; then
-        BASE_TRUST_READY=1
-        restore_installed_application_trust || return 1
-        log "Base executable trust closure reused for this iPad boot."
-        return 0
-    fi
-    BOOT_TRUSTCACHE_INFO=$(/var/jb/usr/bin/jbctl trustcache info 2>/dev/null || true)
-    BOOT_TRUSTCACHE_ADDED=0
-
-    # Exact Ventura 13.4 arm64e shared-cache CodeDirectories. dyld reports
-    # "code signature registration for shared cache failed" without them.
-    boot_trust_hash b5da39409492ac85e5a8e8ab618fe77e2d7a2980 || return 1
-    boot_trust_hash bbb765988e2677b98d47a549d612fa0d4af25f69 || return 1
-
+    [ -f "$boot_trust_helper" ] || {
+        log "ERROR: packaged CodeDirectory trust reader is missing."
+        return 1
+    }
+    application_trust_thermally_safe || return 1
+    set --
     for path in \
         /var/jb/usr/macOS/bin/launchdchrootexec \
         /var/jb/usr/macOS/lib/libmachook.dylib \
@@ -1911,7 +1699,7 @@ restore_cold_boot_trust() {
         "$ROOTFS/usr/local/bin/macwsdisplayd" \
         "$ROOTFS/usr/local/bin/macwsinteropd" \
         "$ROOTFS/usr/local/bin/macwsworkspacectl"; do
-        boot_trust_macho "$path" || return 1
+        set -- "$@" "$path"
     done
 
     # Preview is linked against Hydra before libmachook/autosignd can run.
@@ -1922,22 +1710,37 @@ restore_cold_boot_trust() {
     # tree, so the reboot repair must restore the same dependency closure.
     # Scan only Mach-O headers and re-register existing signatures; never
     # re-sign the framework or alter its nested-code relationship.
-    while IFS= read -r -d '' path; do
-        boot_trust_macho "$path" || return 1
-    done < <(list_boot_macho_files \
-        "$ROOTFS/System/Library/PrivateFrameworks/Hydra.framework")
+    set -- "$@" "$ROOTFS/System/Library/PrivateFrameworks/Hydra.framework"
 
     quicklook_display_root="$ROOTFS/System/Library/Frameworks/QuickLookUI.framework/Versions/A/PlugIns"
     for quicklook_display_bundle in "$quicklook_display_root"/*.qldisplay; do
         [ -d "$quicklook_display_bundle" ] || continue
         quicklook_display_name=${quicklook_display_bundle##*/}
         quicklook_display_name=${quicklook_display_name%.qldisplay}
-        boot_trust_macho \
-            "$quicklook_display_bundle/Contents/MacOS/$quicklook_display_name" || \
-            return 1
+        set -- "$@" "$quicklook_display_bundle/Contents/MacOS/$quicklook_display_name"
     done
 
-    restore_installed_application_trust || return 1
+    # Restore the COMPLETE old application closure, not just the default
+    # Terminal. Delaying Office/Steam trust until the first click would merely
+    # move the cold-start stall to app launch. The reader validates inode,
+    # size, mtime and ctime on every run, also catching same-boot app updates.
+    # Runtime 2026-09-12: old shell walk cost 452 s for 1067 images; even an
+    # uncached bounded reader scans the full application roots in 72 s.
+    for path in "$ROOTFS"/Applications/*.app \
+        "$ROOTFS/Users/root/Library/Application Support/Steam/Steam.AppBundle/Steam" \
+        "$ROOTFS/Users/root/Library/Application Support/Steam/steamapps/macws-runtime"/*/*.app; do
+        [ ! -d "$path/Contents" ] || set -- "$@" "$path/Contents"
+    done
+    # Exact Ventura shared-cache CodeDirectories remain required. The native
+    # backend uses the same verified libjailbreak API as jbctl, one process,
+    # and checks actual live membership after registering missing hashes.
+    /var/jb/usr/bin/python3 "$boot_trust_helper" \
+        --manifest "$boot_trust_cache/hashes.json" \
+        --resource-index "$boot_trust_cache/resources.sqlite" \
+        --thermal-tool /var/jb/usr/macOS/bin/macwsthermal \
+        --hash b5da39409492ac85e5a8e8ab618fe77e2d7a2980 \
+        --hash bbb765988e2677b98d47a549d612fa0d4af25f69 \
+        "$@" || return 1
     if [ -n "$marker_expected" ]; then
         marker_tmp="${BASE_TRUST_BOOT_MARKER}.new.$$"
         printf '%s\n' "$marker_expected" > "$marker_tmp" || return 1
@@ -1945,7 +1748,7 @@ restore_cold_boot_trust() {
         mv -f "$marker_tmp" "$BASE_TRUST_BOOT_MARKER" || return 1
     fi
     BASE_TRUST_READY=1
-    log "Cold-boot trust closure ready (registered=$BOOT_TRUSTCACHE_ADDED existing CodeDirectories)."
+    log "Cold-boot trust closure ready (complete dependency closure; live membership verified)."
 }
 
 # True if a macOS binary can actually run in the chroot right now.
@@ -5577,6 +5380,16 @@ case "$CMD" in
         ;;
     status)
         status
+        ;;
+    windowing-status)
+        # Read-only acceptance of the same predicate used by cold start.
+        # In particular this must not refresh/restart SpringBoard.
+        if windowing_bridge_ready; then
+            log "WINDOWING-READY: current SpringBoard PID, bridge version, fullscreen capability and initial-size protocol verified."
+        else
+            log "WINDOWING-NOT-READY: current SpringBoard does not match the required bridge protocol."
+            exit 1
+        fi
         ;;
     trust)
         # Non-disruptive cold-boot repair/audit entry point.  It changes no
