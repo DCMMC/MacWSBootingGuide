@@ -118,12 +118,21 @@ class HardwareKeyboardContractTests(unittest.TestCase):
         self.assertIn(helper, POSTINST)
         self.assertIn(helper, DEBIAN_POSTINST)
 
-    def test_neofetch_skips_only_runtime_empty_default_probes(self):
+    def test_neofetch_uses_single_process_fast_path(self):
         self.assertIn(
-            "neofetch --disable packages resolution theme icons term "
-            "term_font gpu",
+            "alias neofetch='command /usr/local/bin/macws-neofetch'",
             CLI_CONFIG,
         )
+        fast_source = (ROOT / "macwsneofetch" / "main.c").read_text()
+        self.assertIn('"/opt/local/bin/neofetch"', fast_source)
+        self.assertIn('host_statistics64', fast_source)
+        self.assertIn('sysctlbyname("kern.boottime"', fast_source)
+        self.assertIn("macws-neofetch", POSTINST)
+        self.assertIn("macws-neofetch", DEBIAN_POSTINST)
+        root_makefile = (ROOT / "Makefile").read_text()
+        self.assertIn("macwsneofetch", root_makefile)
+        build_on_ios = (ROOT / "misc" / "build_on_ios.sh").read_text()
+        self.assertIn("macwsworkspacectl macwsneofetch", build_on_ios)
 
 
 if __name__ == "__main__":

@@ -69,7 +69,7 @@ if [ "$FAST" = "1" ] && [ "$FAST_FORCE" != "1" ]; then
                      MacWSHost MacWSCatalystLauncher \
                      SettingsExtensionMetadata misc/PingMTLCompilerService \
                      macwsinputd macwsdisplayd macwsinteropd \
-                     macwsworkspacectl launchservicesd \
+                     macwsworkspacectl macwsneofetch launchservicesd \
                      Makefile control layout \
                      -type f -newer "$MARKER" 2>/dev/null \
                 | grep -v '/\._' | head -3)

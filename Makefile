@@ -8,7 +8,7 @@ include $(THEOS)/makefiles/common.mk
 SUBPROJECTS += MTLCompilerBypassOSCheck MacWSWindowing MacWSCatalystLaunch MTLSimDriverHost launchdchrootexec autosignd macwsallocd macwshostd macwscontrolprobe macwskeychaind macwsthermal macwslocationd mountdevfs ViewBridgeChrootProxy HIServicesChrootProxy OpenAndSavePanelChrootProxy QuickLookUIServiceChrootProxy DockHelperChrootProxy ExtensionKitChrootProxy SettingsExtensionChrootProxy FileCoordinationChrootProxy FileCoordinationMachBridge GeodChrootProxy WriteConfigChrootProxy LocationdChrootProxy mtl_keepalive MacWSHost MacWSCatalystLauncher SettingsExtensionMetadata misc/PingMTLCompilerService
 SUBPROJECTS += macwsairtools
 # macOS subprojects
-SUBPROJECTS += launchservicesd libmachook macwsinputd macwsdisplayd macwsinteropd macwsworkspacectl
+SUBPROJECTS += launchservicesd libmachook macwsinputd macwsdisplayd macwsinteropd macwsworkspacectl macwsneofetch
 
 include $(THEOS_MAKE_PATH)/aggregate.mk
 

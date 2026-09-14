@@ -981,7 +981,7 @@ if ! /var/jb/usr/bin/grep -aFq 'register-settings-extensions' \
 	echo 'ERROR: installed macwsworkspacectl lacks the all-settings startup contract.' >&2
 	exit 1
 fi
-for bridge in macwsdisplayd macwsinteropd macwsworkspacectl; do
+for bridge in macwsdisplayd macwsinteropd macwsworkspacectl macws-neofetch; do
 	if [ -f "/var/jb/usr/macOS/bin/$bridge" ]; then
 		rm -f "/var/mnt/rootfs/usr/local/bin/$bridge"
 		cp -vf "/var/jb/usr/macOS/bin/$bridge" "/var/mnt/rootfs/usr/local/bin/$bridge"

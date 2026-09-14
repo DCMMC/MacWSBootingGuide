@@ -541,7 +541,7 @@ if [ -d "$ROOTFS/System/Library" ]; then
         "$ROOTFS/usr/local/lib/libmachook.dylib" || exit 1
     install_chroot_runtime "$LIBMACHOOK_ARM64" \
         "$ROOTFS/usr/local/lib/libmachook_arm64.dylib" || exit 1
-    for bridge in macwsinputd macwsdisplayd macwsinteropd macwsworkspacectl; do
+    for bridge in macwsinputd macwsdisplayd macwsinteropd macwsworkspacectl macws-neofetch; do
         install_chroot_runtime "/var/jb/usr/macOS/bin/$bridge" \
             "$ROOTFS/usr/local/bin/$bridge" || exit 1
     done
