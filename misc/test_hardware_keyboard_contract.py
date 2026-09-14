@@ -18,6 +18,9 @@ HOSTD = (ROOT / "macwshostd" / "main.m").read_text()
 EXEC_HOOKS = (ROOT / "libmachook" / "exec_hooks.c").read_text()
 POSTINST = (ROOT / "layout" / "usr" / "macOS" / "bin" /
             "postinst.sh").read_text()
+DEBIAN_POSTINST = (ROOT / "layout" / "DEBIAN" / "postinst").read_text()
+CLI_CONFIG = (ROOT / "layout" / "usr" / "macOS" / "bin" /
+              "configure_terminal_cli.sh").read_text()
 
 
 class HardwareKeyboardContractTests(unittest.TestCase):
@@ -109,14 +112,17 @@ class HardwareKeyboardContractTests(unittest.TestCase):
     def test_managed_cli_path_precedes_legacy_usr_local(self):
         preferred = "/opt/local/bin:/opt/local/sbin:/usr/local/bin"
         self.assertIn(f'"PATH={preferred}:"', EXEC_HOOKS)
-        self.assertIn(f"export PATH={preferred}:", POSTINST)
-        self.assertIn("TERMINAL_CLI_ENV_MARKER", POSTINST)
+        self.assertIn(f"export PATH={preferred}:", CLI_CONFIG)
+        self.assertIn("TERMINAL_CLI_ENV_MARKER", CLI_CONFIG)
+        helper = "bash /var/jb/usr/macOS/bin/configure_terminal_cli.sh"
+        self.assertIn(helper, POSTINST)
+        self.assertIn(helper, DEBIAN_POSTINST)
 
     def test_neofetch_skips_only_runtime_empty_default_probes(self):
         self.assertIn(
             "neofetch --disable packages resolution theme icons term "
             "term_font gpu",
-            POSTINST,
+            CLI_CONFIG,
         )
 
 

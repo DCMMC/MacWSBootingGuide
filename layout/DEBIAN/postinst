@@ -720,6 +720,11 @@ if [ -d "$ROOTFS/System/Library" ]; then
     # secondary QuartzCore library remains installed. Provision and validate
     # it here so the first GUI launch after dpkg is never the repair boundary.
     bash /var/jb/usr/macOS/bin/ensure_metal2metal_compat.sh || exit 1
+    # A full package install runs this maintainer script directly; it does not
+    # run the separate deep postinst.sh. Establish the same interactive CLI
+    # invariant here after the package payload has been synchronized. The
+    # helper appends one managed block without replacing user shell settings.
+    bash /var/jb/usr/macOS/bin/configure_terminal_cli.sh "$ROOTFS" || exit 1
     echo 'Synchronized package runtime into the mounted macOS rootfs.'
 else
     echo 'macOS rootfs is not mounted; chroot runtime sync deferred.'
