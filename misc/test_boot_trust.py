@@ -190,6 +190,7 @@ class BootTrustTests(unittest.TestCase):
         method = script.split('restore_cold_boot_trust() {', 1)[1].split('\n}', 1)[0]
         for required in ('Hydra.framework', 'steamapps/macws-runtime',
                          '/Applications/*.app', 'launchservicesd.dylib',
+                         'opt/local/libexec/macws-cursor',
                          '--resource-index', '--manifest'):
             self.assertIn(required, method)
         self.assertLess(method.index('"$@" || return 1'),

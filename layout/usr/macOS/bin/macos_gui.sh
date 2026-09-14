@@ -1438,7 +1438,7 @@ run_watchdog() {
 # get_session_port. This bounded restore changes no binary or signature.
 BOOT_TRUSTCACHE_INFO=""
 BASE_TRUST_BOOT_MARKER="$LOGDIR/macws-base-trust.boot-ready"
-BASE_TRUST_CLOSURE_VERSION=6
+BASE_TRUST_CLOSURE_VERSION=7
 BASE_TRUST_READY=0
 WINDOWING_READY_WITNESS=/var/mobile/Library/Preferences/com.macwsguide.dense-grid.loaded
 WINDOWING_REQUIRED_VERSION=29
@@ -1712,6 +1712,16 @@ restore_cold_boot_trust() {
     # Scan only Mach-O headers and re-register existing signatures; never
     # re-sign the framework or alter its nested-code relationship.
     set -- "$@" "$ROOTFS/System/Library/PrivateFrameworks/Hydra.framework"
+
+    # Cursor Agent loads signed native Node add-ons with dlopen after its
+    # already-trusted Node executable has started. Dopamine's dynamic
+    # trustcache is reboot-volatile, so autosignd's exec hook cannot repair
+    # those non-exec loads. Runtime-confirmed on the 2026-09-15 cold boot:
+    # merkle-tree-napi.darwin-arm64.node failed with "code signature invalid"
+    # until macws_boot_trust restored the 20 existing CodeDirectories under
+    # this bounded installation root. Restore the signatures without
+    # re-signing or modifying Cursor's nested-code resources.
+    set -- "$@" "$ROOTFS/opt/local/libexec/macws-cursor"
 
     quicklook_display_root="$ROOTFS/System/Library/Frameworks/QuickLookUI.framework/Versions/A/PlugIns"
     for quicklook_display_bundle in "$quicklook_display_root"/*.qldisplay; do

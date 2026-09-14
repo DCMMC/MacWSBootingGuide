@@ -290,7 +290,7 @@ static selected_env_t env_select_insert(char *const envp[], const char *path) {
         selected.items[out++] = "USER=root";
         selected.items[out++] = "SHELL=/bin/bash";
         selected.items[out++] =
-            "PATH=/usr/local/bin:/opt/local/bin:/opt/local/sbin:"
+            "PATH=/opt/local/bin:/opt/local/sbin:/usr/local/bin:"
             "/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin";
     }
     selected.items[out++] = selected.insert_entry;

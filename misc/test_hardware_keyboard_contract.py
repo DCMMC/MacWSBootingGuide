@@ -15,6 +15,9 @@ APP_INPUT = (ROOT / "libmachook" / "AppInputBridge.m").read_text()
 INPUTD = (ROOT / "macwsinputd" / "main.c").read_text()
 MAC_HOOKS = (ROOT / "libmachook" / "mac_hooks.m").read_text()
 HOSTD = (ROOT / "macwshostd" / "main.m").read_text()
+EXEC_HOOKS = (ROOT / "libmachook" / "exec_hooks.c").read_text()
+POSTINST = (ROOT / "layout" / "usr" / "macOS" / "bin" /
+            "postinst.sh").read_text()
 
 
 class HardwareKeyboardContractTests(unittest.TestCase):
@@ -102,6 +105,19 @@ class HardwareKeyboardContractTests(unittest.TestCase):
         for signal_name in ("SIGINT", "SIGQUIT", "SIGTSTP", "SIGTTIN",
                             "SIGTTOU"):
             self.assertIn(signal_name, HOSTD)
+
+    def test_managed_cli_path_precedes_legacy_usr_local(self):
+        preferred = "/opt/local/bin:/opt/local/sbin:/usr/local/bin"
+        self.assertIn(f'"PATH={preferred}:"', EXEC_HOOKS)
+        self.assertIn(f"export PATH={preferred}:", POSTINST)
+        self.assertIn("TERMINAL_CLI_ENV_MARKER", POSTINST)
+
+    def test_neofetch_skips_only_runtime_empty_default_probes(self):
+        self.assertIn(
+            "neofetch --disable packages resolution theme icons term "
+            "term_font gpu",
+            POSTINST,
+        )
 
 
 if __name__ == "__main__":

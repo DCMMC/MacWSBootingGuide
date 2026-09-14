@@ -53,6 +53,22 @@ class PopupAndProbeBoundaries(unittest.TestCase):
         delivery = DISPLAY.split("static void DeliverFinalComposite(", 1)[1].split("static CGDisplayStreamRef", 1)[0]
         self.assertIn("PublishFrame(client, nil, record.completionTime", delivery)
 
+    def test_indirect_pointer_can_dismiss_popup_without_click_through(self):
+        self.assertIn(
+            "record.kind == MacWSInputKindTouchDown &&\n"
+            "            record.source == MacWSInputSourceIndirectPointer",
+            INPUT,
+        )
+        self.assertIn("MacWSPopupDismissPointerActive = YES", INPUT)
+        self.assertIn(
+            "record.contactID == MacWSPopupDismissPointerContact", INPUT)
+        self.assertIn(
+            "record.sceneID == MacWSPopupDismissPointerScene", INPUT)
+        self.assertLess(
+            INPUT.index("if (matchingTerminal)"),
+            INPUT.index("Class screenClass = objc_getClass(\"NSScreen\")"),
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

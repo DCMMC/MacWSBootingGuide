@@ -295,6 +295,14 @@ static BOOL MacWSExactSystemPointerActive;
 static uint32_t MacWSExactSystemPointerContact;
 static uint32_t MacWSExactSystemPointerWindow;
 static CGRect MacWSExactSystemPointerMappingFrame;
+// Main-thread-only. A physical indirect-pointer click outside an open AppKit
+// menu is delivered as separate TouchDown/TouchUp records, unlike the atomic
+// Tap used by direct touch and VNC. If the down cancels the native menu
+// tracker, consume its matching terminal record as the tracker itself would;
+// otherwise that up can leak through to the base window underneath the menu.
+static BOOL MacWSPopupDismissPointerActive;
+static uint32_t MacWSPopupDismissPointerContact;
+static uint64_t MacWSPopupDismissPointerScene;
 static NSString *MacWSRuntimeString(const char *utf8);
 
 static BOOL MacWSRuntimeDiagnosticsEnabled(void) {
@@ -7223,6 +7231,32 @@ static void MacWSPostInputOnMainThread(MacWSInputRecord record) {
         return;
     }
 
+    // UIKit emits a hardware-pointer primary click as a stateful pair. The
+    // down may have been consumed below solely to close a synchronous native
+    // menu. Balance that exact contact without clicking the newly exposed
+    // base view; a different new down retires a stale pair defensively.
+    if (MacWSPopupDismissPointerActive) {
+        BOOL matchingTerminal =
+            record.source == MacWSInputSourceIndirectPointer &&
+            record.contactID == MacWSPopupDismissPointerContact &&
+            record.sceneID == MacWSPopupDismissPointerScene &&
+            (record.kind == MacWSInputKindTouchUp ||
+             record.kind == MacWSInputKindTouchCancel);
+        if (matchingTerminal) {
+            MacWSPopupDismissPointerActive = NO;
+            MacWSPopupDismissPointerContact = 0;
+            MacWSPopupDismissPointerScene = 0;
+            MacWSSetAppInputGestureWindow(nil);
+            MacWSClearDeferredRFBMoveEvents();
+            return;
+        }
+        if (record.kind == MacWSInputKindTouchDown) {
+            MacWSPopupDismissPointerActive = NO;
+            MacWSPopupDismissPointerContact = 0;
+            MacWSPopupDismissPointerScene = 0;
+        }
+    }
+
     Class screenClass = objc_getClass("NSScreen");
     Class eventClass = objc_getClass("NSEvent");
     if (!screenClass || !eventClass) {
@@ -8290,9 +8324,13 @@ static void MacWSPostInputOnMainThread(MacWSInputRecord record) {
         } else {
             routedToTransientWindow = window != requestedBaseWindow;
         }
+        BOOL indirectPrimaryDown =
+            record.kind == MacWSInputKindTouchDown &&
+            record.source == MacWSInputSourceIndirectPointer;
         if (!routedToTransientWindow &&
             (record.kind == MacWSInputKindTap ||
-             record.kind == MacWSInputKindSecondaryTap)) {
+             record.kind == MacWSInputKindSecondaryTap ||
+             indirectPrimaryDown)) {
             outsidePopupWindow = MacWSOutsidePopupWindow(
                 application, requestedBaseWindow, screenPoint);
         }
@@ -8319,8 +8357,12 @@ static void MacWSPostInputOnMainThread(MacWSInputRecord record) {
                 getpid(), screenPoint.x, screenPoint.y);
         return;
     }
-    if (outsidePopupWindow && record.kind == MacWSInputKindTap &&
-        !MacWSLegacySystemMousePoster()) {
+    BOOL indirectPopupDismissDown = outsidePopupWindow &&
+        record.kind == MacWSInputKindTouchDown &&
+        record.source == MacWSInputSourceIndirectPointer;
+    if (outsidePopupWindow &&
+        ((record.kind == MacWSInputKindTap &&
+          !MacWSLegacySystemMousePoster()) || indirectPopupDismissDown)) {
         NSInteger popupWindowNumber = ((MacWSMsgInteger)objc_msgSend)(
             outsidePopupWindow, sel_registerName("windowNumber"));
         Class menuWindowClass = objc_getClass("NSMenuWindowManagerWindow");
@@ -8358,6 +8400,11 @@ static void MacWSPostInputOnMainThread(MacWSInputRecord record) {
             dismissed = down && up;
         }
         if (dismissed) {
+            if (indirectPopupDismissDown) {
+                MacWSPopupDismissPointerActive = YES;
+                MacWSPopupDismissPointerContact = record.contactID;
+                MacWSPopupDismissPointerScene = record.sceneID;
+            }
             if (MacWSRuntimeDiagnosticsEnabled()) {
                 fprintf(stderr,
                     "#### APP-INPUT POPUP-OUTSIDE pid=%d base=%u popup=%ld "

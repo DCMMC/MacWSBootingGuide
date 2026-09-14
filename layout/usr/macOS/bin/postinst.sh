@@ -1498,6 +1498,26 @@ do
 done
 echo '[INFO] Terminal shells now source /Users/root/.bashrc'
 
+# Keep project-managed MacPorts CLIs ahead of old one-off installations in
+# /usr/local/bin. In particular, /usr/local/bin/claude can be an obsolete
+# standalone binary while /opt/local/bin/claude is the current, compatibility-
+# wrapped release. The same block gives interactive neofetch its unchanged
+# visible output without spending roughly two seconds probing seven fields
+# that are unavailable in this chroot (runtime A/B on 2026-09-15: 5.16 s ->
+# 3.09 s, byte-identical 310-byte output). `command neofetch` remains an
+# explicit escape hatch for the unfiltered upstream probe set.
+TERMINAL_USER_BASHRC="$ROOTFS/Users/root/.bashrc"
+TERMINAL_CLI_ENV_MARKER='# MacWS: managed CLI environment v1'
+mkdir -p "$(dirname "$TERMINAL_USER_BASHRC")"
+if ! grep -Fq "$TERMINAL_CLI_ENV_MARKER" "$TERMINAL_USER_BASHRC" 2>/dev/null; then
+	{
+		printf '\n%s\n' "$TERMINAL_CLI_ENV_MARKER"
+		printf 'export PATH=/opt/local/bin:/opt/local/sbin:/usr/local/bin:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/bin:/bin:/usr/sbin:/sbin\n'
+		printf "alias neofetch='command /opt/local/bin/neofetch --disable packages resolution theme icons term term_font gpu'\n"
+	} >> "$TERMINAL_USER_BASHRC"
+fi
+echo '[INFO] Terminal CLI priority and fast neofetch profile are installed'
+
 # Core shell / execution helpers
 sign_and_trustcache "$ROOTFS/bin/sh"
 sign_and_trustcache "$ROOTFS/bin/chmod"
