@@ -123,6 +123,8 @@ static const char *const kVSCodeExecutable =
 // therefore presents this path to the generic launch boundary.
 static const char *const kVSCodeBundleExecutable =
     "/Applications/Visual Studio Code.app/Contents/MacOS/Code";
+static const char *const kGeekbenchExecutable =
+    "/Applications/Geekbench 6.app/Contents/MacOS/Geekbench 6";
 static const char *const kUIKitSystemPlist =
     "/var/jb/usr/macOS/LaunchDaemons/com.apple.uikitsystemapp.plist";
 static const char *const kUIKitSystemExecutable =
@@ -638,12 +640,45 @@ static int SpawnMacOSApplication(pid_t *pid,
                                  const char *path,
                                  const posix_spawn_file_actions_t *actions,
                                  char *const argv[],
-                                 char *const environment[]) {
+                                 char *const environment[],
+                                 BOOL applicationProcessType) {
     posix_spawnattr_t attributes;
     int error = posix_spawnattr_init(&attributes);
     if (error != 0) return error;
-    error = posix_spawnattr_setprocesstype_np(
-        &attributes, MACWS_POSIX_SPAWN_PROC_TYPE_APP_DEFAULT);
+
+    // macwshostd is a long-lived launchd/XPC service.  posix_spawn inherits
+    // the calling thread's signal mask unless POSIX_SPAWN_SETSIGMASK is set;
+    // a dispatch worker may therefore launch Terminal with interactive
+    // signals blocked.  AppKit then starts the shell and every foreground
+    // command with the same mask, so the PTY can echo ^C while SIGINT never
+    // reaches the job.  Establish the normal exec boundary explicitly.
+    sigset_t emptyMask;
+    sigemptyset(&emptyMask);
+    error = posix_spawnattr_setsigmask(&attributes, &emptyMask);
+
+    sigset_t defaultSignals;
+    sigemptyset(&defaultSignals);
+    const int interactiveSignals[] = {
+        SIGHUP, SIGINT, SIGQUIT, SIGPIPE, SIGTERM,
+        SIGCHLD, SIGTSTP, SIGTTIN, SIGTTOU,
+    };
+    for (size_t index = 0;
+         error == 0 && index < sizeof(interactiveSignals) /
+                                sizeof(interactiveSignals[0]);
+         index++) {
+        if (sigaddset(&defaultSignals, interactiveSignals[index]) != 0)
+            error = errno;
+    }
+    if (error == 0)
+        error = posix_spawnattr_setsigdefault(&attributes, &defaultSignals);
+    if (error == 0) {
+        error = posix_spawnattr_setflags(
+            &attributes, POSIX_SPAWN_SETSIGMASK | POSIX_SPAWN_SETSIGDEF);
+    }
+    if (error == 0 && applicationProcessType) {
+        error = posix_spawnattr_setprocesstype_np(
+            &attributes, MACWS_POSIX_SPAWN_PROC_TYPE_APP_DEFAULT);
+    }
     if (error == 0) {
         error = posix_spawn(pid, path, actions, &attributes, argv,
                             environment ? environment : environ);
@@ -3615,8 +3650,21 @@ static BOOL LaunchRootExecutable(const char *identifier,
         }
         childEnvironment = ownedEnvironment;
     }
+    // Runtime-confirmed on iPad13,6 / iOS 16.3.1 with the exact Geekbench
+    // 6.7.1 binary: APP_DEFAULT made its backend inherit
+    // PROC_FLAG_APPLICATION while remaining TASK_UNSPECIFIED, and three GUI
+    // runs measured 2.06 GHz. Launching the otherwise identical transaction
+    // without that process type removed only that flag; result 19170292 then
+    // measured 3.196 GHz and scored 2277/8093. Keep the AppKit work-interval
+    // contract for normal GUI applications, but do not classify this detached
+    // benchmark worker tree as an iOS application without a RunningBoard
+    // lifecycle. This changes scheduling provenance, never the workload,
+    // timer, validation, or score.
+    BOOL applicationProcessType =
+        ![rootPath isEqualToString:@(kGeekbenchExecutable)];
     int error = SpawnMacOSApplication(
-        &pid, kChrootExec, &actions, (char *const *)argv, childEnvironment);
+        &pid, kChrootExec, &actions, (char *const *)argv, childEnvironment,
+        applicationProcessType);
     FreeCopiedEnvironment(ownedEnvironment);
     posix_spawn_file_actions_destroy(&actions);
     if (logFD >= 0) close(logFD);

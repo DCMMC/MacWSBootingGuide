@@ -1555,6 +1555,41 @@ int main(void) {
         bool systemGestureRecord =
             record.kind == MacWSInputKindSystemGesture;
         bool gestureRecord = scrollRecord || magnifyRecord || rotateRecord;
+        uint32_t keyModifiers = keyRecord
+            ? MacWSInputModifiersForScene(record.sceneID) : 0;
+        bool nativeKeyboardProxyRecord = keyRecord &&
+            record.targetPID > 1 &&
+            (record.source == MacWSInputSourceHardwareKeyboard ||
+             (record.source == MacWSInputSourceSoftwareKeyboard &&
+              (record.contactID >= 0xff00u ||
+               (keyModifiers & (0x40000u | 0x80000u | 0x100000u)) != 0)));
+        if (nativeKeyboardProxyRecord) {
+            int proxyError = 0;
+            bool proxySent = SendToVNCPointerProxy(
+                socketFD, &record, &proxyError);
+            if (proxySent) {
+                sequence++;
+                if (RuntimeDiagnosticsEnabled()) {
+                    fprintf(stderr,
+                        "MACWS-INPUT KEYBOARD-PROXY seq=%llu kind=%s "
+                        "pid=%d window=%u keycode=%u keysym=%#x\n",
+                        (unsigned long long)sequence,
+                        KindName((MacWSInputKind)record.kind),
+                        record.targetPID, exactWindowID,
+                        (unsigned)llround(record.pressure), record.contactID);
+                    fflush(stderr);
+                }
+                continue;
+            }
+            if (RuntimeDiagnosticsEnabled()) {
+                fprintf(stderr,
+                    "MACWS-INPUT KEYBOARD-PROXY kind=%s pid=%d "
+                    "sent=NO errno=%d fallback=app-input\n",
+                    KindName((MacWSInputKind)record.kind),
+                    record.targetPID, proxyError);
+                fflush(stderr);
+            }
+        }
         if (fullscreenGlobalPointerRecord) {
             int proxyError = 0;
             bool proxySent = SendToVNCPointerProxy(

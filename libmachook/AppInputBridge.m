@@ -5187,6 +5187,26 @@ static NSString *MacWSCharactersApplyingCapsLock(NSString *characters,
     return [NSString stringWithCharacters:&transformed length:1];
 }
 
+static NSString *MacWSCharactersApplyingControl(NSString *characters,
+                                                 NSUInteger modifiers) {
+    // UIKeyCommand reports the physical printable input plus its modifier,
+    // whereas an AppKit NSEvent's `characters` carries the corresponding
+    // terminal control scalar and `charactersIgnoringModifiers` retains the
+    // printable key. Preserve that distinction for the UIKeyCommand fallback
+    // as well as the on-screen modifier row. UIPresses that already supplied
+    // a control scalar pass through unchanged.
+    if ((modifiers & (1u << 18)) == 0 || characters.length != 1)
+        return characters;
+    unichar scalar = [characters characterAtIndex:0];
+    if (scalar < 0x20 || scalar == 0x7f) return characters;
+    if (scalar >= 'a' && scalar <= 'z') scalar -= 'a' - 'A';
+    if (scalar == '?') scalar = 0x7f;
+    else if (scalar == ' ') scalar = 0;
+    else if (scalar >= '@' && scalar <= '_') scalar &= 0x1f;
+    else return characters;
+    return [NSString stringWithCharacters:&scalar length:1];
+}
+
 // RE-confirmed via the installed arm64 OSXvnc-server: its
 // sendKeyEvent:down:modifiers: creates a CGEvent, posts it at vncTapLocation,
 // then polls CGEventSourceFlagsState every 10 ms for as long as 250 ms.
@@ -5240,8 +5260,18 @@ static BOOL MacWSPostKeyRecord(MacWSInputRecord record, id application,
     }
     NSUInteger modifiers = (NSUInteger)
         MacWSInputModifiersForScene(record.sceneID);
-    NSString *characters = MacWSCharactersApplyingCapsLock(
-        MacWSCharactersForRFBKeySym(keySym, NO), modifiers);
+    // Runtime-confirmed on Terminal pid 92892 with the same keyCode=8,
+    // keysym='c', Control flag, target window and 80-ms down/up interval:
+    // without kCGEventFlagMaskNonCoalesced (0x100), `/bin/sleep 60` remained
+    // alive; adding only 0x100 produced ^C and terminated that exact child.
+    // OSXvnc already sets this bit on every physical key. UIKit's Host path
+    // must provide the same hardware-event contract so AppKit/Terminal does
+    // not coalesce a synthetic modifier chord away.
+    modifiers |= 0x100u;
+    NSString *characters = MacWSCharactersApplyingControl(
+        MacWSCharactersApplyingCapsLock(
+            MacWSCharactersForRFBKeySym(keySym, NO), modifiers),
+        modifiers);
     NSString *charactersIgnoring =
         MacWSCharactersForRFBKeySym(keySym, YES);
     NSUInteger eventType = record.kind == MacWSInputKindKeyDown ? 10 : 11;
@@ -5279,6 +5309,7 @@ static BOOL MacWSPostKeyRecord(MacWSInputRecord record, id application,
     // the exact target NSWindow number into AppKit's key-equivalent routing.
     // Ordinary typing retains the established CG-backed path.
     BOOL commandKeyEquivalent = (modifiers & 0x100000u) != 0;
+    BOOL controlModified = (modifiers & 0x40000u) != 0;
     BOOL canWrapCGEvent = keySym != 0xff1bu && !commandKeyEquivalent &&
         createKeyboardCGEvent && setCGEventFlags &&
         class_respondsToSelector(object_getClass(eventClass),
@@ -5293,7 +5324,14 @@ static BOOL MacWSPostKeyRecord(MacWSInputRecord record, id application,
                 setCGEventTimestamp(cgEvent,
                     (uint64_t)llround(record.timestamp * 1.0e9));
             NSUInteger characterCount = [characters length];
-            if (setCGEventUnicode && characterCount > 0 &&
+            // Runtime-confirmed with Terminal pids 87221 and 91825: forcing
+            // ETX into a Control-C CGEvent, and replacing that CGEvent with a
+            // factory NSEvent, both left the real `/bin/sleep` child alive.
+            // A hardware Control event carries the physical keycode + flag;
+            // CoreGraphics/AppKit derives its control scalar. Do not override
+            // that translation with an injected Unicode payload. Ordinary
+            // printable input keeps the established explicit Unicode route.
+            if (!controlModified && setCGEventUnicode && characterCount > 0 &&
                 characterCount <= 8) {
                 unichar unicode[8] = {0};
                 [characters getCharacters:unicode

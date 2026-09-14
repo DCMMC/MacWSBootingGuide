@@ -7753,6 +7753,8 @@ static CGPoint macws_vnc_secondary_down_point;
 // button-free motion can also enter a Carbon menu tracker when required.
 static double macws_vnc_menu_hover_until = 0.0;
 static _Atomic BOOL macws_vnc_pointer_proxy_started = NO;
+static uint32_t macws_vnc_proxy_explicit_modifiers;
+static uint32_t macws_vnc_proxy_synthetic_modifiers;
 
 static BOOL macws_vnc_forward_key(unsigned short keyCode, BOOL down,
                                   uint64_t modifiers, unsigned int keySym);
@@ -7778,8 +7780,6 @@ static BOOL macws_vnc_pointer_proxy_record_valid(
         const MacWSInputRecord *record) {
     if (!record || record->magic != MACWS_INPUT_MAGIC ||
         !MacWSInputVersionSupportsKind(record->version, record->kind) ||
-        (record->flags & MacWSInputFlagGlobalSystemSurface) == 0 ||
-        MacWSInputWindowIDForScene(record->sceneID) != 0 ||
         record->source == MacWSInputSourceVNC ||
         record->source > MacWSInputSourceMax ||
         record->frameWidth == 0 || record->frameHeight == 0 ||
@@ -7787,6 +7787,20 @@ static BOOL macws_vnc_pointer_proxy_record_valid(
         record->x < 0.0f || record->y < 0.0f ||
         record->x >= record->frameWidth ||
         record->y >= record->frameHeight) return NO;
+    if (record->kind == MacWSInputKindKeyDown ||
+        record->kind == MacWSInputKindKeyUp) {
+        if ((record->source != MacWSInputSourceHardwareKeyboard &&
+             record->source != MacWSInputSourceSoftwareKeyboard) ||
+            record->targetPID <= 1 || !isfinite(record->pressure) ||
+            record->pressure < 0.0f || record->pressure > UINT16_MAX ||
+            fabs((double)record->pressure - llround(record->pressure)) >
+                0.01)
+            return NO;
+        return record->contactID != 0;
+    }
+    if ((record->flags & MacWSInputFlagGlobalSystemSurface) == 0 ||
+        MacWSInputWindowIDForScene(record->sceneID) != 0)
+        return NO;
     switch ((MacWSInputKind)record->kind) {
         case MacWSInputKindScroll: {
             float horizontal = 0.0f;
@@ -7806,6 +7820,122 @@ static BOOL macws_vnc_pointer_proxy_record_valid(
         default:
             return NO;
     }
+}
+
+// Runtime-confirmed on iPad13,6 / Terminal pid 94422: process-local
+// CG-wrapped and factory NSEvents both left the exact `/bin/sleep 60` child
+// alive, while OSXvnc's real session CGEvent path produced ^C and terminated
+// it immediately. The proxy already owns that proven WindowServer event
+// session for global pointer input, so preserve the physical keycode and
+// AppKit-compatible flags here instead of fabricating a responder action.
+static uint32_t macws_vnc_proxy_modifier_for_keycode(uint16_t keyCode) {
+    switch (keyCode) {
+        case 56: case 60: return 0x20000u;  // Shift
+        case 59: case 62: return 0x40000u;  // Control
+        case 58: case 61: return 0x80000u;  // Option
+        case 54: case 55: return 0x100000u; // Command
+        default: return 0;
+    }
+}
+
+static BOOL macws_vnc_proxy_post_keyboard(uint16_t keyCode, BOOL down,
+                                           uint32_t modifiers,
+                                           double timestamp) {
+    typedef CFTypeRef (*CreateKeyboard)(CFTypeRef, unsigned short, bool);
+    typedef void (*SetFlags)(CFTypeRef, uint64_t);
+    typedef void (*SetTimestamp)(CFTypeRef, uint64_t);
+    typedef void (*PostEvent)(uint32_t, CFTypeRef);
+    static CreateKeyboard createKeyboard;
+    static SetFlags setFlags;
+    static SetTimestamp setTimestamp;
+    static PostEvent postEvent;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        createKeyboard = (CreateKeyboard)dlsym(
+            RTLD_DEFAULT, "CGEventCreateKeyboardEvent");
+        setFlags = (SetFlags)dlsym(RTLD_DEFAULT, "CGEventSetFlags");
+        setTimestamp = (SetTimestamp)dlsym(
+            RTLD_DEFAULT, "CGEventSetTimestamp");
+        postEvent = (PostEvent)dlsym(RTLD_DEFAULT, "CGEventPost");
+    });
+    if (!createKeyboard || !setFlags || !postEvent) return NO;
+    CFTypeRef event = createKeyboard(NULL, keyCode, down);
+    if (!event) return NO;
+    setFlags(event, modifiers | 0x100u);
+    if (setTimestamp && timestamp > 0.0)
+        setTimestamp(event,
+            (uint64_t)llround(timestamp * 1000000000.0));
+    postEvent(1 /* kCGSessionEventTap */, event);
+    CFRelease(event);
+    return YES;
+}
+
+static BOOL macws_vnc_proxy_keyboard(MacWSInputRecord record) {
+    static const struct {
+        uint32_t flag;
+        uint16_t keyCode;
+    } modifierKeys[] = {
+        {0x20000u, 56}, {0x40000u, 59},
+        {0x80000u, 58}, {0x100000u, 55},
+    };
+    const uint32_t modifierMask =
+        0x20000u | 0x40000u | 0x80000u | 0x100000u;
+    uint16_t keyCode = (uint16_t)llround(record.pressure);
+    BOOL down = record.kind == MacWSInputKindKeyDown;
+    uint32_t desired =
+        MacWSInputModifiersForScene(record.sceneID) & modifierMask;
+    uint32_t keyModifier =
+        macws_vnc_proxy_modifier_for_keycode(keyCode);
+    if (keyModifier != 0) {
+        if (down)
+            macws_vnc_proxy_explicit_modifiers |= keyModifier;
+        else
+            macws_vnc_proxy_explicit_modifiers &= ~keyModifier;
+        uint32_t active = macws_vnc_proxy_explicit_modifiers |
+            macws_vnc_proxy_synthetic_modifiers;
+        return macws_vnc_proxy_post_keyboard(
+            keyCode, down, active, record.timestamp);
+    }
+
+    if (down) {
+        uint32_t missing = desired &
+            ~(macws_vnc_proxy_explicit_modifiers |
+              macws_vnc_proxy_synthetic_modifiers);
+        for (size_t index = 0;
+             index < sizeof(modifierKeys) / sizeof(modifierKeys[0]);
+             index++) {
+            if ((missing & modifierKeys[index].flag) == 0) continue;
+            macws_vnc_proxy_synthetic_modifiers |= modifierKeys[index].flag;
+            uint32_t active = macws_vnc_proxy_explicit_modifiers |
+                macws_vnc_proxy_synthetic_modifiers;
+            if (!macws_vnc_proxy_post_keyboard(
+                    modifierKeys[index].keyCode, YES, active,
+                    record.timestamp))
+                return NO;
+            usleep(1000);
+        }
+    }
+
+    BOOL posted = macws_vnc_proxy_post_keyboard(
+        keyCode, down, desired, record.timestamp);
+    if (!down && macws_vnc_proxy_synthetic_modifiers != 0) {
+        // UIKeyCommand supplies a complete modified key pair but UIKit may
+        // omit modifier-only UIPresses. Match OSXvnc's runtime-proven global
+        // sequence by bracketing that one key with real modifier transitions.
+        for (size_t index = sizeof(modifierKeys) / sizeof(modifierKeys[0]);
+             index > 0; index--) {
+            uint32_t flag = modifierKeys[index - 1].flag;
+            if ((macws_vnc_proxy_synthetic_modifiers & flag) == 0) continue;
+            macws_vnc_proxy_synthetic_modifiers &= ~flag;
+            uint32_t active = macws_vnc_proxy_explicit_modifiers |
+                macws_vnc_proxy_synthetic_modifiers;
+            usleep(1000);
+            posted = macws_vnc_proxy_post_keyboard(
+                modifierKeys[index - 1].keyCode, NO, active,
+                record.timestamp) && posted;
+        }
+    }
+    return posted;
 }
 
 static CGPoint macws_vnc_pointer_proxy_quartz_point(
@@ -7938,6 +8068,26 @@ static void *macws_vnc_pointer_proxy_listener(void *unused) {
                 received, record.magic, record.version, record.kind,
                 record.source, record.flags);
             fflush(stderr);
+            continue;
+        }
+
+        if (record.kind == MacWSInputKindKeyDown ||
+            record.kind == MacWSInputKindKeyUp) {
+            BOOL posted = macws_vnc_proxy_keyboard(record);
+            if (!posted || (record.kind == MacWSInputKindKeyDown &&
+                            macws_runtime_diagnostics_enabled())) {
+                fprintf(stderr,
+                    "#### OSXVNC KEYBOARD-PROXY post kind=%u pid=%d "
+                    "window=%u keycode=%u keysym=%#x modifiers=%#x "
+                    "posted=%s\n",
+                    record.kind, record.targetPID,
+                    MacWSInputWindowIDForScene(record.sceneID),
+                    (unsigned)llround(record.pressure), record.contactID,
+                    MacWSInputModifiersForScene(record.sceneID),
+                    posted ? "YES" : "NO");
+                fflush(stderr);
+            }
+            if (posted) macws_vnc_note_interaction();
             continue;
         }
 

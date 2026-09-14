@@ -1741,16 +1741,27 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
 - (BOOL)canBecomeFirstResponder { return YES; }
 
 - (NSArray<UIKeyCommand *> *)keyCommands {
-    // iPadOS owns a subset of the desktop Command-key namespace before
-    // UIPresses reaches a custom view. Publish the Mac editing/document
-    // equivalents explicitly so they resolve to this scene's focused
-    // MacWSMetalView, then forward the original key and modifiers unchanged
-    // to AppKit. This is intentionally a finite desktop set; system-level
-    // iPadOS commands such as Command-Space remain owned by SpringBoard.
+    // Hardware keyboard input may be resolved by UIKit's key-command system
+    // before a custom responder receives UIPresses. Publish the desktop keys
+    // that must remain available to an AppKit terminal/editor, then forward
+    // the original key and modifiers through the same Host input protocol as
+    // UIPresses. This is intentionally finite: Command-Tab and Command-Space
+    // remain owned by iPadOS.
     static NSArray<UIKeyCommand *> *commands;
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
         NSMutableArray<UIKeyCommand *> *result = [NSMutableArray array];
+        void (^append)(NSString *, UIKeyModifierFlags) =
+            ^(NSString *input, UIKeyModifierFlags modifiers) {
+                UIKeyCommand *key = [UIKeyCommand
+                    keyCommandWithInput:input
+                          modifierFlags:modifiers
+                                  action:@selector(forwardMacKeyCommand:)];
+                if ([key respondsToSelector:
+                        @selector(setWantsPriorityOverSystemBehavior:)])
+                    key.wantsPriorityOverSystemBehavior = YES;
+                [result addObject:key];
+            };
         // Register the complete printable Command-letter/digit/punctuation
         // family rather than guessing which menu equivalents each AppKit app
         // uses. Finder alone needs Command-I/J/D/Y in addition to C/V, while
@@ -1765,24 +1776,62 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
             @"6", @"7", @"8", @"9", @",", @".", @"/", @";",
             @"'", @"[", @"]", @"\\", @"-", @"=", @"`"
         ];
-        NSArray<NSString *> *shifted = plain;
         for (NSString *input in plain) {
-            UIKeyCommand *key = [UIKeyCommand
-                keyCommandWithInput:input
-                      modifierFlags:UIKeyModifierCommand
-                              action:@selector(forwardMacKeyCommand:)];
-            if ([key respondsToSelector:@selector(setWantsPriorityOverSystemBehavior:)])
-                key.wantsPriorityOverSystemBehavior = YES;
-            [result addObject:key];
+            append(input, UIKeyModifierCommand);
+            append(input, UIKeyModifierCommand | UIKeyModifierShift);
+
+            // Terminal control sequences must preserve both the physical
+            // key identity and Control modifier. Sending the resulting ASCII
+            // control byte as text would lose combinations such as Ctrl-[,
+            // Ctrl-\\ and Ctrl-].
+            append(input, UIKeyModifierControl);
+            append(input, UIKeyModifierControl | UIKeyModifierShift);
         }
-        for (NSString *input in shifted) {
-            UIKeyCommand *key = [UIKeyCommand
-                keyCommandWithInput:input
-                      modifierFlags:UIKeyModifierCommand | UIKeyModifierShift
-                              action:@selector(forwardMacKeyCommand:)];
-            if ([key respondsToSelector:@selector(setWantsPriorityOverSystemBehavior:)])
-                key.wantsPriorityOverSystemBehavior = YES;
-            [result addObject:key];
+
+        // Ctrl-Space is a real terminal input (NUL) and does not overlap the
+        // iPadOS Command-Space search gesture.
+        append(@" ", UIKeyModifierControl);
+        append(@" ", UIKeyModifierControl | UIKeyModifierShift);
+
+        NSArray<NSString *> *navigationInputs = @[
+            UIKeyInputUpArrow, UIKeyInputDownArrow,
+            UIKeyInputLeftArrow, UIKeyInputRightArrow,
+            UIKeyInputPageUp, UIKeyInputPageDown,
+            UIKeyInputHome, UIKeyInputEnd
+        ];
+        NSArray<NSNumber *> *navigationModifiers = @[
+            @0,
+            @(UIKeyModifierShift),
+            @(UIKeyModifierControl),
+            @(UIKeyModifierAlternate),
+            @(UIKeyModifierCommand),
+            @(UIKeyModifierControl | UIKeyModifierShift),
+            @(UIKeyModifierAlternate | UIKeyModifierShift),
+            @(UIKeyModifierCommand | UIKeyModifierShift)
+        ];
+        for (NSString *input in navigationInputs) {
+            for (NSNumber *modifiers in navigationModifiers)
+                append(input, modifiers.unsignedIntegerValue);
+        }
+
+        // UIKit publishes Escape and backward Delete as named key inputs.
+        // Explicit entries keep them out of view-dismissal/editing handling
+        // and preserve their real AppKit key codes for Vim and shells.
+        append(UIKeyInputEscape, 0);
+        for (NSNumber *modifiers in navigationModifiers)
+            append(UIKeyInputDelete, modifiers.unsignedIntegerValue);
+
+        // Return and Tab can also be consumed as responder navigation/default
+        // actions. Preserve the common terminal modifier variants.
+        NSArray<NSNumber *> *terminalModifiers = @[
+            @0, @(UIKeyModifierShift), @(UIKeyModifierControl),
+            @(UIKeyModifierAlternate),
+            @(UIKeyModifierControl | UIKeyModifierShift),
+            @(UIKeyModifierAlternate | UIKeyModifierShift)
+        ];
+        for (NSNumber *modifiers in terminalModifiers) {
+            append(@"\r", modifiers.unsignedIntegerValue);
+            append(@"\t", modifiers.unsignedIntegerValue);
         }
         commands = [result copy];
     });
@@ -1792,8 +1841,32 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
 - (void)forwardMacKeyCommand:(UIKeyCommand *)command {
     if (!self.isMacWSInputEnabled || command.input.length == 0) return;
     NSString *input = command.input;
-    uint32_t scalar = [input characterAtIndex:0];
-    [self emitSoftwareKeySym:scalar modifiers:(uint32_t)command.modifierFlags];
+    uint32_t keySym = 0;
+    if ([input isEqualToString:UIKeyInputEscape]) keySym = 0xff1b;
+    else if ([input isEqualToString:UIKeyInputDelete]) keySym = 0xff08;
+    else if ([input isEqualToString:UIKeyInputUpArrow]) keySym = 0xff52;
+    else if ([input isEqualToString:UIKeyInputDownArrow]) keySym = 0xff54;
+    else if ([input isEqualToString:UIKeyInputLeftArrow]) keySym = 0xff51;
+    else if ([input isEqualToString:UIKeyInputRightArrow]) keySym = 0xff53;
+    else if ([input isEqualToString:UIKeyInputPageUp]) keySym = 0xff55;
+    else if ([input isEqualToString:UIKeyInputPageDown]) keySym = 0xff56;
+    else if ([input isEqualToString:UIKeyInputHome]) keySym = 0xff50;
+    else if ([input isEqualToString:UIKeyInputEnd]) keySym = 0xff57;
+    else {
+        unichar scalar = [input characterAtIndex:0];
+        if (scalar == '\r' || scalar == '\n') keySym = 0xff0d;
+        else if (scalar == '\t') keySym = 0xff09;
+        else if (scalar == '\b') keySym = 0xff08;
+        else {
+            NSInteger usage = MacWSHIDUsageForASCII(scalar);
+            keySym = usage >= 0
+                ? MacWSKeySymForHIDUsage(
+                      usage, nil, command.modifierFlags)
+                : scalar;
+        }
+    }
+    [self emitSoftwareKeySym:keySym
+                   modifiers:(uint32_t)command.modifierFlags];
 }
 
 // UIKit resolves several Command shortcuts through the responder action
@@ -1983,6 +2056,10 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
         case 0xff52: keyCode = 126; break;
         case 0xff53: keyCode = 124; break;
         case 0xff54: keyCode = 125; break;
+        case 0xff50: keyCode = 115; break;
+        case 0xff55: keyCode = 116; break;
+        case 0xff56: keyCode = 121; break;
+        case 0xff57: keyCode = 119; break;
         default: break;
     }
     CGPoint point = _trackpadCursor;

@@ -107,13 +107,15 @@ def resolve_window(pid, requested, timeout=5.0):
         if len(payload) >= 40:
             break
         time.sleep(0.05)
-    if len(payload) < 40:
+    if len(payload) < 44:
         raise RuntimeError(f"no window metrics entry for pid {pid}")
     magic, version, header_size, entry_size, entry_count, generation = \
         struct.unpack_from("<IHHIIQ", payload)
     expected_size = header_size + entry_count * entry_size
-    if (magic != 0x4D57474D or version != 2 or header_size != 24 or
-            entry_size != 20 or entry_count < 1 or generation == 0 or
+    supported_layout = ((version == 2 and entry_size == 20) or
+                        (version == 3 and entry_size == 56))
+    if (magic != 0x4D57474D or not supported_layout or header_size != 24 or
+            entry_count < 1 or generation == 0 or
             len(payload) != expected_size):
         raise RuntimeError(f"invalid window metrics for pid {pid}")
     return struct.unpack_from("<I", payload, header_size)[0]
