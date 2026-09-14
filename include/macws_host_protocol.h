@@ -6,7 +6,8 @@
 #define MACWS_FRAME_MAGIC 0x564e4346u /* "VNCF" */
 #define MACWS_INPUT_MAGIC 0x4d574556u /* "MWEV" */
 #define MACWS_INPUT_LEGACY_VERSION 5u
-#define MACWS_INPUT_VERSION 6u
+#define MACWS_INPUT_DOCUMENT_VERSION 6u
+#define MACWS_INPUT_VERSION 7u
 #define MACWS_INPUT_CONTACT_DIAGNOSTIC 0x44494147u /* "DIAG" */
 #define MACWS_INPUT_WINDOW_SCENE_FLAG UINT64_C(0x0000000080000000)
 #define MACWS_TARGET_PROBE_MAGIC 0x4d575450u /* "MWTP" */
@@ -173,28 +174,44 @@ enum {
     // endpoint; the receiver constructs kAEOpenDocuments and passes it to
     // NSApplication's normal Ventura open-event handler.
     MacWSInputKindOpenDocuments = 24,
+    // Deliver the standard application-quit lifecycle inside the exact
+    // directly-exec'd AppKit process. Dock's ordinary aevt/quit AppleEvent
+    // cannot find these applications because launchdchrootexec does not give
+    // them a LaunchServices AppleEvent endpoint. The receiver enters AppKit's
+    // own Ventura quit handler on its main thread; applicationShouldTerminate,
+    // unsaved-document prompts and cancellation remain application-owned.
+    MacWSInputKindPerformQuit = 25,
 };
 
-// ABI 6 added only OpenDocuments; the packed record itself is still the
+// ABI 6 added only OpenDocuments and ABI 7 adds PerformQuit; the packed record
+// itself is still the
 // 84-byte ABI introduced by version 5.  During a package upgrade, UIKit Host,
 // macwsinputd and long-lived AppKit/Dock processes cannot all replace their
 // mapped code atomically.  Keep every pre-existing kind on the version-5 wire
 // dialect and let current receivers accept either dialect for those kinds.
-// OpenDocuments remains fail-closed on version 6 because an ABI-5 endpoint
-// does not implement its sidecar/ACK transaction.
+// OpenDocuments stays on version 6 for rolling-upgrade compatibility and
+// accepts v7 as well. PerformQuit remains fail-closed on v7 because older
+// endpoints do not implement the AppKit lifecycle transaction.
 static inline int MacWSInputVersionSupportsKind(uint16_t version,
                                                 MacWSInputKind kind) {
     if (kind == MacWSInputKindOpenDocuments)
+        return version == MACWS_INPUT_DOCUMENT_VERSION ||
+            version == MACWS_INPUT_VERSION;
+    if (kind == MacWSInputKindPerformQuit)
         return version == MACWS_INPUT_VERSION;
     return kind >= MacWSInputKindTouchDown &&
         kind <= MacWSInputKindPerformPaste &&
         (version == MACWS_INPUT_LEGACY_VERSION ||
+         version == MACWS_INPUT_DOCUMENT_VERSION ||
          version == MACWS_INPUT_VERSION);
 }
 
 static inline uint16_t MacWSInputWireVersionForKind(MacWSInputKind kind) {
-    return kind == MacWSInputKindOpenDocuments
-        ? MACWS_INPUT_VERSION : MACWS_INPUT_LEGACY_VERSION;
+    if (kind == MacWSInputKindOpenDocuments)
+        return MACWS_INPUT_DOCUMENT_VERSION;
+    if (kind == MacWSInputKindPerformQuit)
+        return MACWS_INPUT_VERSION;
+    return MACWS_INPUT_LEGACY_VERSION;
 }
 
 #define MACWS_OPEN_DOCUMENT_SIDECAR_PREFIX \

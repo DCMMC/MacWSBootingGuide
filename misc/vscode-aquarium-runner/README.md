@@ -1,4 +1,10 @@
-# MacWS Aquarium Runner
+# MacWS VS Code Bridge and Aquarium Runner
+
+The extension owns MacWS's event-driven web-link endpoint at
+`/private/tmp/macws_vscode_url.sock`. The root-side host sends one bounded,
+length-prefixed HTTP(S) URL per connection and considers the request complete
+only after `simpleBrowser.show` resolves and the extension returns its one-byte
+acknowledgement. There is no polling loop while VS Code is idle.
 
 This disposable VS Code extension opens the WebGL Aquarium workload in the
 built-in Simple Browser when `MacWS: Open WebGL Aquarium` is selected from the

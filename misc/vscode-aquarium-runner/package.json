@@ -1,8 +1,8 @@
 {
   "name": "macws-aquarium-runner",
   "displayName": "MacWS Aquarium Runner",
-  "description": "Opens the repeatable WebGL Aquarium workload in VS Code's built-in Simple Browser.",
-  "version": "0.0.1",
+  "description": "Provides MacWS web-link routing and the repeatable WebGL Aquarium workload in VS Code's built-in Simple Browser.",
+  "version": "0.0.2",
   "publisher": "macwsguide",
   "engines": {
     "vscode": "^1.90.0"

@@ -59,6 +59,7 @@ typedef void (*MacWSMsgVoidIDBool)(id, SEL, id, BOOL);
 typedef void (*MacWSMsgVoidRectBoolBool)(id, SEL, CGRect, BOOL, BOOL);
 typedef void (*MacWSWorkspaceOpenURLFunction)(id, SEL, id, id, id);
 typedef void (*MacWSWorkspaceOpenURLsFunction)(id, SEL, id, id, id, id);
+typedef BOOL (*MacWSWorkspaceLegacyOpenURLFunction)(id, SEL, id);
 typedef void (*MacWSSeamlessOpenFailureFunction)(id, SEL, id, id, id);
 typedef double (*MacWSMsgDouble)(id, SEL);
 typedef float (*MacWSMsgFloat)(id, SEL);
@@ -2090,40 +2091,181 @@ static void MacWSLogNSEventFactorySelectors(Class eventClass) {
 
 static MacWSWorkspaceOpenURLFunction MacWSOriginalWorkspaceOpenURL;
 static MacWSWorkspaceOpenURLsFunction MacWSOriginalWorkspaceOpenURLs;
+static MacWSWorkspaceLegacyOpenURLFunction
+    MacWSOriginalWorkspaceLegacyOpenURL;
 static MacWSSeamlessOpenFailureFunction MacWSOriginalSeamlessOpenFailure;
 
 extern xpc_connection_t MacWSRawXPCConnectionCreateMachService(
     const char *, dispatch_queue_t, uint64_t)
     __asm("_xpc_connection_create_mach_service");
 
-static void MacWSWorkspaceOpenURLWitness(id workspace, SEL command, id url,
-                                         id configuration, id completion) {
-    fprintf(stderr,
-            "#### APP-INPUT WORKSPACE-OPEN selector=%s url=%s "
-            "configuration=%s completion=%p\n",
-            sel_getName(command),
-            [[url description] UTF8String] ?: "(nil)",
-            [[configuration description] UTF8String] ?: "(nil)",
-            completion);
-    fflush(stderr);
-    MacWSOriginalWorkspaceOpenURL(
-        workspace, command, url, configuration, completion);
+static BOOL MacWSIsRoutableWebURL(id value) {
+    if (![value isKindOfClass:[NSURL class]]) return NO;
+    NSURLComponents *components = [NSURLComponents
+        componentsWithURL:(NSURL *)value resolvingAgainstBaseURL:NO];
+    NSString *scheme = components.scheme.lowercaseString;
+    return components.host.length != 0 && components.user.length == 0 &&
+        components.password.length == 0 &&
+        ([scheme isEqualToString:@"http"] ||
+         [scheme isEqualToString:@"https"]);
 }
 
-static void MacWSWorkspaceOpenURLsWitness(id workspace, SEL command, id urls,
-                                          id applicationURL,
+static BOOL MacWSRequestHostOpenWebURL(NSURL *url, pid_t *targetPIDOut,
+                                       NSString **messageOut) {
+    if (!MacWSIsRoutableWebURL(url)) return NO;
+    xpc_connection_t connection = MacWSRawXPCConnectionCreateMachService(
+        MACWS_CONTROL_SERVICE,
+        dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), 0);
+    if (!connection) return NO;
+    xpc_connection_set_event_handler(connection,
+        ^(xpc_object_t event) { (void)event; });
+    xpc_connection_resume(connection);
+    xpc_object_t request = xpc_dictionary_create(NULL, NULL, 0);
+    xpc_dictionary_set_string(request, MACWS_CONTROL_KEY_OP,
+                              MACWS_CONTROL_OP_OPEN_WEB_URL);
+    xpc_dictionary_set_string(request, MACWS_CONTROL_KEY_WEB_URL,
+                              url.absoluteString.UTF8String);
+    xpc_object_t reply = xpc_connection_send_message_with_reply_sync(
+        connection, request);
+    BOOL accepted = reply && xpc_get_type(reply) == XPC_TYPE_DICTIONARY &&
+        xpc_dictionary_get_bool(reply, "ok");
+    const char *message = reply && xpc_get_type(reply) == XPC_TYPE_DICTIONARY
+        ? xpc_dictionary_get_string(reply, "message") : NULL;
+    pid_t targetPID = reply && xpc_get_type(reply) == XPC_TYPE_DICTIONARY
+        ? (pid_t)xpc_dictionary_get_int64(reply, "launched_app_pid") : 0;
+    if (targetPIDOut) *targetPIDOut = accepted ? targetPID : 0;
+    if (messageOut) *messageOut = message
+        ? [NSString stringWithUTF8String:message] : nil;
+    if (!accepted || MacWSRuntimeDiagnosticsEnabled()) {
+        fprintf(stderr,
+            "#### APP-INPUT WEB-URL-ROUTE caller=%d target=%d result=%s "
+            "message=%s\n",
+            getpid(), targetPID,
+            accepted ? "simple-browser-accepted" : "failed",
+            message ?: "");
+        fflush(stderr);
+    }
+    if (reply) xpc_release(reply);
+    xpc_release(request);
+    xpc_connection_cancel(connection);
+    xpc_release(connection);
+    return accepted;
+}
+
+static void MacWSDispatchHostOpenWebURL(NSURL *url, id completion) {
+    NSURL *urlCopy = [[url copy] autorelease];
+    id completionCopy = completion ? [[completion copy] autorelease] : nil;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        @autoreleasepool {
+            pid_t targetPID = 0;
+            NSString *message = nil;
+            BOOL accepted = MacWSRequestHostOpenWebURL(
+                urlCopy, &targetPID, &message);
+            if (!completionCopy) return;
+            id runningApplication = nil;
+            if (accepted && targetPID > 1) {
+                id runningClass = (id)objc_getClass("NSRunningApplication");
+                SEL withPID = sel_registerName(
+                    "runningApplicationWithProcessIdentifier:");
+                if (runningClass && [runningClass respondsToSelector:withPID])
+                    runningApplication = ((id (*)(id, SEL, pid_t))objc_msgSend)(
+                        runningClass, withPID, targetPID);
+            }
+            NSError *error = accepted ? nil : [NSError
+                errorWithDomain:@"com.macwsguide.WebURLRouter"
+                           code:-1
+                       userInfo:@{NSLocalizedDescriptionKey:
+                           message ?: @"VS Code 没有接收网页链接"}];
+            dispatch_async(dispatch_get_main_queue(), ^{
+                ((void (^)(id, NSError *))completionCopy)(
+                    runningApplication, error);
+            });
+        }
+    });
+}
+
+static BOOL MacWSWorkspaceLegacyOpenURLRedirect(id workspace, SEL command,
+                                                id url) {
+    if (!MacWSIsRoutableWebURL(url)) {
+        return MacWSOriginalWorkspaceLegacyOpenURL
+            ? MacWSOriginalWorkspaceLegacyOpenURL(workspace, command, url)
+            : NO;
+    }
+    // NSWorkspace's legacy API is synchronous, but a cold VS Code launch is
+    // not. Acceptance here means the validated transaction was queued onto
+    // hostd; its extension-level acknowledgement is recorded asynchronously.
+    MacWSDispatchHostOpenWebURL((NSURL *)url, nil);
+    return YES;
+}
+
+static void MacWSWorkspaceOpenURLRedirect(id workspace, SEL command, id url,
                                           id configuration, id completion) {
-    fprintf(stderr,
-            "#### APP-INPUT WORKSPACE-OPEN selector=%s urls=%s app=%s "
-            "configuration=%s completion=%p\n",
-            sel_getName(command),
-            [[urls description] UTF8String] ?: "(nil)",
-            [[applicationURL description] UTF8String] ?: "(nil)",
-            [[configuration description] UTF8String] ?: "(nil)",
-            completion);
-    fflush(stderr);
-    MacWSOriginalWorkspaceOpenURLs(
-        workspace, command, urls, applicationURL, configuration, completion);
+    if (!MacWSIsRoutableWebURL(url)) {
+        if (MacWSOriginalWorkspaceOpenURL)
+            MacWSOriginalWorkspaceOpenURL(
+                workspace, command, url, configuration, completion);
+        return;
+    }
+    MacWSDispatchHostOpenWebURL((NSURL *)url, completion);
+}
+
+static BOOL MacWSArrayContainsOnlyRoutableWebURLs(id values) {
+    if (![values isKindOfClass:[NSArray class]] || [values count] == 0)
+        return NO;
+    for (id value in values) {
+        if (!MacWSIsRoutableWebURL(value)) return NO;
+    }
+    return YES;
+}
+
+static void MacWSWorkspaceOpenURLsRedirect(id workspace, SEL command, id urls,
+                                           id applicationURL,
+                                           id configuration, id completion) {
+    // A non-nil applicationURL is an explicit caller choice rather than a
+    // default web-handler request. Preserve that choice, plus every mixed or
+    // non-web batch, through NSWorkspace unchanged.
+    if (applicationURL || !MacWSArrayContainsOnlyRoutableWebURLs(urls)) {
+        if (MacWSOriginalWorkspaceOpenURLs)
+            MacWSOriginalWorkspaceOpenURLs(workspace, command, urls,
+                                            applicationURL, configuration,
+                                            completion);
+        return;
+    }
+    NSArray *urlsCopy = [[urls copy] autorelease];
+    id completionCopy = completion ? [[completion copy] autorelease] : nil;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        @autoreleasepool {
+            BOOL accepted = YES;
+            pid_t targetPID = 0;
+            NSString *message = nil;
+            for (NSURL *url in urlsCopy) {
+                if (!MacWSRequestHostOpenWebURL(
+                        url, &targetPID, &message)) {
+                    accepted = NO;
+                    break;
+                }
+            }
+            if (!completionCopy) return;
+            id runningApplication = nil;
+            if (accepted && targetPID > 1) {
+                id runningClass = (id)objc_getClass("NSRunningApplication");
+                SEL withPID = sel_registerName(
+                    "runningApplicationWithProcessIdentifier:");
+                if (runningClass && [runningClass respondsToSelector:withPID])
+                    runningApplication = ((id (*)(id, SEL, pid_t))objc_msgSend)(
+                        runningClass, withPID, targetPID);
+            }
+            NSError *error = accepted ? nil : [NSError
+                errorWithDomain:@"com.macwsguide.WebURLRouter"
+                           code:-1
+                       userInfo:@{NSLocalizedDescriptionKey:
+                           message ?: @"VS Code 没有接收全部网页链接"}];
+            dispatch_async(dispatch_get_main_queue(), ^{
+                ((void (^)(id, NSError *))completionCopy)(
+                    runningApplication, error);
+            });
+        }
+    });
 }
 
 static NSURL *MacWSFinderOpenItemURL(id item) {
@@ -2294,9 +2436,11 @@ static void MacWSSeamlessOpenFailureWitness(id delegate, SEL command,
 // LaunchServices AppleEvent endpoint. Preserve the original failure callback,
 // then complete only those typed failures through hostd and the target's
 // normal AppKit open-event path.
-// The additional NSWorkspace hooks below remain diagnostic witnesses only.
+// The typed HTTP(S) redirect below is production behavior for every AppKit
+// application. Finder's explicit-app document bridge and the multi-URL
+// NSWorkspace witness remain independently scoped.
 static void MacWSInstallWorkspaceOpenWitness(void) {
-    if (strcmp(MacWSAppInputProgramName(), "Finder") != 0) return;
+    BOOL finder = strcmp(MacWSAppInputProgramName(), "Finder") == 0;
     id workspaceClass = (id)objc_getClass("NSWorkspace");
     id sharedWorkspace = workspaceClass &&
         [workspaceClass respondsToSelector:sel_registerName("sharedWorkspace")]
@@ -2306,24 +2450,46 @@ static void MacWSInstallWorkspaceOpenWitness(void) {
         ? object_getClass(sharedWorkspace) : (Class)workspaceClass;
     if (!implementationClass) return;
 
-    Class seamlessDelegate = objc_getClass("TSeamlessOpenerDelegate");
-    SEL seamlessFailure = sel_registerName(
-        "seamlessOpener:failedToOpenItems:withError:");
-    Method seamlessFailureMethod = seamlessDelegate
-        ? class_getInstanceMethod(seamlessDelegate, seamlessFailure) : NULL;
-    if (seamlessFailureMethod && !MacWSOriginalSeamlessOpenFailure) {
-        MacWSOriginalSeamlessOpenFailure = (MacWSSeamlessOpenFailureFunction)
-            method_getImplementation(seamlessFailureMethod);
-        method_setImplementation(seamlessFailureMethod,
-                                 (IMP)MacWSSeamlessOpenFailureWitness);
-        if (MacWSRuntimeDiagnosticsEnabled())
-            fprintf(stderr,
-                    "#### APP-INPUT WORKSPACE-WITNESS selector=%s types=%s\n",
-                    sel_getName(seamlessFailure),
-                    method_getTypeEncoding(seamlessFailureMethod) ?: "(null)");
+    if (finder) {
+        Class seamlessDelegate = objc_getClass("TSeamlessOpenerDelegate");
+        SEL seamlessFailure = sel_registerName(
+            "seamlessOpener:failedToOpenItems:withError:");
+        Method seamlessFailureMethod = seamlessDelegate
+            ? class_getInstanceMethod(seamlessDelegate, seamlessFailure) : NULL;
+        if (seamlessFailureMethod && !MacWSOriginalSeamlessOpenFailure) {
+            MacWSOriginalSeamlessOpenFailure =
+                (MacWSSeamlessOpenFailureFunction)
+                method_getImplementation(seamlessFailureMethod);
+            method_setImplementation(seamlessFailureMethod,
+                                     (IMP)MacWSSeamlessOpenFailureWitness);
+            if (MacWSRuntimeDiagnosticsEnabled())
+                fprintf(stderr,
+                        "#### APP-INPUT WORKSPACE-WITNESS selector=%s "
+                        "types=%s\n",
+                        sel_getName(seamlessFailure),
+                        method_getTypeEncoding(seamlessFailureMethod) ?:
+                            "(null)");
+        }
     }
 
-    if (!MacWSRuntimeDiagnosticsEnabled()) return;
+    SEL legacyOpenURL = sel_registerName("openURL:");
+    Method legacyOpenURLMethod = class_getInstanceMethod(
+        implementationClass, legacyOpenURL);
+    const char *legacyTypes = legacyOpenURLMethod
+        ? method_getTypeEncoding(legacyOpenURLMethod) : NULL;
+    if (legacyOpenURLMethod && legacyTypes &&
+        (legacyTypes[0] == 'B' || legacyTypes[0] == 'c') &&
+        !MacWSOriginalWorkspaceLegacyOpenURL) {
+        MacWSOriginalWorkspaceLegacyOpenURL =
+            (MacWSWorkspaceLegacyOpenURLFunction)
+            method_getImplementation(legacyOpenURLMethod);
+        method_setImplementation(legacyOpenURLMethod,
+                                 (IMP)MacWSWorkspaceLegacyOpenURLRedirect);
+        if (MacWSRuntimeDiagnosticsEnabled())
+            fprintf(stderr,
+                    "#### APP-INPUT WORKSPACE-WEB-ROUTE selector=%s "
+                    "types=%s\n", sel_getName(legacyOpenURL), legacyTypes);
+    }
 
     SEL openURL = sel_registerName(
         "openURL:configuration:completionHandler:");
@@ -2333,11 +2499,12 @@ static void MacWSInstallWorkspaceOpenWitness(void) {
         MacWSOriginalWorkspaceOpenURL = (MacWSWorkspaceOpenURLFunction)
             method_getImplementation(openURLMethod);
         method_setImplementation(openURLMethod,
-                                 (IMP)MacWSWorkspaceOpenURLWitness);
-        fprintf(stderr,
-                "#### APP-INPUT WORKSPACE-WITNESS selector=%s types=%s\n",
-                sel_getName(openURL),
-                method_getTypeEncoding(openURLMethod) ?: "(null)");
+                                 (IMP)MacWSWorkspaceOpenURLRedirect);
+        if (MacWSRuntimeDiagnosticsEnabled())
+            fprintf(stderr,
+                    "#### APP-INPUT WORKSPACE-WEB-ROUTE selector=%s "
+                    "types=%s\n", sel_getName(openURL),
+                    method_getTypeEncoding(openURLMethod) ?: "(null)");
     }
 
     SEL openURLs = sel_registerName(
@@ -2348,13 +2515,15 @@ static void MacWSInstallWorkspaceOpenWitness(void) {
         MacWSOriginalWorkspaceOpenURLs = (MacWSWorkspaceOpenURLsFunction)
             method_getImplementation(openURLsMethod);
         method_setImplementation(openURLsMethod,
-                                 (IMP)MacWSWorkspaceOpenURLsWitness);
-        fprintf(stderr,
-                "#### APP-INPUT WORKSPACE-WITNESS selector=%s types=%s\n",
-                sel_getName(openURLs),
-                method_getTypeEncoding(openURLsMethod) ?: "(null)");
+                                 (IMP)MacWSWorkspaceOpenURLsRedirect);
+        if (MacWSRuntimeDiagnosticsEnabled()) {
+            fprintf(stderr,
+                    "#### APP-INPUT WORKSPACE-WEB-ROUTE selector=%s "
+                    "types=%s\n", sel_getName(openURLs),
+                    method_getTypeEncoding(openURLsMethod) ?: "(null)");
+        }
     }
-    fflush(stderr);
+    if (MacWSRuntimeDiagnosticsEnabled()) fflush(stderr);
 }
 
 static void MacWSInstallPressedMouseButtonsBridge(Class eventClass) {
@@ -2739,6 +2908,7 @@ static NSUInteger MacWSNSEventType(MacWSInputKind kind) {
         case MacWSInputKindRotate:
         case MacWSInputKindPerformPaste:
         case MacWSInputKindOpenDocuments:
+        case MacWSInputKindPerformQuit:
         case MacWSInputKindConfigureWindow:
         case MacWSInputKindCloseWindow:
         case MacWSInputKindCreateInitialWindow:
@@ -3178,6 +3348,7 @@ static BOOL MacWSInputRecordIsValid(const MacWSInputRecord *record) {
     if (record->kind == MacWSInputKindReopenApplication) return YES;
     if (record->kind == MacWSInputKindOpenDocuments)
         return record->sceneID != 0;
+    if (record->kind == MacWSInputKindPerformQuit) return YES;
     if (record->kind == MacWSInputKindDesktopCommand) {
         return record->contactID >= MacWSDesktopCommandSpaceLeft &&
             record->contactID <= MacWSDesktopCommandSpaceRight;
@@ -3219,7 +3390,7 @@ static BOOL MacWSInputRecordIsValid(const MacWSInputRecord *record) {
     }
     return
         record->kind >= MacWSInputKindTouchDown &&
-        record->kind <= MacWSInputKindOpenDocuments &&
+        record->kind <= MacWSInputKindPerformQuit &&
         record->x >= 0.0f && record->y >= 0.0f &&
         record->x < record->frameWidth &&
         record->y < record->frameHeight;
@@ -6951,6 +7122,30 @@ static void MacWSHandleOpenDocuments(MacWSInputRecord record,
     [paths release];
 }
 
+static void MacWSHandlePerformQuit(id application) {
+    // RE-confirmed via the live Ventura 13.4 AppKit image on the target:
+    // -[NSApplication(NSAppleEventHandling) _handleAEQuit] is the no-argument
+    // method at unslid 0x183a34b78. Its control flow asks
+    // NSAppleEventManager for the current event, resolves targetForAction:,
+    // calls _shouldTerminate, and schedules
+    // _terminateFromSender:askIfShouldTerminate:saveWindows:. Entering here
+    // restores the exact AppKit lifecycle that Dock's failed aevt/quit would
+    // have delivered; it does not force a disabled NSMenuItem or signal the
+    // process. A nil current AppleEvent takes AppKit's ordinary default quit
+    // reason while preserving delegate/document cancellation.
+    SEL handleQuit = sel_registerName("_handleAEQuit");
+    BOOL supported = application && ((MacWSMsgBoolSEL)objc_msgSend)(
+        application, sel_registerName("respondsToSelector:"), handleQuit);
+    int16_t status = supported
+        ? ((int16_t (*)(id, SEL))objc_msgSend)(application, handleQuit)
+        : INT16_MIN;
+    fprintf(stderr,
+        "#### APP-INPUT PERFORM-QUIT pid=%d route=AppKit-AE "
+        "supported=%s status=%d\n",
+        getpid(), supported ? "YES" : "NO", status);
+    fflush(stderr);
+}
+
 static void MacWSPostInputOnMainThread(MacWSInputRecord record) {
     double latencyMainStart =
         (record.flags & MacWSInputFlagLatencyDiagnostic)
@@ -6968,17 +7163,37 @@ static void MacWSPostInputOnMainThread(MacWSInputRecord record) {
         fflush(stderr);
     }
     Class applicationClass = objc_getClass("NSApplication");
+    if (!applicationClass) {
+        fprintf(stderr,
+                "#### APP-INPUT DROP pid=%d reason=NSApplication-unavailable\n",
+                getpid());
+        return;
+    }
+    id application = ((MacWSMsgID)objc_msgSend)((id)applicationClass,
+        sel_registerName("sharedApplication"));
+    if (!application) {
+        fprintf(stderr,
+                "#### APP-INPUT DROP pid=%d reason=no-application\n",
+                getpid());
+        return;
+    }
+    // Quit is application-scoped and remains valid for a hidden/windowless
+    // target. Do not make it depend on NSScreen publication or install any
+    // pointer hooks before entering AppKit's real termination lifecycle.
+    if (record.kind == MacWSInputKindPerformQuit) {
+        MacWSHandlePerformQuit(application);
+        return;
+    }
+
     Class screenClass = objc_getClass("NSScreen");
     Class eventClass = objc_getClass("NSEvent");
-    if (!applicationClass || !screenClass || !eventClass) {
+    if (!screenClass || !eventClass) {
         fprintf(stderr,
                 "#### APP-INPUT DROP pid=%d reason=AppKit-classes-unavailable\n",
                 getpid());
         return;
     }
     MacWSInstallPressedMouseButtonsBridge(eventClass);
-    id application = ((MacWSMsgID)objc_msgSend)((id)applicationClass,
-        sel_registerName("sharedApplication"));
     // Geometry observation is input-facing state. Install it lazily on the
     // already-running AppKit main thread instead of during application launch;
     // Catalyst Maps has not completed its native scene/window transaction at
@@ -6987,7 +7202,7 @@ static void MacWSPostInputOnMainThread(MacWSInputRecord record) {
     MacWSInstallWindowGeometryObservers();
     id screen = ((MacWSMsgID)objc_msgSend)((id)screenClass,
         sel_registerName("mainScreen"));
-    if (!application || !screen || record.frameWidth == 0 ||
+    if (!screen || record.frameWidth == 0 ||
         record.frameHeight == 0) {
         fprintf(stderr,
                 "#### APP-INPUT DROP pid=%d reason=no-application-or-screen\n",
@@ -9587,6 +9802,23 @@ static NSString *MacWSMenuShortcutForItem(id item) {
     return shortcut;
 }
 
+static BOOL MacWSMenuItemIsStandardApplicationQuit(
+        id item, NSUInteger depth, NSString *title, NSString *shortcut,
+        BOOL separator, BOOL hidden, id submenu, id customView) {
+    if (!item || depth != 1 || separator || hidden || submenu || customView ||
+        ![title isKindOfClass:objc_getClass("NSString")] ||
+        ![shortcut isEqualToString:MacWSRuntimeString("⌘Q")]) return NO;
+    // Most AppKit applications use terminate:. Catalyst Maps publishes the
+    // standard item disabled, and its synthesized item may omit the action;
+    // retain the exact Ventura English title as the second canonical witness.
+    // Depth one + Command-Q prevents an arbitrary document-menu shortcut from
+    // acquiring process-lifecycle semantics.
+    SEL action = ((SEL (*)(id, SEL))objc_msgSend)(
+        item, sel_registerName("action"));
+    return (action && strcmp(sel_getName(action), "terminate:") == 0) ||
+        [title hasPrefix:MacWSRuntimeString("Quit ")];
+}
+
 static BOOL MacWSMenuAppendTree(id menu, uint64_t parentItemID,
                                 NSUInteger depth, NSArray *parentPath,
                                 NSMutableData *nodes, NSMutableData *strings,
@@ -9630,6 +9862,10 @@ static BOOL MacWSMenuAppendTree(id menu, uint64_t parentItemID,
             item, sel_registerName("state"));
         NSString *title = ((MacWSMsgID)objc_msgSend)(
             item, sel_registerName("title"));
+        NSString *shortcut = MacWSMenuShortcutForItem(item);
+        BOOL bridgedQuit = MacWSMenuItemIsStandardApplicationQuit(
+            item, depth, title, shortcut, separator, hidden, submenu,
+            customView);
         MacWSMenuNode node = {
             .itemID = itemID,
             .parentItemID = parentItemID,
@@ -9641,7 +9877,8 @@ static BOOL MacWSMenuAppendTree(id menu, uint64_t parentItemID,
                 (state == 1 ? MacWSMenuNodeChecked : 0) |
                 (state == -1 ? MacWSMenuNodeMixed : 0) |
                 (alternate ? MacWSMenuNodeAlternate : 0) |
-                (customView ? MacWSMenuNodeRequiresWorkspace : 0),
+                (customView ? MacWSMenuNodeRequiresWorkspace : 0) |
+                (bridgedQuit ? MacWSMenuNodeBridgedQuit : 0),
             .state = (int32_t)state,
         };
         uint32_t titleOffset = 0;
@@ -9649,7 +9886,7 @@ static BOOL MacWSMenuAppendTree(id menu, uint64_t parentItemID,
         uint32_t shortcutOffset = 0;
         uint32_t shortcutLength = 0;
         MacWSMenuAppendString(strings, title, &titleOffset, &titleLength);
-        MacWSMenuAppendString(strings, MacWSMenuShortcutForItem(item),
+        MacWSMenuAppendString(strings, shortcut,
                               &shortcutOffset, &shortcutLength);
         node.titleOffset = titleOffset;
         node.titleLength = titleLength;

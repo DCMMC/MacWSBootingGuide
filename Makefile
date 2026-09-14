@@ -22,7 +22,7 @@ after-stage::
 	@mkdir -p $(THEOS_STAGING_DIR)/usr/macOS/libexec/MacWSInteropService.app/Contents/MacOS
 	@rm -rf $(THEOS_STAGING_DIR)/usr/macOS/bin/__pycache__
 	@rm -f $(THEOS_STAGING_DIR)/usr/macOS/bin/.ldid.entitlements.plist
-	@mkdir -p $(THEOS_STAGING_DIR)/usr/macOS/share/vscode/macwsguide.macws-aquarium-runner-0.0.1
+	@mkdir -p $(THEOS_STAGING_DIR)/usr/macOS/share/vscode/macwsguide.macws-aquarium-runner-0.0.2
 	@install -m 0644 misc/com.macwsguide.vscode.plist \
 		$(THEOS_STAGING_DIR)/usr/macOS/gui-launchd/com.macwsguide.vscode.plist
 	@install -m 0644 misc/com.macwsguide.steam.runtime.plist \
@@ -51,7 +51,7 @@ after-stage::
 	@install -m 0644 misc/vscode-aquarium-runner/package.json \
 		misc/vscode-aquarium-runner/extension.js \
 		misc/vscode-aquarium-runner/README.md \
-		$(THEOS_STAGING_DIR)/usr/macOS/share/vscode/macwsguide.macws-aquarium-runner-0.0.1/
+		$(THEOS_STAGING_DIR)/usr/macOS/share/vscode/macwsguide.macws-aquarium-runner-0.0.2/
 	@install -m 0644 misc/metal2metal.py \
 		misc/metal2metal_manifest.py \
 		misc/metal2metal_profiles.py \

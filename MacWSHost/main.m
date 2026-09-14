@@ -1053,6 +1053,24 @@ static BOOL MacWSSendCloseWindow(uint32_t windowID, int32_t ownerPID,
     return MacWSSendInputRecord(&record, errorOut);
 }
 
+static BOOL MacWSSendPerformQuit(int32_t ownerPID, int *errorOut) {
+    if (ownerPID <= 1) {
+        if (errorOut) *errorOut = EINVAL;
+        return NO;
+    }
+    MacWSInputRecord record = {
+        .magic = MACWS_INPUT_MAGIC,
+        .version = MACWS_INPUT_VERSION,
+        .kind = MacWSInputKindPerformQuit,
+        .timestamp = CACurrentMediaTime(),
+        .frameWidth = 1,
+        .frameHeight = 1,
+        .targetPID = ownerPID,
+        .source = MacWSInputSourceUnknown,
+    };
+    return MacWSSendInputRecord(&record, errorOut);
+}
+
 static NSString *MacWSWindowIdentity(int32_t ownerPID, uint32_t windowID,
                                      uint32_t logicalGroupID) {
     if (ownerPID <= 1 || windowID == 0) return nil;
@@ -1377,7 +1395,8 @@ typedef void (^MacWSCompactMenuSelection)(MacWSMenuItem *item);
     if (item.flags & MacWSMenuNodeHasSubmenu)
         suffix = suffix.length ? [suffix stringByAppendingString:@"   ›"] : @"›";
     cell.detailTextLabel.text = suffix;
-    BOOL enabled = (item.flags & MacWSMenuNodeEnabled) != 0;
+    BOOL enabled = (item.flags & (MacWSMenuNodeEnabled |
+                                  MacWSMenuNodeBridgedQuit)) != 0;
     cell.textLabel.enabled = enabled;
     cell.detailTextLabel.enabled = enabled;
     cell.selectionStyle = enabled ? UITableViewCellSelectionStyleDefault
@@ -1390,7 +1409,8 @@ typedef void (^MacWSCompactMenuSelection)(MacWSMenuItem *item);
     [tableView deselectRowAtIndexPath:indexPath animated:NO];
     MacWSMenuItem *item = _items[(NSUInteger)indexPath.row];
     if ((item.flags & (MacWSMenuNodeHidden | MacWSMenuNodeSeparator)) ||
-        (item.flags & MacWSMenuNodeEnabled) == 0) return;
+        (item.flags & (MacWSMenuNodeEnabled |
+                       MacWSMenuNodeBridgedQuit)) == 0) return;
     MacWSCompactMenuSelection selection = _selection;
     if (selection) selection(item);
 }
@@ -2257,6 +2277,24 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
                 [self presentSemanticMenuForParent:item.itemID
                                           snapshot:snapshot source:source
                                              title:item.title];
+                return;
+            }
+            if ((item.flags & MacWSMenuNodeBridgedQuit) &&
+                !(item.flags & MacWSMenuNodeEnabled)) {
+                // Runtime-confirmed from Maps' live Ventura menu snapshot:
+                // the standard depth-one "Quit Maps" Command-Q item is
+                // present with flags=0 (disabled). Do not mutate that real
+                // NSMenuItem. Route this one semantic to the exact process's
+                // PerformQuit control; AppKit still owns termination checks,
+                // prompts, cancellation and final process exit.
+                int sendError = 0;
+                BOOL sent = MacWSSendPerformQuit(
+                    snapshot.representedOwnerPID, &sendError);
+                [self setNotice:sent
+                    ? [NSString stringWithFormat:@"已发送“%@”", item.title]
+                    : [NSString stringWithFormat:
+                        @"无法发送退出请求（%d）", sendError]
+                         success:sent];
                 return;
             }
             // The iOS menu is outside AppKit, so selecting it does not itself

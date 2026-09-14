@@ -338,6 +338,15 @@ int main(int argc, const char *argv[]) {
                                  MACWS_CONTROL_KEY_DOCUMENT_PATHS,
                                  documents);
         xpc_release(documents);
+    } else if (strcmp(operation, MACWS_CONTROL_OP_OPEN_WEB_URL) == 0) {
+        if (argc != 3) {
+            fprintf(stderr,
+                    "usage: macws_control_probe open-web-url "
+                    "https://example.com\n");
+            return 64;
+        }
+        xpc_dictionary_set_string(request, MACWS_CONTROL_KEY_WEB_URL,
+                                  argv[2]);
     } else if (strcmp(operation, MACWS_CONTROL_OP_REFRESH_DOCK) == 0) {
         if (argc != 3) {
             fprintf(stderr,

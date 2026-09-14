@@ -50,6 +50,12 @@ enum {
     // Custom NSMenuItem views and other semantics that cannot be represented
     // safely in UIKit remain visible but must route to the full workspace.
     MacWSMenuNodeRequiresWorkspace = 1u << 7,
+    // This is the standard application-menu Command-Q item. A directly
+    // exec'd Catalyst application can expose that item disabled because its
+    // LaunchServices AppleEvent endpoint is absent. The Host may route only
+    // that disabled semantic through PerformQuit; enabled items continue to
+    // execute their real current NSMenuItem target/action.
+    MacWSMenuNodeBridgedQuit = 1u << 8,
 };
 
 // The semantic iPadOS menu is rendered by Host, but its appearance belongs to

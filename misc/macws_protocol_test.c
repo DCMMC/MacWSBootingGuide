@@ -47,7 +47,8 @@ int main(void) {
         0.0, 0.0, 1194.0, 834.0));
     assert(!MacWSLayerCoversLogicalDisplay(
         0.0, 0.0, 1194.0, 417.0, 0.0, 0.0, 1194.0, 834.0));
-    assert(MACWS_INPUT_VERSION == 6u);
+    assert(MACWS_INPUT_VERSION == 7u);
+    assert(MACWS_INPUT_DOCUMENT_VERSION == 6u);
     assert(MACWS_INPUT_LEGACY_VERSION == 5u);
     assert(MACWS_STREAM_VERSION == 8u);
     assert(MACWS_FINAL_COMPOSITE_VERSION == 1u);
@@ -61,6 +62,7 @@ int main(void) {
     assert(MacWSInputKindRotate == 22);
     assert(MacWSInputKindPerformPaste == 23);
     assert(MacWSInputKindOpenDocuments == 24);
+    assert(MacWSInputKindPerformQuit == 25);
     assert(MacWSInputVersionSupportsKind(
         MACWS_INPUT_LEGACY_VERSION, MacWSInputKindTouchDown));
     assert(MacWSInputVersionSupportsKind(
@@ -69,9 +71,17 @@ int main(void) {
         MACWS_INPUT_LEGACY_VERSION, MacWSInputKindOpenDocuments));
     assert(MacWSInputVersionSupportsKind(
         MACWS_INPUT_VERSION, MacWSInputKindOpenDocuments));
+    assert(MacWSInputVersionSupportsKind(
+        MACWS_INPUT_DOCUMENT_VERSION, MacWSInputKindOpenDocuments));
+    assert(!MacWSInputVersionSupportsKind(
+        MACWS_INPUT_DOCUMENT_VERSION, MacWSInputKindPerformQuit));
+    assert(MacWSInputVersionSupportsKind(
+        MACWS_INPUT_VERSION, MacWSInputKindPerformQuit));
     assert(MacWSInputWireVersionForKind(MacWSInputKindTouchDown) ==
            MACWS_INPUT_LEGACY_VERSION);
     assert(MacWSInputWireVersionForKind(MacWSInputKindOpenDocuments) ==
+           MACWS_INPUT_DOCUMENT_VERSION);
+    assert(MacWSInputWireVersionForKind(MacWSInputKindPerformQuit) ==
            MACWS_INPUT_VERSION);
     assert(sizeof(MacWSOpenDocumentAck) == 24);
     assert(MacWSSystemGestureAxisHorizontal == 1);
@@ -549,6 +559,7 @@ int main(void) {
     MacWSMenuNode *menuNode = (void *)(menuBytes + sizeof(*menu));
     *menuNode = (MacWSMenuNode){
         .itemID = 1,
+        .flags = MacWSMenuNodeBridgedQuit,
         .titleLength = 4,
     };
     memcpy(menuBytes + sizeof(*menu) + sizeof(*menuNode), "File", 4);

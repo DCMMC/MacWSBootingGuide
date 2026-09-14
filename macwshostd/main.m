@@ -9,6 +9,7 @@
 @import Darwin;
 
 #include <dispatch/dispatch.h>
+#include <arpa/inet.h>
 #include <dlfcn.h>
 #include <fcntl.h>
 #include <limits.h>
@@ -112,6 +113,8 @@ static const char *const kVSCodePlist =
 static const char *const kVSCodeLog = "/var/jb/var/mobile/vscode.log";
 static const char *const kVSCodeHealthMarker =
     "/var/jb/var/mobile/vscode-health-marker";
+static const char *const kVSCodeURLSocket =
+    "/var/mnt/rootfs" MACWS_VSCODE_URL_SOCKET_PATH;
 static const char *const kVSCodeExecutable =
     "/Applications/Visual Studio Code.app/Contents/MacOS/Electron";
 // Current VS Code's bundle metadata names the thin launcher `Code`, while the
@@ -3039,6 +3042,162 @@ static BOOL LaunchVSCode(NSString **message) {
     }
     HostLog(@"launch-app window-ready id=vscode pid=%d path=DisplayStream", pid);
     *message = @"VS Code 已通过生产 AGX/JIT 配置启动，窗口已进入列表";
+    return YES;
+}
+
+static NSString *ValidatedWebURL(xpc_object_t request, NSString **message) {
+    const char *requested = xpc_dictionary_get_string(
+        request, MACWS_CONTROL_KEY_WEB_URL);
+    size_t length = requested
+        ? strnlen(requested, MACWS_VSCODE_URL_MAX_BYTES + 1) : 0;
+    if (length == 0 || length > MACWS_VSCODE_URL_MAX_BYTES) {
+        if (message) *message = @"网页链接为空或过长";
+        return nil;
+    }
+    NSString *value = [[NSString alloc] initWithBytes:requested
+                                               length:length
+                                             encoding:NSUTF8StringEncoding];
+    NSURLComponents *components = value
+        ? [NSURLComponents componentsWithString:value] : nil;
+    NSString *scheme = components.scheme.lowercaseString;
+    BOOL valid = components &&
+        ([scheme isEqualToString:@"http"] ||
+         [scheme isEqualToString:@"https"]) &&
+        components.host.length != 0 &&
+        components.user.length == 0 && components.password.length == 0 &&
+        components.URL.absoluteString.length != 0;
+    if (!valid) {
+        if (message) *message = @"只接受不含用户凭据的完整 HTTP/HTTPS 链接";
+        return nil;
+    }
+    NSData *encoded = [components.URL.absoluteString
+        dataUsingEncoding:NSUTF8StringEncoding];
+    if (encoded.length == 0 || encoded.length > MACWS_VSCODE_URL_MAX_BYTES) {
+        if (message) *message = @"规范化后的网页链接过长";
+        return nil;
+    }
+    return components.URL.absoluteString;
+}
+
+static BOOL SendAllSocketBytes(int descriptor, const void *buffer,
+                               size_t length, int *errorOut) {
+    const uint8_t *bytes = buffer;
+    size_t offset = 0;
+    while (offset < length) {
+        ssize_t amount = send(descriptor, bytes + offset, length - offset, 0);
+        if (amount < 0 && errno == EINTR) continue;
+        if (amount <= 0) {
+            if (errorOut) *errorOut = amount < 0 ? errno : EPIPE;
+            return NO;
+        }
+        offset += (size_t)amount;
+    }
+    return YES;
+}
+
+static BOOL SendWebURLToVSCodeExtension(NSString *url,
+                                        NSTimeInterval timeout,
+                                        int *errorOut) {
+    NSData *payload = [url dataUsingEncoding:NSUTF8StringEncoding];
+    if (payload.length == 0 || payload.length > MACWS_VSCODE_URL_MAX_BYTES) {
+        if (errorOut) *errorOut = EINVAL;
+        return NO;
+    }
+    NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:timeout];
+    int descriptor = -1;
+    int savedError = ENOENT;
+    while (deadline.timeIntervalSinceNow > 0) {
+        descriptor = socket(AF_UNIX, SOCK_STREAM, 0);
+        if (descriptor < 0) {
+            savedError = errno;
+            break;
+        }
+        struct timeval socketTimeout = {.tv_sec = 10, .tv_usec = 0};
+        (void)setsockopt(descriptor, SOL_SOCKET, SO_SNDTIMEO,
+                         &socketTimeout, sizeof(socketTimeout));
+        (void)setsockopt(descriptor, SOL_SOCKET, SO_RCVTIMEO,
+                         &socketTimeout, sizeof(socketTimeout));
+        struct sockaddr_un address = {0};
+        address.sun_family = AF_UNIX;
+        strlcpy(address.sun_path, kVSCodeURLSocket,
+                sizeof(address.sun_path));
+        if (connect(descriptor, (const struct sockaddr *)&address,
+                    sizeof(address)) == 0) break;
+        savedError = errno;
+        close(descriptor);
+        descriptor = -1;
+        usleep(50000);
+    }
+    if (descriptor < 0) {
+        if (errorOut) *errorOut = savedError;
+        return NO;
+    }
+    uint32_t networkLength = htonl((uint32_t)payload.length);
+    BOOL transferred = SendAllSocketBytes(
+        descriptor, &networkLength, sizeof(networkLength), &savedError) &&
+        SendAllSocketBytes(descriptor, payload.bytes, payload.length,
+                           &savedError);
+    // The request is length-framed, so EOF is not part of its boundary.
+    // Do not half-close here: Node net.Server defaults allowHalfOpen to false
+    // and would mirror our FIN before the asynchronous simpleBrowser.show
+    // command can write its one-byte completion acknowledgement.
+    uint8_t acknowledgement = 0;
+    ssize_t received = transferred
+        ? recv(descriptor, &acknowledgement, sizeof(acknowledgement), 0) : -1;
+    if (received < 0) savedError = errno;
+    else if (received != 1 || acknowledgement != 1) savedError = EPROTO;
+    close(descriptor);
+    BOOL accepted = transferred && received == 1 && acknowledgement == 1;
+    if (errorOut) *errorOut = accepted ? 0 : savedError;
+    return accepted;
+}
+
+static void ActivateVSCodeAfterWebOpen(pid_t pid) {
+    if (pid <= 1 || !WaitForAppInputEndpoint(pid, 1.0)) return;
+    static _Atomic uint32_t sequence = 0;
+    MacWSInputRecord record = {
+        .magic = MACWS_INPUT_MAGIC,
+        .version = MACWS_INPUT_VERSION,
+        .kind = MacWSInputKindActivateTarget,
+        .frameWidth = 1,
+        .frameHeight = 1,
+        .targetPID = pid,
+        .source = MacWSInputSourceUnknown,
+        .sampleSequence = atomic_fetch_add(&sequence, 1) + 1,
+    };
+    int sendError = 0;
+    BOOL sent = SendAppInputRecord(pid, &record, &sendError);
+    HostLog(@"open-web-url activate pid=%d sent=%@ errno=%d", pid,
+            sent ? @"YES" : @"NO", sendError);
+}
+
+static BOOL OpenWebURLRequest(xpc_object_t request, pid_t *targetPIDOut,
+                              NSString **message) {
+    NSString *url = ValidatedWebURL(request, message);
+    if (!url) return NO;
+    if (!LaunchVSCode(message)) return NO;
+    os_unfair_lock_lock(&gStateLock);
+    pid_t targetPID = gActiveAppPID;
+    os_unfair_lock_unlock(&gStateLock);
+    if (targetPID <= 1) {
+        if (message) *message = @"VS Code 已启动，但没有有效进程";
+        return NO;
+    }
+    int sendError = 0;
+    BOOL accepted = SendWebURLToVSCodeExtension(url, 12.0, &sendError);
+    NSURLComponents *components = [NSURLComponents componentsWithString:url];
+    HostLog(@"open-web-url target=vscode pid=%d result=%@ errno=%d "
+            "scheme=%@ host=%@",
+            targetPID, accepted ? @"simple-browser-accepted" : @"failed",
+            sendError, components.scheme ?: @"", components.host ?: @"");
+    if (!accepted) {
+        if (message) *message = [NSString stringWithFormat:
+            @"VS Code Simple Browser 没有确认链接（errno=%d）", sendError];
+        return NO;
+    }
+    ActivateVSCodeAfterWebOpen(targetPID);
+    if (targetPIDOut) *targetPIDOut = targetPID;
+    if (message) *message = @"链接已由 VS Code Simple Browser 接收";
     return YES;
 }
 
@@ -6137,6 +6296,9 @@ static void ServeRequest(xpc_object_t request) {
         } else if (strcmp(op, MACWS_CONTROL_OP_OPEN_DOCUMENTS) == 0) {
             SetState(YES, @"正在打开 macOS 文稿…", @"");
             ok = OpenDocumentsRequest(request, &launchedAppPID, &message);
+        } else if (strcmp(op, MACWS_CONTROL_OP_OPEN_WEB_URL) == 0) {
+            SetState(YES, @"正在用 VS Code 打开网页…", @"");
+            ok = OpenWebURLRequest(request, &launchedAppPID, &message);
         } else if (strcmp(op, MACWS_CONTROL_OP_LAUNCH_PATH) == 0) {
             SetState(YES, @"启动 macOS 路径…", @"");
             ok = LaunchRequestedPath(

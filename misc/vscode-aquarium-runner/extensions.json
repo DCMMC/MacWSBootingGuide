@@ -3,13 +3,13 @@
     "identifier": {
       "id": "macwsguide.macws-aquarium-runner"
     },
-    "version": "0.0.1",
+    "version": "0.0.2",
     "location": {
       "$mid": 1,
-      "path": "/tmp/macws-vscode-extensions/macwsguide.macws-aquarium-runner-0.0.1",
+      "path": "/tmp/macws-vscode-extensions/macwsguide.macws-aquarium-runner-0.0.2",
       "scheme": "file"
     },
-    "relativeLocation": "macwsguide.macws-aquarium-runner-0.0.1",
+    "relativeLocation": "macwsguide.macws-aquarium-runner-0.0.2",
     "metadata": {
       "isApplicationScoped": false,
       "isMachineScoped": false,

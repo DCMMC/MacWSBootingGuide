@@ -159,6 +159,7 @@ static const char *KindName(MacWSInputKind kind) {
         case MacWSInputKindSystemGesture: return "system-gesture";
         case MacWSInputKindPerformPaste: return "perform-paste";
         case MacWSInputKindOpenDocuments: return "open-documents";
+        case MacWSInputKindPerformQuit: return "perform-quit";
     }
     return "invalid";
 }
@@ -212,6 +213,8 @@ static bool RecordIsValid(const MacWSInputRecord *record) {
         return record->targetPID > 1;
     if (record->kind == MacWSInputKindOpenDocuments)
         return record->targetPID > 1 && record->sceneID != 0;
+    if (record->kind == MacWSInputKindPerformQuit)
+        return record->targetPID > 1;
     if (record->kind == MacWSInputKindDesktopCommand)
         return record->targetPID > 1 &&
             record->contactID >= MacWSDesktopCommandSpaceLeft &&
@@ -255,7 +258,7 @@ static bool RecordIsValid(const MacWSInputRecord *record) {
         record->x < 0.0f || record->y < 0.0f ||
         record->x >= record->frameWidth || record->y >= record->frameHeight ||
         record->kind < MacWSInputKindTouchDown ||
-        record->kind > MacWSInputKindOpenDocuments) {
+        record->kind > MacWSInputKindPerformQuit) {
         return false;
     }
     return true;
@@ -307,6 +310,9 @@ static CGEventType EventTypeForRecord(const MacWSInputRecord *record,
         case MacWSInputKindReopenApplication:
         case MacWSInputKindDesktopCommand:
         case MacWSInputKindSystemGesture:
+        case MacWSInputKindPerformPaste:
+        case MacWSInputKindOpenDocuments:
+        case MacWSInputKindPerformQuit:
             // Consumed before event construction in main().
             return 0;
     }
@@ -1423,14 +1429,15 @@ int main(void) {
         // It has no Quartz point and must remain usable while WindowServer is
         // still publishing or reconfiguring display geometry.
         if (record.kind == MacWSInputKindConfigureWindow ||
-            record.kind == MacWSInputKindCloseWindow) {
+            record.kind == MacWSInputKindCloseWindow ||
+            record.kind == MacWSInputKindPerformQuit) {
             int appBridgeError = 0;
             bool appBridgeSent = SendToAppInputBridge(
                 socketFD, &record, &appBridgeError);
             sequence++;
             if (RuntimeDiagnosticsEnabled()) {
                 fprintf(stderr,
-                    "MACWS-INPUT WINDOW-CONTROL kind=%s seq=%llu target=%d "
+                    "MACWS-INPUT APP-CONTROL kind=%s seq=%llu target=%d "
                     "window=%u size=%.1fx%.1f density=%.2f sent=%s errno=%d\n",
                     KindName(record.kind),
                     (unsigned long long)sequence, record.targetPID,

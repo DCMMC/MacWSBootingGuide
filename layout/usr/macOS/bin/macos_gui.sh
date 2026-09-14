@@ -354,6 +354,7 @@ esac
 # an iOS-native helper. Temperature values and non-critical states are evidence
 # only; per policy, thermal intervention occurs only at `critical`.
 WD_THERMAL_POLL=300  # temperature sensors are sampled every 5 minutes
+WD_ARM_TIMEOUT=30    # cold-boot launchd scheduling can exceed the old 10s window
 # Do not gate or stop the GUI on `memory_pressure -Q`. iOS deliberately uses
 # otherwise-idle RAM for caches and reclaimable objects, so a free-percentage
 # threshold is not a reliable pressure-state boundary. The former 58% policy
@@ -1964,8 +1965,8 @@ ensure_chroot_works() {
 # plist, workload URL or extension behind; Chromium caches and session storage
 # remain intact for normal warm starts.
 prepare_vscode_production_assets() {
-    local extension_source="$VSCODE_ASSET_DIR/macwsguide.macws-aquarium-runner-0.0.1"
-    local extension_target="$VSCODE_EXTENSIONS_DIR/macwsguide.macws-aquarium-runner-0.0.1"
+    local extension_source="$VSCODE_ASSET_DIR/macwsguide.macws-aquarium-runner-0.0.2"
+    local extension_target="$VSCODE_EXTENSIONS_DIR/macwsguide.macws-aquarium-runner-0.0.2"
     local installed_schema="" marker_tmp=""
 
     [ -d "$ROOTFS/Applications/Visual Studio Code.app" ] || return 0
@@ -5207,7 +5208,7 @@ start_watchdog() {
         log "ERROR: mandatory health watchdog launchd job failed to load."
         return 1
     fi
-    while [ "$waited" -lt 10 ]; do
+    while [ "$waited" -lt "$WD_ARM_TIMEOUT" ]; do
         child=$(launchd_job_pid "$WATCHDOG_LABEL")
         IFS=' ' read -r ready_owner _ 2>/dev/null < "$WD_READY" || \
             ready_owner=""
@@ -5221,10 +5222,19 @@ start_watchdog() {
             [ -f "$WD_TRIP" ] && sed 's/^/[macos_gui]        /' "$WD_TRIP"
             return 1
         fi
+        # Runtime-confirmed after the 2026-09-14 cold boot: launchctl accepted
+        # the job, but launchd had not assigned it a PID or produced stdout by
+        # the old ten-second deadline. A one-shot start request is idempotent
+        # for an already-running label and nudges an accepted-but-undispatched
+        # cold-boot job without unloading or creating a competing generation.
+        if [ "$waited" -eq 5 ]; then
+            launchctl start "$WATCHDOG_LABEL" 2>/dev/null || true
+        fi
         sleep 1
         waited=$((waited + 1))
     done
-    log "ERROR: mandatory health watchdog did not acknowledge within 10 seconds."
+    log "ERROR: mandatory health watchdog did not acknowledge within ${WD_ARM_TIMEOUT} seconds."
+    launchctl list "$WATCHDOG_LABEL" >> "$WD_LOG" 2>&1 || true
     return 1
 }
 

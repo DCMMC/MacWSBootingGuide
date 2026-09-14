@@ -57,6 +57,37 @@ extern const CFStringRef kSecCodeInfoCMS;
 extern int proc_pidpath(int pid, void *buffer, uint32_t buffersize);
 extern CFTypeID CGImageGetTypeID(void);
 
+// The iPhoneOS SDK omits AppleEvent declarations although the target shared
+// cache exports the same Carbon ABI used by Ventura Dock. AEDesc is two
+// pointer-sized fields on arm64 (FourCharCode + padding + storage pointer).
+// Keep these declarations private so the iOS-targeted interposer can observe
+// Dock's macOS call boundary without importing an incompatible macOS SDK.
+typedef FourCharCode MacWSAEDescType;
+typedef FourCharCode MacWSAEKeyword;
+typedef SInt32 MacWSAESize;
+typedef SInt32 MacWSAESendMode;
+typedef struct {
+    MacWSAEDescType descriptorType;
+    void *dataHandle;
+} MacWSAppleEvent;
+typedef OSStatus (*MacWSAESendMessageFunction)(
+    const MacWSAppleEvent *event, MacWSAppleEvent *reply,
+    MacWSAESendMode sendMode, SInt32 timeOutInTicks);
+
+enum {
+    MacWSTypeNull = 0x6e756c6cu,                 // 'null'
+    MacWSTypeType = 0x74797065u,                 // 'type'
+    MacWSKeyAddressAttr = 0x61646472u,           // 'addr'
+    MacWSTypeKernelProcessID = 0x6b706964u,      // 'kpid'
+    MacWSTypeProcessSerialNumber = 0x70736e20u,  // 'psn '
+    MacWSKeyEventClassAttr = 0x6576636cu,        // 'evcl'
+    MacWSKeyEventIDAttr = 0x65766964u,           // 'evid'
+    MacWSCoreEventClass = 0x61657674u,           // 'aevt'
+    MacWSQuitApplication = 0x71756974u,           // 'quit'
+    MacWSProcNotFound = -600,
+    MacWSEventNotHandled = -1708,
+};
+
 static void macws_install_fsnode_root_volume_repair(void);
 static void macws_install_lsd_session_store_isolation(void);
 static const char *macws_private_bootstrap_service_name(const char *name);
@@ -12558,6 +12589,323 @@ static BOOL macws_process_is_dock(void) {
     // executable suffix, not one particular namespace spelling.
     return pathLength >= suffixLength &&
         strcmp(executable + pathLength - suffixLength, dockSuffix) == 0;
+}
+
+static BOOL macws_process_is_dock_quit_sender(void) {
+    if (macws_process_is_dock()) return YES;
+    char executable[PATH_MAX] = {0};
+    if (proc_pidpath(getpid(), executable, sizeof(executable)) <= 0)
+        return NO;
+    static const char dockHelperSuffix[] =
+        "/System/Library/CoreServices/Dock.app/Contents/XPCServices/"
+        "DockHelper.xpc/Contents/MacOS/DockHelper";
+    size_t pathLength = strlen(executable);
+    size_t suffixLength = sizeof(dockHelperSuffix) - 1;
+    return pathLength >= suffixLength &&
+        strcmp(executable + pathLength - suffixLength,
+               dockHelperSuffix) == 0;
+}
+
+static BOOL macws_apple_event_fourcc(const MacWSAppleEvent *event,
+                                     MacWSAEKeyword keyword,
+                                     OSType *valueOut) {
+    if (!event || !valueOut) return NO;
+    typedef OSStatus (*MacWSAEGetAttributePtrFunction)(
+        const MacWSAppleEvent *, MacWSAEKeyword, MacWSAEDescType,
+        MacWSAEDescType *, void *, MacWSAESize, MacWSAESize *);
+    MacWSAEGetAttributePtrFunction getAttribute =
+        (MacWSAEGetAttributePtrFunction)dlsym(
+            RTLD_DEFAULT, "AEGetAttributePtr");
+    if (!getAttribute) return NO;
+    MacWSAEDescType actualType = MacWSTypeNull;
+    MacWSAESize actualSize = 0;
+    OSType value = 0;
+    OSStatus status = getAttribute(event, keyword, MacWSTypeType,
+                                   &actualType, &value, sizeof(value),
+                                   &actualSize);
+    if (status != noErr || actualSize != sizeof(value)) return NO;
+    *valueOut = value;
+    return YES;
+}
+
+static pid_t macws_apple_event_target_pid(const MacWSAppleEvent *event) {
+    if (!event) return -1;
+    typedef OSStatus (*MacWSAEGetAttributePtrFunction)(
+        const MacWSAppleEvent *, MacWSAEKeyword, MacWSAEDescType,
+        MacWSAEDescType *, void *, MacWSAESize, MacWSAESize *);
+    MacWSAEGetAttributePtrFunction getAttribute =
+        (MacWSAEGetAttributePtrFunction)dlsym(
+            RTLD_DEFAULT, "AEGetAttributePtr");
+    if (!getAttribute) return -1;
+    MacWSAEDescType actualType = MacWSTypeNull;
+    MacWSAESize actualSize = 0;
+    pid_t targetPID = -1;
+    OSStatus status = getAttribute(
+        event, MacWSKeyAddressAttr, MacWSTypeKernelProcessID, &actualType,
+        &targetPID, sizeof(targetPID), &actualSize);
+    if (status == noErr && actualSize == sizeof(targetPID) && targetPID > 1)
+        return targetPID;
+
+    ProcessSerialNumber psn = {0};
+    actualType = MacWSTypeNull;
+    actualSize = 0;
+    status = getAttribute(event, MacWSKeyAddressAttr,
+                          MacWSTypeProcessSerialNumber, &actualType,
+                          &psn, sizeof(psn), &actualSize);
+    if (status != noErr || actualSize != sizeof(psn)) return -1;
+    typedef OSStatus (*MacWSGetProcessPIDFunction)(
+        const ProcessSerialNumber *, pid_t *);
+    MacWSGetProcessPIDFunction getProcessPID =
+        (MacWSGetProcessPIDFunction)dlsym(RTLD_DEFAULT, "GetProcessPID");
+    if (!getProcessPID) return -1;
+    targetPID = -1;
+    return getProcessPID(&psn, &targetPID) == noErr && targetPID > 1
+        ? targetPID : -1;
+}
+
+static BOOL macws_send_perform_quit_to_app(pid_t targetPID,
+                                           int *errorOut) {
+    if (errorOut) *errorOut = 0;
+    if (targetPID <= 1 || (kill(targetPID, 0) != 0 && errno != EPERM)) {
+        if (errorOut) *errorOut = ESRCH;
+        return NO;
+    }
+    char path[sizeof(((struct sockaddr_un *)0)->sun_path)] = {0};
+    int length = snprintf(path, sizeof(path),
+                          "/private/tmp/macws_app_input.%d.sock",
+                          targetPID);
+    if (length <= 0 || (size_t)length >= sizeof(path)) {
+        if (errorOut) *errorOut = ENAMETOOLONG;
+        return NO;
+    }
+    int socketFD = socket(AF_UNIX, SOCK_DGRAM, 0);
+    if (socketFD < 0) {
+        if (errorOut) *errorOut = errno;
+        return NO;
+    }
+    struct sockaddr_un address = {0};
+    address.sun_family = AF_UNIX;
+    memcpy(address.sun_path, path, (size_t)length + 1);
+    MacWSInputRecord record = {
+        .magic = MACWS_INPUT_MAGIC,
+        .version = MacWSInputWireVersionForKind(MacWSInputKindPerformQuit),
+        .kind = MacWSInputKindPerformQuit,
+        .timestamp = CFAbsoluteTimeGetCurrent(),
+        .frameWidth = 1,
+        .frameHeight = 1,
+        .targetPID = targetPID,
+        .source = MacWSInputSourceUnknown,
+    };
+    ssize_t sent = sendto(socketFD, &record, sizeof(record), MSG_DONTWAIT,
+                          (const struct sockaddr *)&address,
+                          sizeof(address));
+    int savedError = sent == (ssize_t)sizeof(record)
+        ? 0 : (sent < 0 ? errno : EMSGSIZE);
+    close(socketFD);
+    if (errorOut) *errorOut = savedError;
+    return sent == (ssize_t)sizeof(record);
+}
+
+static MacWSAESendMessageFunction g_macws_original_ae_send_message;
+static _Atomic bool g_macws_ae_stub_bridge_attempted;
+
+static OSStatus macws_AESendMessage(const MacWSAppleEvent *event,
+                                    MacWSAppleEvent *reply,
+                                    MacWSAESendMode sendMode,
+                                    SInt32 timeOutInTicks) {
+    // RE-confirmed via the installed Ventura 13.4 Dock arm64e binary: its
+    // application-action paths call AESendMessage (including the call at
+    // __TEXT 0x1001a884c) and evaluate the returned OSStatus. Preserve the
+    // stock transaction first. Only Dock/DockHelper's exact aevt/quit event
+    // that returns procNotFound (-600) is eligible for the process-local
+    // transport used by directly-exec'd chroot applications.
+    MacWSAESendMessageFunction original = g_macws_original_ae_send_message;
+    if (!original) return MacWSEventNotHandled;
+    OSStatus status = original(event, reply, sendMode, timeOutInTicks);
+    if (status != MacWSProcNotFound ||
+        !macws_process_is_dock_quit_sender())
+        return status;
+    OSType eventClass = 0;
+    OSType eventID = 0;
+    if (!macws_apple_event_fourcc(
+            event, MacWSKeyEventClassAttr, &eventClass) ||
+        !macws_apple_event_fourcc(event, MacWSKeyEventIDAttr, &eventID) ||
+        eventClass != MacWSCoreEventClass ||
+        eventID != MacWSQuitApplication)
+        return status;
+    pid_t targetPID = macws_apple_event_target_pid(event);
+    int sendError = 0;
+    BOOL sent = macws_send_perform_quit_to_app(targetPID, &sendError);
+    // A successful bridged Quit is normal production behavior. Keep the
+    // per-action witness behind diagnostics, while retaining a failure line
+    // because that is actionable and otherwise indistinguishable from Dock's
+    // stock procNotFound result at the UI boundary.
+    if (!sent || macws_runtime_diagnostics_enabled()) {
+        fprintf(stderr,
+            "#### MACWS QUIT-BRIDGE sender=%s target=%d event=%08x/%08x "
+            "original=%d sent=%s errno=%d\n",
+            getprogname() ?: "unknown", targetPID, eventClass, eventID,
+            (int)status, sent ? "YES" : "NO", sendError);
+        fflush(stderr);
+    }
+    return sent ? noErr : status;
+}
+
+static void *macws_import_stub(const struct mach_header *header,
+                               intptr_t slide, const char *symbolName) {
+    if (!header || header->magic != MH_MAGIC_64 || !symbolName)
+        return NULL;
+    const struct mach_header_64 *header64 =
+        (const struct mach_header_64 *)header;
+    const struct segment_command_64 *linkedit = NULL;
+    const struct symtab_command *symbols = NULL;
+    const struct dysymtab_command *dynamicSymbols = NULL;
+    const struct load_command *command =
+        (const struct load_command *)(header64 + 1);
+    for (uint32_t index = 0; index < header64->ncmds; index++) {
+        if (command->cmd == LC_SEGMENT_64) {
+            const struct segment_command_64 *segment =
+                (const struct segment_command_64 *)command;
+            if (!strcmp(segment->segname, SEG_LINKEDIT)) linkedit = segment;
+        } else if (command->cmd == LC_SYMTAB) {
+            symbols = (const struct symtab_command *)command;
+        } else if (command->cmd == LC_DYSYMTAB) {
+            dynamicSymbols = (const struct dysymtab_command *)command;
+        }
+        command = (const struct load_command *)
+            ((const uint8_t *)command + command->cmdsize);
+    }
+    if (!linkedit || !symbols || !dynamicSymbols) return NULL;
+    uintptr_t linkeditBase = (uintptr_t)slide + linkedit->vmaddr -
+        linkedit->fileoff;
+    const struct nlist_64 *symbolTable =
+        (const struct nlist_64 *)(linkeditBase + symbols->symoff);
+    const char *stringTable =
+        (const char *)(linkeditBase + symbols->stroff);
+    const uint32_t *indirectTable =
+        (const uint32_t *)(linkeditBase + dynamicSymbols->indirectsymoff);
+
+    command = (const struct load_command *)(header64 + 1);
+    for (uint32_t commandIndex = 0;
+         commandIndex < header64->ncmds; commandIndex++) {
+        if (command->cmd != LC_SEGMENT_64) {
+            command = (const struct load_command *)
+                ((const uint8_t *)command + command->cmdsize);
+            continue;
+        }
+        const struct segment_command_64 *segment =
+            (const struct segment_command_64 *)command;
+        const struct section_64 *section =
+            (const struct section_64 *)(segment + 1);
+        for (uint32_t sectionIndex = 0;
+             sectionIndex < segment->nsects; sectionIndex++, section++) {
+            if ((section->flags & SECTION_TYPE) != S_SYMBOL_STUBS ||
+                section->reserved2 == 0)
+                continue;
+            size_t count = (size_t)(section->size / section->reserved2);
+            for (size_t stubIndex = 0; stubIndex < count; stubIndex++) {
+                uint32_t indirectIndex = section->reserved1 + stubIndex;
+                if (indirectIndex >= dynamicSymbols->nindirectsyms) break;
+                uint32_t symbolIndex = indirectTable[indirectIndex];
+                if (symbolIndex == INDIRECT_SYMBOL_ABS ||
+                    symbolIndex == INDIRECT_SYMBOL_LOCAL ||
+                    symbolIndex == (INDIRECT_SYMBOL_LOCAL |
+                                    INDIRECT_SYMBOL_ABS) ||
+                    symbolIndex >= symbols->nsyms)
+                    continue;
+                uint32_t stringOffset =
+                    symbolTable[symbolIndex].n_un.n_strx;
+                if (stringOffset >= symbols->strsize) continue;
+                if (strcmp(stringTable + stringOffset, symbolName) != 0)
+                    continue;
+                return (void *)((uintptr_t)slide + section->addr +
+                    stubIndex * section->reserved2);
+            }
+        }
+        command = (const struct load_command *)
+            ((const uint8_t *)command + command->cmdsize);
+    }
+    return NULL;
+}
+
+static void macws_install_dock_ae_quit_bridge(
+        const struct mach_header *header, intptr_t slide) {
+    if (atomic_load_explicit(&g_macws_ae_stub_bridge_attempted,
+                             memory_order_acquire) || !header ||
+        header->magic != MH_MAGIC_64)
+        return;
+    Dl_info imageInfo = {0};
+    (void)dladdr(header, &imageInfo);
+    const char *imagePath = imageInfo.dli_fname;
+    static const char dockSuffix[] =
+        "/System/Library/CoreServices/Dock.app/Contents/MacOS/Dock";
+    static const char helperSuffix[] =
+        "/System/Library/CoreServices/Dock.app/Contents/XPCServices/"
+        "DockHelper.xpc/Contents/MacOS/DockHelper";
+    size_t pathLength = imagePath ? strlen(imagePath) : 0;
+    size_t dockLength = sizeof(dockSuffix) - 1;
+    size_t helperLength = sizeof(helperSuffix) - 1;
+    BOOL exactDock = pathLength >= dockLength &&
+        strcmp(imagePath + pathLength - dockLength, dockSuffix) == 0;
+    BOOL exactHelper = pathLength >= helperLength &&
+        strcmp(imagePath + pathLength - helperLength, helperSuffix) == 0;
+    if (!exactDock && !exactHelper) return;
+    void *stub = macws_import_stub(header, slide, "_AESendMessage");
+    if (!stub) return;
+    static pthread_mutex_t installLock = PTHREAD_MUTEX_INITIALIZER;
+    pthread_mutex_lock(&installLock);
+    if (!atomic_load_explicit(&g_macws_ae_stub_bridge_attempted,
+                              memory_order_relaxed)) {
+        atomic_store_explicit(&g_macws_ae_stub_bridge_attempted, true,
+                              memory_order_release);
+        MacWSAESendMessageFunction implementation =
+            (MacWSAESendMessageFunction)dlsym(RTLD_DEFAULT,
+                                               "AESendMessage");
+        Dl_info implementationInfo = {0};
+        BOOL implementationResolved = implementation &&
+            (void *)implementation != stub &&
+            dladdr((void *)implementation, &implementationInfo) != 0 &&
+            implementationInfo.dli_fbase != header;
+        if (!implementationResolved) {
+            fprintf(stderr,
+                    "#### MACWS QUIT-BRIDGE unavailable sender=%s "
+                    "stub=%p implementation=%p image=%s\n",
+                    getprogname() ?: "unknown", stub, implementation,
+                    implementationInfo.dli_fname ?: "(unresolved)");
+            fflush(stderr);
+            pthread_mutex_unlock(&installLock);
+            return;
+        }
+        g_macws_original_ae_send_message = implementation;
+        // Do not put AESendMessage in libmachook's global interpose table:
+        // codesign and other injected CLI processes do not load AE/HIServices.
+        // RE-confirmed via Ventura 13.4 Dock's actual arm64e image and otool:
+        // _AESendMessage is auth stub 0x1002f7070. Runtime-confirmed by
+        // Dock-2026-09-14-052050.ips: Substrate's returned "original" began at
+        // that stub's +12 instruction, lacked the authenticated branch setup,
+        // and PAC-faulted when an ordinary Finder click reached it. Use the
+        // loader-resolved implementation as the preserved original; the hook
+        // remains confined to Dock's symbolically identified import stub.
+        MSHookFunction(stub, (void *)macws_AESendMessage,
+                       NULL);
+        if (macws_runtime_diagnostics_enabled()) {
+            fprintf(stderr,
+                    "#### MACWS QUIT-BRIDGE installed sender=%s "
+                    "stub=%p implementation=%p image=%s\n",
+                    getprogname() ?: "unknown", stub,
+                    g_macws_original_ae_send_message,
+                    implementationInfo.dli_fname ?: "(unknown)");
+            fflush(stderr);
+        }
+    }
+    pthread_mutex_unlock(&installLock);
+}
+
+__attribute__((constructor))
+static void macws_register_dock_ae_quit_bridge(void) {
+    // Registration immediately visits existing images and also catches the
+    // later HIServices load used by DockHelper on demand.
+    _dyld_register_func_for_add_image(macws_install_dock_ae_quit_bridge);
 }
 
 static OSStatus macws_LSOpenFromURLSpec(

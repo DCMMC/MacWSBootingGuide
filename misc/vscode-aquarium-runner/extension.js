@@ -1,4 +1,95 @@
 const vscode = require("vscode");
+const fs = require("fs");
+const net = require("net");
+
+const urlSocketPath = "/private/tmp/macws_vscode_url.sock";
+const maximumURLBytes = 8192;
+
+function validatedWebURL(value) {
+  if (typeof value !== "string" || value.length === 0) return undefined;
+  try {
+    const parsed = new URL(value);
+    if ((parsed.protocol !== "http:" && parsed.protocol !== "https:") ||
+        parsed.username || parsed.password) return undefined;
+    return parsed.toString();
+  } catch {
+    return undefined;
+  }
+}
+
+async function openWebURL(value) {
+  const url = validatedWebURL(value);
+  if (!url) throw new Error("MacWS rejected an invalid web URL");
+  await vscode.commands.executeCommand("simpleBrowser.show", url);
+  console.log("MACWS web URL accepted by Simple Browser");
+}
+
+function removeOwnedSocket() {
+  try {
+    const status = fs.lstatSync(urlSocketPath);
+    if (status.isSocket()) fs.unlinkSync(urlSocketPath);
+  } catch (error) {
+    if (error?.code !== "ENOENT") {
+      console.error("MACWS URL socket cleanup failed", error);
+    }
+  }
+}
+
+function createURLServer() {
+  removeOwnedSocket();
+  const server = net.createServer((socket) => {
+    let bytes = Buffer.alloc(0);
+    let expectedLength;
+    let completed = false;
+    const reject = (error) => {
+      if (completed) return;
+      completed = true;
+      console.error("MACWS URL request rejected", error);
+      socket.end(Buffer.from([0]));
+    };
+    socket.setTimeout(10000, () => reject(new Error("request timed out")));
+    socket.on("error", (error) => {
+      if (!completed) console.error("MACWS URL connection failed", error);
+      completed = true;
+    });
+    socket.on("data", (chunk) => {
+      if (completed) return;
+      bytes = Buffer.concat([bytes, chunk]);
+      if (expectedLength === undefined && bytes.length >= 4) {
+        expectedLength = bytes.readUInt32BE(0);
+        bytes = bytes.subarray(4);
+        if (expectedLength === 0 || expectedLength > maximumURLBytes) {
+          reject(new Error(`invalid URL byte count ${expectedLength}`));
+          return;
+        }
+      }
+      if (expectedLength === undefined || bytes.length < expectedLength) return;
+      if (bytes.length !== expectedLength) {
+        reject(new Error("URL request contains trailing bytes"));
+        return;
+      }
+      completed = true;
+      const value = bytes.toString("utf8");
+      openWebURL(value).then(
+        () => socket.end(Buffer.from([1])),
+        (error) => {
+          completed = false;
+          reject(error);
+        },
+      );
+    });
+  });
+  server.on("error", (error) => {
+    console.error("MACWS URL server failed", error);
+  });
+  server.listen(urlSocketPath, () => {
+    fs.chmod(urlSocketPath, 0o600, (error) => {
+      if (error) console.error("MACWS URL socket chmod failed", error);
+    });
+    console.log(`MACWS URL server listening at ${urlSocketPath}`);
+  });
+  return server;
+}
 
 async function openAquarium() {
   const configuration = vscode.workspace.getConfiguration("macwsAquarium");
@@ -63,6 +154,13 @@ async function convergeToOneAquarium() {
 }
 
 function activate(context) {
+  const urlServer = createURLServer();
+  context.subscriptions.push({
+    dispose: () => {
+      urlServer.close();
+      removeOwnedSocket();
+    },
+  });
   context.subscriptions.push(
     vscode.commands.registerCommand("macwsAquarium.open", openAquarium),
   );

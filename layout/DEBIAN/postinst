@@ -91,6 +91,20 @@ for launch_plist in /var/jb/Library/LaunchDaemons/com.macwsguide*.plist; do
     chmod 0644 "$launch_plist" || exit 1
 done
 
+# Runtime-confirmed on the 2026-09-14 cold boot: Terminal's unchanged signed
+# main image was owned by uid/gid 501, so macws_system_app_prepare.py rejected
+# it before spawn with its exact "root-owned regular file" policy. Normalize
+# only this canonical stock executable; do not chown an unexpected symlink or
+# any user application bundle.
+terminal_main="$ROOTFS/System/Applications/Utilities/Terminal.app/Contents/MacOS/Terminal"
+if [ -e "$terminal_main" ]; then
+    [ -f "$terminal_main" ] && [ ! -L "$terminal_main" ] || {
+        echo 'ERROR: Terminal main executable is not a regular file.' >&2
+        exit 1
+    }
+    chown root:wheel "$terminal_main" || exit 1
+fi
+
 # Theos builds libmachook for iOS and the chroot's macOS dyld rejects that
 # LC_BUILD_VERSION. This used to be a mandatory SSH-only step after every
 # package install. Do it before publishing the App's root control service so a
@@ -797,29 +811,34 @@ windowing_ready() {
         "$windowing_witness" 2>/dev/null
 }
 if ! windowing_ready; then
-    old_springboard_pid=$(springboard_pid)
-    rm -f "$windowing_witness"
-    if [ -n "$old_springboard_pid" ]; then
-        /var/jb/usr/bin/killall SpringBoard 2>/dev/null || exit 1
+    if [ "${MACWS_POSTINST_NO_RESPRING:-0}" = 1 ]; then
+        echo 'MacWSWindowing refresh deferred by MACWS_POSTINST_NO_RESPRING=1.'
+        echo 'The new SpringBoard-side window policy will load at the next user-initiated respring.'
     else
-        /var/jb/usr/bin/launchctl load \
-            /System/Library/LaunchDaemons/com.apple.SpringBoard.plist \
-            2>/dev/null || true
+        old_springboard_pid=$(springboard_pid)
+        rm -f "$windowing_witness"
+        if [ -n "$old_springboard_pid" ]; then
+            /var/jb/usr/bin/killall SpringBoard 2>/dev/null || exit 1
+        else
+            /var/jb/usr/bin/launchctl load \
+                /System/Library/LaunchDaemons/com.apple.SpringBoard.plist \
+                2>/dev/null || true
+        fi
+        windowing_waited=0
+        while [ "$windowing_waited" -lt 80 ] && ! windowing_ready; do
+            sleep 0.25
+            windowing_waited=$((windowing_waited + 1))
+        done
+        if ! windowing_ready; then
+            echo 'ERROR: MacWSWindowing did not attach to the current SpringBoard within 20 seconds.' >&2
+            exit 1
+        fi
+        if [ -x /var/jb/usr/bin/uicache ]; then
+            /var/jb/usr/bin/uicache -p \
+                /var/jb/Applications/MacWSHost.app 2>/dev/null || true
+        fi
+        echo "Refreshed MacWSWindowing for SpringBoard pid=$(springboard_pid)."
     fi
-    windowing_waited=0
-    while [ "$windowing_waited" -lt 80 ] && ! windowing_ready; do
-        sleep 0.25
-        windowing_waited=$((windowing_waited + 1))
-    done
-    if ! windowing_ready; then
-        echo 'ERROR: MacWSWindowing did not attach to the current SpringBoard within 20 seconds.' >&2
-        exit 1
-    fi
-    if [ -x /var/jb/usr/bin/uicache ]; then
-        /var/jb/usr/bin/uicache -p \
-            /var/jb/Applications/MacWSHost.app 2>/dev/null || true
-    fi
-    echo "Refreshed MacWSWindowing for SpringBoard pid=$(springboard_pid)."
 fi
 
 # AppKit's ViewBridge, HIServices and open/save-panel helpers, plus

@@ -1209,6 +1209,18 @@ add_all_trustcache /var/jb/usr/lib/libroot.dylib
 add_all_trustcache /var/mnt/rootfs/System/Library/PrivateFrameworks/SkyLight.framework/Versions/A/Resources/CursorAsset
 add_all_trustcache /var/mnt/rootfs/System/Library/PrivateFrameworks/SkyLight.framework/Versions/A/Resources/CursorAsset_base
 add_all_trustcache /var/mnt/rootfs/System/Library/PrivateFrameworks/GPUCompiler.framework/Versions/31001/Libraries/libGPUCompiler.dylib
+# Runtime-confirmed on the 2026-09-14 cold boot: a uid/gid 501 Terminal main
+# image was rejected by the root-owned first-party application admission
+# invariant before spawn. Repair only the canonical regular stock executable;
+# its content and existing CodeDirectory remain unchanged.
+TERMINAL_MAIN=/var/mnt/rootfs/System/Applications/Utilities/Terminal.app/Contents/MacOS/Terminal
+if [ -e "$TERMINAL_MAIN" ]; then
+    [ -f "$TERMINAL_MAIN" ] && [ ! -L "$TERMINAL_MAIN" ] || {
+        echo 'ERROR: Terminal main executable is not a regular file.' >&2
+        exit 1
+    }
+    chown root:wheel "$TERMINAL_MAIN" || exit 1
+fi
 add_all_trustcache /var/mnt/rootfs/System/Applications/Utilities/Terminal.app/Contents/MacOS/Terminal
 sign_and_trustcache '/var/mnt/rootfs/System/Applications/System Settings.app/Contents/MacOS/System Settings'
 sign_and_trustcache_with_identifier_requirement \

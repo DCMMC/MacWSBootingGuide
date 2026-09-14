@@ -13,7 +13,11 @@
 // RunningBoard cannot launch that foreign macOS executable.  hostd validates
 // both the bundle and document paths, starts/reuses the target process, then
 // hands the standard open-documents lifecycle to that process's AppKit bridge.
-#define MACWS_CONTROL_VERSION 11u
+// Version 12 adds the web-URL routing transaction. AppKit callers submit only
+// validated HTTP(S) URLs; hostd starts/reuses the production VS Code job and
+// waits for its packaged extension to acknowledge that Simple Browser
+// accepted the URL.
+#define MACWS_CONTROL_VERSION 12u
 
 #define MACWS_CONTROL_KEY_OP "op"
 #define MACWS_CONTROL_KEY_APP_ID "app_id"
@@ -37,6 +41,7 @@
 #define MACWS_CONTROL_KEY_DOCUMENT_OPEN_PENDING "document_open_pending"
 #define MACWS_CONTROL_KEY_PROVIDER_SOURCE_PATH "provider_source_path"
 #define MACWS_CONTROL_KEY_PROVIDER_DESTINATION_PATH "provider_destination_path"
+#define MACWS_CONTROL_KEY_WEB_URL "web_url"
 
 #define MACWS_CONTROL_OP_STATUS "status"
 #define MACWS_CONTROL_OP_START "start"
@@ -53,5 +58,9 @@
 #define MACWS_CONTROL_OP_RETARGET_METAL_LIBRARY "retarget-metal-library"
 #define MACWS_CONTROL_OP_OPEN_DOCUMENTS "open-documents"
 #define MACWS_CONTROL_OP_STAGE_PROVIDER_FILE "stage-provider-file"
+#define MACWS_CONTROL_OP_OPEN_WEB_URL "open-web-url"
+
+#define MACWS_VSCODE_URL_SOCKET_PATH "/private/tmp/macws_vscode_url.sock"
+#define MACWS_VSCODE_URL_MAX_BYTES 8192u
 
 #endif
