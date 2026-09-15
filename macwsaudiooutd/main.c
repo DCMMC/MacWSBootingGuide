@@ -20,6 +20,10 @@ typedef struct {
     uint64_t readFrame;
     uint64_t observedCallbackCount;
     uint64_t observedCallbackMachTime;
+    uint64_t pendingStartFrame;
+    int16_t lastSample[MACWS_AUDIO_CHANNELS];
+    bool pendingStart;
+    bool recoveringFromUnderrun;
     AudioQueueRef queue;
     bool acceptingCallbacks;
 } OutputState;
@@ -49,7 +53,7 @@ static void CopyFrames(OutputState *state, int16_t *destination,
         &state->header->writeFrame, __ATOMIC_ACQUIRE);
     uint64_t capacity = state->header->capacityFrames;
     if (writer > state->readFrame + capacity) {
-        state->readFrame = writer - capacity / 4;
+        state->readFrame = writer - MACWS_AUDIO_OUTPUT_PREROLL_FRAMES;
     }
     uint64_t available = writer > state->readFrame
         ? writer - state->readFrame : 0;
@@ -69,6 +73,45 @@ static void CopyFrames(OutputState *state, int16_t *destination,
                    sizeof(*destination));
     }
     state->readFrame += copiedFrames;
+
+    if (copiedFrames && state->recoveringFromUnderrun) {
+        uint32_t rampFrames = copiedFrames < 64 ? copiedFrames : 64;
+        for (uint32_t frame = 0; frame < rampFrames; frame++) {
+            for (uint32_t channel = 0;
+                 channel < MACWS_AUDIO_CHANNELS; channel++) {
+                size_t sample = (size_t)frame * MACWS_AUDIO_CHANNELS + channel;
+                destination[sample] = (int16_t)(
+                    (int32_t)destination[sample] * (int32_t)(frame + 1) /
+                    (int32_t)rampFrames);
+            }
+        }
+        state->recoveringFromUnderrun = false;
+    }
+    if (copiedFrames) {
+        for (uint32_t channel = 0; channel < MACWS_AUDIO_CHANNELS; channel++)
+            state->lastSample[channel] = destination[
+                (size_t)(copiedFrames - 1) * MACWS_AUDIO_CHANNELS + channel];
+    }
+    if (copiedFrames < frameCount) {
+        uint32_t missing = frameCount - copiedFrames;
+        uint32_t rampFrames = missing < 64 ? missing : 64;
+        for (uint32_t frame = 0; frame < rampFrames; frame++) {
+            for (uint32_t channel = 0;
+                 channel < MACWS_AUDIO_CHANNELS; channel++) {
+                size_t sample = (size_t)(copiedFrames + frame) *
+                    MACWS_AUDIO_CHANNELS + channel;
+                destination[sample] = (int16_t)(
+                    (int32_t)state->lastSample[channel] *
+                    (int32_t)(rampFrames - frame - 1) /
+                    (int32_t)rampFrames);
+            }
+        }
+        memset(state->lastSample, 0, sizeof(state->lastSample));
+        state->recoveringFromUnderrun = true;
+        __atomic_add_fetch(
+            &state->header->reserved[MACWS_AUDIO_RESERVED_UNDERRUN_COUNT],
+            1, __ATOMIC_RELAXED);
+    }
 }
 
 static void OutputCallback(void *context, AudioQueueRef queue,
@@ -118,7 +161,10 @@ static OSStatus StartOutput(OutputState *state) {
     if (status != noErr) return status;
     uint64_t writer = __atomic_load_n(
         &state->header->writeFrame, __ATOMIC_ACQUIRE);
-    state->readFrame = writer > 960 ? writer - 960 : 0;
+    state->readFrame = writer > MACWS_AUDIO_OUTPUT_PREROLL_FRAMES
+        ? writer - MACWS_AUDIO_OUTPUT_PREROLL_FRAMES : 0;
+    memset(state->lastSample, 0, sizeof(state->lastSample));
+    state->recoveringFromUnderrun = false;
     state->acceptingCallbacks = true;
     const UInt32 framesPerBuffer = 960;
     const UInt32 bytes = framesPerBuffer * format.mBytesPerFrame;
@@ -211,7 +257,9 @@ int main(void) {
             callbackCount != state.observedCallbackCount) {
             state.observedCallbackCount = callbackCount;
             state.observedCallbackMachTime = now;
-        } else if (__atomic_load_n(&state.header->reserved[0],
+        } else if (__atomic_load_n(
+                       &state.header->reserved[
+                           MACWS_AUDIO_RESERVED_WRITER_LOCK],
                                    __ATOMIC_ACQUIRE) != 0 &&
                    state.observedCallbackMachTime != 0) {
             // A renderer can terminate inside its realtime callback. Its
@@ -225,7 +273,9 @@ int main(void) {
             if (stalledNanoseconds >= 1000ULL * 1000ULL * 1000ULL) {
                 uint64_t locked = 1;
                 (void)__atomic_compare_exchange_n(
-                    &state.header->reserved[0], &locked, 0, false,
+                    &state.header->reserved[
+                        MACWS_AUDIO_RESERVED_WRITER_LOCK],
+                    &locked, 0, false,
                     __ATOMIC_RELEASE, __ATOMIC_RELAXED);
                 state.observedCallbackMachTime = now;
             }
@@ -236,12 +286,26 @@ int main(void) {
         bool recentAudio = audible != 0 &&
             elapsedNanoseconds < silenceNanoseconds;
         if (recentAudio && !state.queue) {
-            OSStatus status = StartOutput(&state);
-            dprintf(STDERR_FILENO,
-                    "macwsaudiooutd: output start status=%d\n", (int)status);
+            uint64_t writer = __atomic_load_n(
+                &state.header->writeFrame, __ATOMIC_ACQUIRE);
+            if (!state.pendingStart) {
+                state.pendingStart = true;
+                state.pendingStartFrame = writer;
+            }
+            if (writer >= state.pendingStartFrame &&
+                writer - state.pendingStartFrame >=
+                    MACWS_AUDIO_OUTPUT_PREROLL_FRAMES) {
+                OSStatus status = StartOutput(&state);
+                state.pendingStart = false;
+                dprintf(STDERR_FILENO,
+                        "macwsaudiooutd: output start status=%d preroll=%u\n",
+                        (int)status, MACWS_AUDIO_OUTPUT_PREROLL_FRAMES);
+            }
         } else if (!recentAudio && state.queue) {
             StopOutput(&state);
             dprintf(STDERR_FILENO, "macwsaudiooutd: output idle\n");
+        } else if (!recentAudio) {
+            state.pendingStart = false;
         }
         // AudioQueue owns the active render cadence. This control loop only
         // notices transitions between silence and playback, so 50 ms keeps

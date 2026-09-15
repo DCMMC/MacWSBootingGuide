@@ -28,12 +28,53 @@ typedef struct {
     void *originalContext;
     AudioStreamBasicDescription format;
     MacWSAudioRingHeader *ring;
+    uint64_t producerToken;
     int16_t scratch[4096 * MACWS_AUDIO_CHANNELS];
 } MacWSAudioRenderContext;
 
 static MacWSAudioUnitSetPropertyFn gMacWSOriginalAudioUnitSetProperty;
 static MacWSAudioUnitGetPropertyFn gMacWSAudioUnitGetProperty;
 static _Atomic(bool) gMacWSAudioHookInstalled;
+static _Atomic(uint32_t) gMacWSAudioProducerSerial = 1;
+static uint64_t gMacWSAudioOwnerSilenceTicks;
+
+static BOOL MacWSAudioContextOwnsRing(MacWSAudioRenderContext *context,
+                                     uint16_t peak,
+                                     uint64_t now) {
+    if (!context || !context->ring || !context->producerToken) return NO;
+    MacWSAudioRingHeader *header = context->ring;
+    uint64_t owner = __atomic_load_n(
+        &header->reserved[MACWS_AUDIO_RESERVED_OWNER_TOKEN],
+        __ATOMIC_ACQUIRE);
+    if (owner == context->producerToken) {
+        if (peak >= 8) {
+            __atomic_store_n(
+                &header->reserved[MACWS_AUDIO_RESERVED_OWNER_LAST_AUDIBLE],
+                now, __ATOMIC_RELEASE);
+        }
+        return YES;
+    }
+    // A context cannot take ownership before it has real signal. This keeps
+    // Chromium's dormant/silent AudioUnits from interleaving zero blocks with
+    // the active YouTube stream.
+    if (peak < 8) return NO;
+    uint64_t lastAudible = __atomic_load_n(
+        &header->reserved[MACWS_AUDIO_RESERVED_OWNER_LAST_AUDIBLE],
+        __ATOMIC_ACQUIRE);
+    if (owner != 0 && lastAudible != 0 && now > lastAudible &&
+        now - lastAudible <= gMacWSAudioOwnerSilenceTicks)
+        return NO;
+    uint64_t expected = owner;
+    if (!__atomic_compare_exchange_n(
+            &header->reserved[MACWS_AUDIO_RESERVED_OWNER_TOKEN],
+            &expected, context->producerToken, false,
+            __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+        return expected == context->producerToken;
+    __atomic_store_n(
+        &header->reserved[MACWS_AUDIO_RESERVED_OWNER_LAST_AUDIBLE],
+        now, __ATOMIC_RELEASE);
+    return YES;
+}
 
 static MacWSAudioRingHeader *MacWSMapAudioRing(void) {
     int descriptor = open(MACWS_AUDIO_RING_CHROOT_PATH,
@@ -102,12 +143,6 @@ static void MacWSPublishAudio(MacWSAudioRenderContext *context,
     MacWSAudioRingHeader *header = context->ring;
     if (!header) return;
 
-    // Audio render callbacks must never wait behind another process. Drop a
-    // single quantum on contention; the next callback arrives in a few ms.
-    if (__atomic_exchange_n(&header->reserved[0], 1,
-                            __ATOMIC_ACQUIRE) != 0)
-        return;
-
     double sourceRate = context->format.mSampleRate;
     if (sourceRate < 1.0) sourceRate = MACWS_AUDIO_SAMPLE_RATE;
     UInt32 outputFrames = (UInt32)(
@@ -134,6 +169,16 @@ static void MacWSPublishAudio(MacWSAudioRenderContext *context,
         }
     }
 
+    uint64_t now = mach_continuous_time();
+    if (!MacWSAudioContextOwnsRing(context, peak, now)) return;
+
+    // Audio render callbacks must never wait behind another process. Drop a
+    // single quantum on contention; the next callback arrives in a few ms.
+    if (__atomic_exchange_n(
+            &header->reserved[MACWS_AUDIO_RESERVED_WRITER_LOCK], 1,
+            __ATOMIC_ACQUIRE) != 0)
+        return;
+
     const uint64_t capacity = header->capacityFrames;
     uint64_t writeFrame = __atomic_load_n(
         &header->writeFrame, __ATOMIC_RELAXED);
@@ -152,12 +197,14 @@ static void MacWSPublishAudio(MacWSAudioRenderContext *context,
     }
     if (peak >= 8) {
         __atomic_store_n(&header->lastAudibleMachTime,
-                         mach_continuous_time(), __ATOMIC_RELEASE);
+                         now, __ATOMIC_RELEASE);
     }
     __atomic_add_fetch(&header->callbackCount, 1, __ATOMIC_RELAXED);
     __atomic_store_n(&header->writeFrame, writeFrame + outputFrames,
                      __ATOMIC_RELEASE);
-    __atomic_store_n(&header->reserved[0], 0, __ATOMIC_RELEASE);
+    __atomic_store_n(
+        &header->reserved[MACWS_AUDIO_RESERVED_WRITER_LOCK], 0,
+        __ATOMIC_RELEASE);
 }
 
 static OSStatus MacWSAudioRenderCallback(
@@ -196,6 +243,9 @@ static OSStatus MacWSAudioUnitSetProperty(
     }
     context->original = callback->inputProc;
     context->originalContext = callback->inputProcRefCon;
+    context->producerToken = ((uint64_t)(uint32_t)getpid() << 32) |
+        atomic_fetch_add_explicit(&gMacWSAudioProducerSerial, 1,
+                                  memory_order_relaxed);
     UInt32 formatSize = sizeof(context->format);
     if (!gMacWSAudioUnitGetProperty ||
         gMacWSAudioUnitGetProperty(
@@ -234,5 +284,18 @@ void MacWSInstallAudioRenderBridge(void) {
 __attribute__((constructor)) static void MacWSInitializeAudioRenderBridge(void) {
     const char *enabled = getenv("MACWS_AUDIO_RENDER_BRIDGE");
     if (!enabled || strcmp(enabled, "1") != 0) return;
+    mach_timebase_info_data_t timebase = {0};
+    if (mach_timebase_info(&timebase) == KERN_SUCCESS &&
+        timebase.numer != 0) {
+        long double ticks =
+            (long double)MACWS_AUDIO_OWNER_SILENCE_NANOSECONDS *
+            timebase.denom / timebase.numer;
+        // The interval is fixed at 500 ms and mach timebase ratios are small;
+        // its tick representation is therefore far below UINT64_MAX.
+        gMacWSAudioOwnerSilenceTicks = (uint64_t)ticks;
+    }
+    if (gMacWSAudioOwnerSilenceTicks == 0)
+        gMacWSAudioOwnerSilenceTicks =
+            MACWS_AUDIO_OWNER_SILENCE_NANOSECONDS;
     MacWSInstallAudioRenderBridge();
 }

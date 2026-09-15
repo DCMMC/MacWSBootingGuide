@@ -14,6 +14,7 @@ const args = {
   seconds: 8,
   loadwait: 3,
   play: 1,
+  mute: 1,
   evaluate: 1,
   capture: 1,
   single: 0,
@@ -22,6 +23,7 @@ const args = {
   screenshots: "/tmp/macws-media-frame",
   text: "",
   offset: 0,
+  tone: 0,
 };
 for (let index = 2; index < process.argv.length; index += 2) {
   const key = process.argv[index]?.replace(/^--/, "");
@@ -41,7 +43,7 @@ if (!Number.isFinite(args.seconds) || args.seconds < 1 || args.seconds > 60) {
 if (!Number.isFinite(args.loadwait) || args.loadwait < 0.25 || args.loadwait > 15) {
   throw new Error(`invalid --loadwait: ${args.loadwait}`);
 }
-for (const name of ["play", "evaluate", "capture", "single"]) {
+for (const name of ["play", "mute", "evaluate", "capture", "single"]) {
   if (![0, 1].includes(args[name])) throw new Error(`invalid --${name}: ${args[name]}`);
 }
 if (!Number.isFinite(args.offset) || Math.abs(args.offset) > 20000) {
@@ -49,6 +51,9 @@ if (!Number.isFinite(args.offset) || Math.abs(args.offset) > 20000) {
 }
 if (!Number.isFinite(args.seek) || args.seek < -1 || args.seek > 86400) {
   throw new Error(`invalid --seek: ${args.seek}`);
+}
+if (!Number.isFinite(args.tone) || args.tone < -1 || args.tone > 30) {
+  throw new Error(`invalid --tone: ${args.tone}`);
 }
 
 class CDP {
@@ -200,13 +205,35 @@ if (args.text) {
 const playResult = args.play ? await cdp.send("Runtime.evaluate", {
     expression: `(async () => Promise.all([...document.querySelectorAll('video')]
       .map(async (video, index) => {
-        video.muted = true;
+        video.muted = ${args.mute ? "true" : "false"};
         try { await video.play(); return {index, ok: true}; }
         catch (error) { return {index, ok: false, error: String(error)}; }
       })))()`,
     awaitPromise: true,
-    returnByValue: true,
-  }) : null;
+  returnByValue: true,
+}) : null;
+const toneResult = args.tone !== 0 ? await cdp.send("Runtime.evaluate", {
+  expression: `(async () => {
+    if (globalThis.__macwsAudioProbe) {
+      try { await globalThis.__macwsAudioProbe.context.close(); } catch {}
+      delete globalThis.__macwsAudioProbe;
+    }
+    if (${Number(args.tone)} < 0) return {closed: true};
+    const context = new AudioContext({sampleRate: 48000});
+    const oscillator = new OscillatorNode(context, {frequency: 440});
+    const gain = new GainNode(context, {gain: 0.04});
+    oscillator.connect(gain).connect(context.destination);
+    await context.resume();
+    oscillator.start();
+    oscillator.stop(context.currentTime + ${Number(args.tone)});
+    globalThis.__macwsAudioProbe = {context, oscillator, gain};
+    return {state: context.state, sampleRate: context.sampleRate,
+      duration: ${Number(args.tone)}};
+  })()`,
+  awaitPromise: true,
+  returnByValue: true,
+  userGesture: true,
+}) : null;
 if (args.seek >= 0) {
   await cdp.send("Runtime.evaluate", {
     expression: `Promise.all([...document.querySelectorAll('video')].map(
@@ -320,6 +347,7 @@ const output = {
   targetID: page.id,
   mediaDomainEnabled,
   playResult: playResult?.result?.value ?? null,
+  toneResult: toneResult?.result?.value ?? null,
   diagnosticEvents,
   samples,
 };

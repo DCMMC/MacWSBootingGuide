@@ -113,6 +113,17 @@ static const char *const kVSCodePlist =
 static const char *const kVSCodeLog = "/var/jb/var/mobile/vscode.log";
 static const char *const kVSCodeHealthMarker =
     "/var/jb/var/mobile/vscode-health-marker";
+static const char *const kCoreAudioLabel = "com.apple.audio.coreaudiod";
+static const char *const kCoreAudioPlist =
+    "/var/jb/usr/macOS/gui-launchd/com.macwsguide.coreaudiod.plist";
+static const char *const kAudioComponentRegistrarLabel =
+    "com.apple.macosbooter.audio.AudioComponentRegistrar";
+static const char *const kAudioComponentRegistrarPlist =
+    "/var/jb/usr/macOS/gui-launchd/com.macwsguide.audiocomponentregistrar.plist";
+static const char *const kAudioOutputLabel =
+    "com.macwsguide.audio-output";
+static const char *const kAudioOutputPlist =
+    "/var/jb/usr/macOS/gui-launchd/com.macwsguide.audio-output.plist";
 static const char *const kVSCodeURLSocket =
     "/var/mnt/rootfs" MACWS_VSCODE_URL_SOCKET_PATH;
 static const char *const kVSCodeExecutable =
@@ -2946,6 +2957,56 @@ static BOOL LaunchWeatherViaUIKitCarrier(NSString **message) {
         kWeatherBundleIdentifier, kWeatherContainerHome, message);
 }
 
+static BOOL EnsureVSCodeAudioBridge(NSString **message) {
+    const char *labels[] = {
+        kAudioComponentRegistrarLabel, kCoreAudioLabel, kAudioOutputLabel,
+    };
+    const char *plists[] = {
+        kAudioComponentRegistrarPlist, kCoreAudioPlist, kAudioOutputPlist,
+    };
+    for (NSUInteger index = 0;
+         index < sizeof(labels) / sizeof(labels[0]); index++) {
+        BOOL loaded = NO;
+        int pid = 0;
+        (void)InspectJob(labels[index], &pid, &loaded);
+        if (!loaded) {
+            if (access(plists[index], R_OK) != 0) {
+                if (message) *message = [NSString stringWithFormat:
+                    @"VS Code 音频服务配置缺失：%s", plists[index]];
+                return NO;
+            }
+            const char *loadArgv[] = {
+                kLaunchctl, "load", plists[index], NULL,
+            };
+            int result = RunCommand(loadArgv, YES);
+            (void)InspectJob(labels[index], &pid, &loaded);
+            HostLog(@"vscode-audio self-heal label=%s load=%d loaded=%@ pid=%d",
+                    labels[index], result, loaded ? @"YES" : @"NO", pid);
+            if (result != 0 || !loaded) {
+                if (message) *message = [NSString stringWithFormat:
+                    @"VS Code 音频服务未能注册：%s", labels[index]];
+                return NO;
+            }
+        }
+        if (strcmp(labels[index], kAudioOutputLabel) == 0 && pid <= 1) {
+            // KeepAlive normally starts this job immediately.  If launchd has
+            // retained a loaded-but-dormant definition, explicitly requesting
+            // the same registered job is cheaper and safer than cycling the
+            // rest of the audio graph.
+            const char *startArgv[] = {
+                kLaunchctl, "start", labels[index], NULL,
+            };
+            (void)RunCommand(startArgv, YES);
+            if (!WaitForJobPID(labels[index], 3.0, &pid)) {
+                if (message)
+                    *message = @"VS Code 音频输出服务已注册但未运行";
+                return NO;
+            }
+        }
+    }
+    return YES;
+}
+
 static BOOL LaunchVSCode(NSString **message) {
     if (access(kVSCodePlist, R_OK) != 0 ||
         access("/var/mnt/rootfs/Applications/Visual Studio Code.app/Contents/MacOS/Electron",
@@ -2953,6 +3014,13 @@ static BOOL LaunchVSCode(NSString **message) {
         *message = @"VS Code 或生产启动配置不存在";
         return NO;
     }
+    // cleanup_all intentionally unloads project-owned jobs during emergency
+    // recovery. A later window-only recovery can leave the long-lived
+    // coreaudiod/registrar alive while macwsaudiooutd remains absent; runtime
+    // evidence on 2026-09-16 showed exactly that split state and a silent
+    // YouTube renderer. Repair the complete three-job contract before both a
+    // fresh VS Code launch and reuse of an existing Electron generation.
+    if (!EnsureVSCodeAudioBridge(message)) return NO;
     int pid = 0;
     off_t launchLogOffset = FileSizeAtPath(kVSCodeLog);
     BOOL jobLoaded = NO;

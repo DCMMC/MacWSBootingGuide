@@ -126,6 +126,24 @@ int main(void) {
     assert(!MacWSShouldStartScrollMomentum(79.99, 0.0));
     assert(MacWSShouldStartScrollMomentum(80.0, 0.0));
     assert(MacWSShouldStartScrollMomentum(60.0, 60.0));
+    double releaseX = 0.0;
+    double releaseY = 0.0;
+    assert(MacWSShouldStartIndirectScrollMomentum(20.1, 0.0));
+    assert(!MacWSShouldStartIndirectScrollMomentum(7.99, 0.0));
+    assert(MacWSResolveIndirectScrollReleaseVelocity(
+        0.0, 0.0, 480.0, -120.0, 0.02, &releaseX, &releaseY));
+    assert(Near((float)releaseX, 480.0f));
+    assert(Near((float)releaseY, -120.0f));
+    assert(!MacWSResolveIndirectScrollReleaseVelocity(
+        0.0, 0.0, 480.0, -120.0,
+        MACWS_SCROLL_RELEASE_SAMPLE_MAX_AGE_SECONDS + 0.001,
+        &releaseX, &releaseY));
+    assert(Near((float)releaseX, 0.0f));
+    assert(Near((float)releaseY, 0.0f));
+    assert(MacWSResolveIndirectScrollReleaseVelocity(
+        160.0, 20.0, 900.0, 0.0, 0.01, &releaseX, &releaseY));
+    assert(Near((float)releaseX, 160.0f));
+    assert(Near((float)releaseY, 20.0f));
     assert(Near((float)MacWSAppKitRotationDegreesForUIKitRadians(
                     3.14159265358979323846 / 2.0), -90.0f));
     assert(Near((float)MacWSAppKitRotationDegreesForUIKitRadians(

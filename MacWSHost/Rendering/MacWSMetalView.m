@@ -271,6 +271,12 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
     BOOL _contentGesturesPassthrough;
     UIPanGestureRecognizer *_twoFingerPanRecognizer;
     UIPanGestureRecognizer *_indirectScrollRecognizer;
+    CGPoint _indirectScrollSampledVelocity;
+    CFTimeInterval _indirectScrollPreviousTimestamp;
+    CFTimeInterval _indirectScrollLastMotionTimestamp;
+    NSUInteger _indirectScrollMotionSegmentCount;
+    CGPoint _indirectScrollFramePoint;
+    BOOL _indirectScrollFramePointValid;
     UIPinchGestureRecognizer *_pinchRecognizer;
     UIRotationGestureRecognizer *_rotationRecognizer;
     UITapGestureRecognizer *_secondaryTapRecognizer;
@@ -5448,41 +5454,145 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
         _scrollEmissionResidual = CGPointZero;
 }
 
+- (void)consumeIndirectScrollTranslation:(CGPoint)translation
+                       recognizerVelocity:(CGPoint)recognizerVelocity
+                               framePoint:(CGPoint)scrollPoint
+                                timestamp:(CFTimeInterval)timestamp {
+    if (translation.x == 0.0 && translation.y == 0.0) {
+        _indirectScrollPreviousTimestamp = timestamp;
+        return;
+    }
+
+    CFTimeInterval deltaTime = _indirectScrollPreviousTimestamp > 0
+        ? timestamp - _indirectScrollPreviousTimestamp : 0;
+    CGPoint sampled = CGPointZero;
+    BOOL hasSample = NO;
+    if (isfinite(recognizerVelocity.x) &&
+        isfinite(recognizerVelocity.y) &&
+        hypot(recognizerVelocity.x, recognizerVelocity.y) > 0.01) {
+        // UIKit's velocity estimator spans multiple hardware samples and is
+        // more reliable than dividing a coalesced callback delta by wall time.
+        sampled = recognizerVelocity;
+        hasSample = YES;
+    } else if (deltaTime >= 1.0 / 1000.0 && deltaTime <= 0.10) {
+        sampled = CGPointMake(translation.x / deltaTime,
+                              translation.y / deltaTime);
+        hasSample = isfinite(sampled.x) && isfinite(sampled.y);
+    }
+    if (hasSample) {
+        _indirectScrollSampledVelocity = sampled;
+        _indirectScrollLastMotionTimestamp = timestamp;
+    }
+
+    [self emitScrollAtFramePoint:scrollPoint
+                     translation:translation
+                           flags:MacWSInputFlagScrollChanged
+                       timestamp:timestamp
+                          source:MacWSInputSourceIndirectPointer
+             directionMultiplier:-1.0];
+    _indirectScrollMotionSegmentCount++;
+    _indirectScrollPreviousTimestamp = timestamp;
+}
+
 - (void)indirectScrolled:(UIPanGestureRecognizer *)recognizer
     API_AVAILABLE(ios(13.4)) {
     if (!self.isMacWSInputEnabled) return;
     CGPoint translation = [recognizer translationInView:self];
     [recognizer setTranslation:CGPointZero inView:self];
+    CGPoint recognizerVelocity = [recognizer velocityInView:self];
     CGPoint scrollPoint = CGPointZero;
-    if (![self scrollFramePointForRecognizer:recognizer output:&scrollPoint])
-        return;
+    BOOL begins = recognizer.state == UIGestureRecognizerStateBegan;
+    if (begins || !_indirectScrollFramePointValid) {
+        if (![self scrollFramePointForRecognizer:recognizer
+                                          output:&scrollPoint]) {
+            if (MacWSHostTouchDiagnosticsEnabled()) {
+                CGPoint location = [recognizer locationInView:self];
+                MacWSLog(@"indirect-scroll route-rejected window=%u state=%ld location=(%.2f,%.2f) content=(%.2f,%.2f %.2fx%.2f)",
+                    self.targetWindowID, (long)recognizer.state,
+                    location.x, location.y, _contentRect.origin.x,
+                    _contentRect.origin.y, _contentRect.size.width,
+                    _contentRect.size.height);
+            }
+            return;
+        }
+        _indirectScrollFramePoint = scrollPoint;
+        _indirectScrollFramePointValid = YES;
+    } else {
+        // Scroll is one input transaction. UIKit's terminal scroll event can
+        // report a transient/out-of-content location after the pointer or
+        // scene focus changes. Freeze the Begin-time AppKit point just like
+        // the fullscreen router freezes its Begin descriptor.
+        scrollPoint = _indirectScrollFramePoint;
+    }
     NSTimeInterval timestamp = CACurrentMediaTime();
     switch (recognizer.state) {
         case UIGestureRecognizerStateBegan:
             [self stopScrollMomentumWithTerminalPhase:YES];
+            _indirectScrollSampledVelocity = CGPointZero;
+            _indirectScrollPreviousTimestamp = timestamp;
+            _indirectScrollLastMotionTimestamp = 0;
+            _indirectScrollMotionSegmentCount = 0;
             [self emitScrollAtFramePoint:scrollPoint
                              translation:CGPointZero
                                    flags:MacWSInputFlagScrollBegan
                                timestamp:timestamp
                                   source:MacWSInputSourceIndirectPointer
                      directionMultiplier:-1.0];
+            // A scroll recognizer enters Began only after it has accumulated
+            // enough device movement.  That first callback can already carry
+            // the complete motion of a short trackpad flick, so it must be
+            // forwarded and sampled instead of being reset and discarded.
+            [self consumeIndirectScrollTranslation:translation
+                                recognizerVelocity:recognizerVelocity
+                                        framePoint:scrollPoint
+                                         timestamp:timestamp];
+            if (MacWSHostTouchDiagnosticsEnabled()) {
+                MacWSLog(@"indirect-scroll begin window=%u translation=(%.2f,%.2f) velocity=(%.1f,%.1f) segments=%lu",
+                    self.targetWindowID, translation.x, translation.y,
+                    recognizerVelocity.x, recognizerVelocity.y,
+                    (unsigned long)_indirectScrollMotionSegmentCount);
+            }
             break;
         case UIGestureRecognizerStateChanged:
-            if (translation.x != 0.0 || translation.y != 0.0) {
-                [self emitScrollAtFramePoint:scrollPoint
-                                 translation:translation
-                                       flags:MacWSInputFlagScrollChanged
-                                   timestamp:timestamp
-                                      source:MacWSInputSourceIndirectPointer
-                         directionMultiplier:-1.0];
-            }
+            [self consumeIndirectScrollTranslation:translation
+                                recognizerVelocity:recognizerVelocity
+                                        framePoint:scrollPoint
+                                         timestamp:timestamp];
             break;
         case UIGestureRecognizerStateEnded:
         {
-            CGPoint velocity = [recognizer velocityInView:self];
+            // UIKit can coalesce the final hardware segment directly into
+            // Ended.  Consume it before resolving release velocity so a short
+            // Began -> Ended gesture has a complete transaction.
+            [self consumeIndirectScrollTranslation:translation
+                                recognizerVelocity:recognizerVelocity
+                                        framePoint:scrollPoint
+                                         timestamp:timestamp];
+            CFTimeInterval sampledAge =
+                _indirectScrollLastMotionTimestamp > 0
+                ? timestamp - _indirectScrollLastMotionTimestamp
+                : INFINITY;
+            double velocityX = 0;
+            double velocityY = 0;
+            BOOL startsMomentum = MacWSResolveIndirectScrollReleaseVelocity(
+                recognizerVelocity.x, recognizerVelocity.y,
+                _indirectScrollSampledVelocity.x,
+                _indirectScrollSampledVelocity.y,
+                sampledAge, &velocityX, &velocityY);
+            CGPoint velocity = CGPointMake(velocityX, velocityY);
             uint16_t endedFlags = MacWSInputFlagScrollEnded;
-            if (MacWSShouldStartScrollMomentum(velocity.x, velocity.y))
+            if (startsMomentum)
                 endedFlags |= MacWSInputFlagScrollWillMomentum;
+            if (MacWSHostTouchDiagnosticsEnabled()) {
+                MacWSLog(@"indirect-scroll release window=%u recognizer=(%.1f,%.1f) sampled=(%.1f,%.1f) age=%.4f resolved=(%.1f,%.1f) segments=%lu momentum=%@",
+                    self.targetWindowID,
+                    recognizerVelocity.x, recognizerVelocity.y,
+                    _indirectScrollSampledVelocity.x,
+                    _indirectScrollSampledVelocity.y,
+                    sampledAge, velocity.x, velocity.y,
+                    (unsigned long)_indirectScrollMotionSegmentCount,
+                    startsMomentum ? @"YES" : @"NO");
+            }
             [self emitScrollAtFramePoint:scrollPoint
                              translation:CGPointZero
                                    flags:endedFlags
@@ -5493,10 +5603,18 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
                                        framePoint:scrollPoint
                                            source:MacWSInputSourceIndirectPointer
                               directionMultiplier:-1.0];
+            _indirectScrollFramePointValid = NO;
             break;
         }
         case UIGestureRecognizerStateCancelled:
         case UIGestureRecognizerStateFailed:
+            if (MacWSHostTouchDiagnosticsEnabled()) {
+                MacWSLog(@"indirect-scroll cancelled window=%u state=%ld sampled=(%.1f,%.1f) segments=%lu",
+                    self.targetWindowID, (long)recognizer.state,
+                    _indirectScrollSampledVelocity.x,
+                    _indirectScrollSampledVelocity.y,
+                    (unsigned long)_indirectScrollMotionSegmentCount);
+            }
             [self emitScrollAtFramePoint:scrollPoint
                              translation:CGPointZero
                                    flags:MacWSInputFlagScrollCancelled
@@ -5504,6 +5622,11 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
                                   source:MacWSInputSourceIndirectPointer
                      directionMultiplier:-1.0];
             [self stopScrollMomentumWithTerminalPhase:NO];
+            _indirectScrollSampledVelocity = CGPointZero;
+            _indirectScrollPreviousTimestamp = 0;
+            _indirectScrollLastMotionTimestamp = 0;
+            _indirectScrollMotionSegmentCount = 0;
+            _indirectScrollFramePointValid = NO;
             break;
         default:
             break;
@@ -5542,7 +5665,11 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
                              framePoint:(CGPoint)framePoint
                                  source:(MacWSInputSource)source
                     directionMultiplier:(CGFloat)directionMultiplier {
-    if (!MacWSShouldStartScrollMomentum(velocity.x, velocity.y)) return;
+    BOOL indirect = source == MacWSInputSourceIndirectPointer;
+    BOOL shouldStart = indirect
+        ? MacWSShouldStartIndirectScrollMomentum(velocity.x, velocity.y)
+        : MacWSShouldStartScrollMomentum(velocity.x, velocity.y);
+    if (!shouldStart) return;
     [self stopScrollMomentumWithTerminalPhase:NO];
     _scrollMomentumVelocity = velocity;
     _scrollMomentumFramePoint = framePoint;
@@ -5571,7 +5698,11 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
     _scrollMomentumVelocity.y *= decay;
     CGFloat speed = hypot(_scrollMomentumVelocity.x,
                           _scrollMomentumVelocity.y);
-    if (speed < 18.0) {
+    CGFloat stopSpeed = _scrollMomentumSource ==
+        MacWSInputSourceIndirectPointer
+        ? MACWS_INDIRECT_SCROLL_MOMENTUM_STOP_POINTS_PER_SECOND
+        : MACWS_SCROLL_MOMENTUM_STOP_POINTS_PER_SECOND;
+    if (speed < stopSpeed) {
         [self stopScrollMomentumWithTerminalPhase:YES];
         return;
     }

@@ -18,6 +18,20 @@
 #define MACWS_DIRECT_DOUBLE_TAP_SECONDS 0.42
 #define MACWS_DIRECT_DOUBLE_TAP_DISTANCE_POINTS 44.0
 #define MACWS_SCROLL_MOMENTUM_MINIMUM_POINTS_PER_SECOND 80.0
+// Physical trackpads report much smaller point velocities for short scrolls
+// than direct UIKit pans.  Runtime capture on the M1 Magic Keyboard measured
+// a deliberate short release at roughly 20 pt/s; using the direct-touch 80
+// pt/s gate discarded it.  Keep the lower gate scoped to indirect scrolling
+// so fingertip gestures retain their existing release behaviour.
+#define MACWS_INDIRECT_SCROLL_MOMENTUM_MINIMUM_POINTS_PER_SECOND 8.0
+#define MACWS_SCROLL_MOMENTUM_STOP_POINTS_PER_SECOND 18.0
+#define MACWS_INDIRECT_SCROLL_MOMENTUM_STOP_POINTS_PER_SECOND 4.0
+// Keep only a very recent velocity sample as a fallback when the recognizer's
+// terminal velocity is zero or sub-threshold. Runtime diagnostics on the M1
+// iPad observed the terminal callback 8-25 ms after the last movement sample;
+// a bounded 100-ms witness covers that interval without turning a deliberate
+// stop-then-lift into an unwanted fling.
+#define MACWS_SCROLL_RELEASE_SAMPLE_MAX_AGE_SECONDS 0.10
 #define MACWS_SYSTEM_GESTURE_RECOGNITION_FRACTION 0.012
 #define MACWS_SYSTEM_GESTURE_REFERENCE_FRACTION 0.28
 #define MACWS_THREE_FINGER_CHORD_GRACE_SECONDS 0.10
@@ -63,6 +77,40 @@ static inline bool MacWSShouldStartScrollMomentum(double velocityX,
                                                   double velocityY) {
     return hypot(velocityX, velocityY) >=
         MACWS_SCROLL_MOMENTUM_MINIMUM_POINTS_PER_SECOND;
+}
+
+static inline bool MacWSShouldStartIndirectScrollMomentum(double velocityX,
+                                                          double velocityY) {
+    return isfinite(velocityX) && isfinite(velocityY) &&
+        hypot(velocityX, velocityY) >=
+            MACWS_INDIRECT_SCROLL_MOMENTUM_MINIMUM_POINTS_PER_SECOND;
+}
+
+static inline bool MacWSResolveIndirectScrollReleaseVelocity(
+        double recognizerVelocityX, double recognizerVelocityY,
+        double sampledVelocityX, double sampledVelocityY,
+        double sampledVelocityAgeSeconds,
+        double *resolvedVelocityX, double *resolvedVelocityY) {
+    bool recognizerValid = isfinite(recognizerVelocityX) &&
+        isfinite(recognizerVelocityY);
+    double velocityX = recognizerValid ? recognizerVelocityX : 0.0;
+    double velocityY = recognizerValid ? recognizerVelocityY : 0.0;
+    bool sampledValid = isfinite(sampledVelocityX) &&
+        isfinite(sampledVelocityY) &&
+        isfinite(sampledVelocityAgeSeconds) &&
+        sampledVelocityAgeSeconds >= 0.0 &&
+        sampledVelocityAgeSeconds <=
+            MACWS_SCROLL_RELEASE_SAMPLE_MAX_AGE_SECONDS;
+    if (!MacWSShouldStartIndirectScrollMomentum(velocityX, velocityY) &&
+        sampledValid &&
+        MacWSShouldStartIndirectScrollMomentum(sampledVelocityX,
+                                               sampledVelocityY)) {
+        velocityX = sampledVelocityX;
+        velocityY = sampledVelocityY;
+    }
+    if (resolvedVelocityX) *resolvedVelocityX = velocityX;
+    if (resolvedVelocityY) *resolvedVelocityY = velocityY;
+    return MacWSShouldStartIndirectScrollMomentum(velocityX, velocityY);
 }
 
 // UIKit measures rotation in its top-left-origin view coordinates, while the
