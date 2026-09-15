@@ -60,6 +60,7 @@ env	MACWS_AGX_ZERO_QUEUE_ARGS	off	disproved experiment	Zeroes command-queue argu
 env	MACWS_AMFI_IMMOVABLE_TASK_PORT_COMPAT	on	VS Code,Chrome,Steam	Narrow Chromium task-policy compatibility; covers newer __mac_syscall and CEF 126 __sandbox_ms entry points.
 env	MACWS_CRASHPAD_IMMOVABLE_TASK_PORT_COMPAT	on	Steam	Returns the kernel-equivalent MACH_SEND_INVALID_RIGHT for Crashpad's exact nonfatal CPsx task-port telemetry request before iPadOS raises fatal EXC_GUARD; real exceptions are unchanged.
 env	MACWS_APP_DISPLAY_SETTLE_MS	on	Terminal=750	Bounded Terminal redraw settlement; not enabled for benchmarks.
+env	MACWS_AUDIO_RENDER_BRIDGE	on	VS Code audio service	Wraps the real DefaultOutput AudioUnit callback and publishes its final 48-kHz stereo PCM render into the shared bridge ring; disabled in every unrelated process.
 env	MACWS_BLUR_TRACE	off	diagnostic	Blur pipeline trace.
 env	MACWS_BLUR_XPC	off	diagnostic experiment	Blur texture XPC experiment.
 env	MACWS_CHROMIUM_COMPOSITE_OVERLAYS	on	VS Code,Chrome	Mark Chromium's real AggregatedRenderPass video_capture_enabled field before native CALayer processing so its normal primary-plane fallback remains in the AGX scanout captured by MacWS/VNC.
@@ -239,6 +240,7 @@ env	MACWS_XPC_NAME_TRACE	off	diagnostic	Bounded allocation-free cold-start recor
 env	MACWS_XPC_NAME_TRACE_FILTER	off	diagnostic	Optional substring filter for MACWS_XPC_NAME_TRACE; absent in production and launcher-cleared before every Catalyst child.
 env	MACWS_RANDOM_DIAGNOSTICS	off	Asphalt diagnostic	Read-only entropy/file-access witnesses enabled only by the matching rootfs sentinel; production preflight removes the sentinel.
 env	MACWS_IDENTITY_DIAGNOSTICS	off	Asphalt diagnostic	Read-only identifierForVendor and SecItem status witnesses; never records UUID or Keychain value, and production preflight removes its sentinel.
+env	MACWS_SDR_SCANOUT	on	VS Code	Reports the MacWS desktop's actual 8-bit BGRA scanout boundary through NSScreen so Chromium does not select an HDR10/RGBA16F plane that the transport cannot represent; native iPadOS display capabilities remain unchanged.
 env	MACWS_CATALYST_LOCAL_KEYCHAIN	on	Asphalt compatibility	After the stock Ventura SecItem client returns errSecNotAvailable/errSecMDSError, routes only Asphalt generic-password requests through the authenticated mobile-session iOS Security helper with the original Gameloft access groups.
 env	ALL_PROXY/HTTPS_PROXY/HTTP_PROXY	auto	Asphalt network compatibility	Set to socks5h://127.0.0.1:1082 only when that user-owned loopback endpoint accepts a bounded launch-time connection; otherwise cleared for direct networking. TLS verification remains enabled.
 env	MACWS_KEYCHAIN_PROBE_PRESERVE	off	standalone Keychain probe	Keeps the probe's synthetic generic-password record for a second-process persistence check; never set by an application or production launch job.
@@ -256,6 +258,7 @@ env	VSCODE_RESOLVING_ENVIRONMENT	transient	VS Code shell environment resolver	Ex
 env	MallocScribble	off	allocator diagnostic	Forbidden in every production launch plist.
 env	XPC_SERVICE_NAME	auto	macOS XPC services	System-provided service identity observed by the read-only proxy diagnostic; MacWS does not set it.
 cli	--force-disable-user-env	on	VS Code main service	Supported VS Code switch avoids the redundant main-service login-shell environment probe.
+cli	--disable-features=SkiaGraphite,avfoundation-overlays	on	VS Code Chromium	Keeps the unsupported Graphite shader path and AVSampleBufferDisplayLayer overlay path out of MacWS while retaining ANGLE/Metal, WebGL, GPU compositing, and the ordinary video compositor.
 cli	--no-watchdog	off	safety invariant	Removed option; iPad thermal, memory-pressure and crash-loop protection cannot be disabled.
 setting	chat.agentHost.enabled	off	dedicated VS Code benchmark profile	Avoid optional Copilot/Claude AgentHost processes unrelated to native-AGX WebGL measurement.
 setting	terminal.integrated.enablePersistentSessions	off	dedicated VS Code benchmark profile	Avoid reviving stale benchmark-profile PTYs across isolated runs.
@@ -365,6 +368,7 @@ state	/private/tmp/macws_location_provider_ready	transient	Maps location capabil
 state	com.macwsguide.catalyst-drawable	transient	MacWSHost/Catalyst display transport	Foreground Host-owned bootstrap Mach receive service; each typed complex message transfers one completed IOSurface send right and is rejected on envelope, geometry, stride, pixel-format, or owner mismatch.
 state	/var/jb/var/mobile/macws-maps-host-carrier.pid	transient	Maps Catalyst lifecycle	Current Maps carrier PID; every WindowServer teardown removes it after terminating Maps so a new GUI generation cannot reuse a live process with a dead CGS connection.
 state	/tmp/macws_vnc_surfid	transient	legacy transport	IOSurface ID compatibility state.
+state	/private/tmp/macws_audio_ring	transient	VS Code audio bridge	Versioned 48-kHz stereo PCM ring produced by the macOS AudioUnit callback and consumed by the iOS-native AudioQueue output helper; recreated and permission-clamped by the helper.
 state	/tmp/ws_headless	on	coexistence	Keeps the iPad panel owned by iOS.
 socket	/private/tmp/macws_app_input.%d.sock	transient	GUI client	Per-process AppInputBridge endpoint.
 socket	/private/tmp/macws_host_input.lock	transient	native host	Single broker ownership lock.

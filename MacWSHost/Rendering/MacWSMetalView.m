@@ -289,6 +289,8 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
     CGPoint _scrollMomentumVelocity;
     CGPoint _scrollMomentumFramePoint;
     CGPoint _scrollEmissionResidual;
+    MacWSInputSource _scrollMomentumSource;
+    CGFloat _scrollMomentumDirectionMultiplier;
     CFTimeInterval _scrollMomentumLastTimestamp;
     BOOL _scrollMomentumBegan;
     BOOL _windowConfigurationDispatchPending;
@@ -5476,13 +5478,23 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
             }
             break;
         case UIGestureRecognizerStateEnded:
+        {
+            CGPoint velocity = [recognizer velocityInView:self];
+            uint16_t endedFlags = MacWSInputFlagScrollEnded;
+            if (MacWSShouldStartScrollMomentum(velocity.x, velocity.y))
+                endedFlags |= MacWSInputFlagScrollWillMomentum;
             [self emitScrollAtFramePoint:scrollPoint
                              translation:CGPointZero
-                                   flags:MacWSInputFlagScrollEnded
+                                   flags:endedFlags
                                timestamp:timestamp
                                   source:MacWSInputSourceIndirectPointer
                      directionMultiplier:-1.0];
+            [self startScrollMomentumWithVelocity:velocity
+                                       framePoint:scrollPoint
+                                           source:MacWSInputSourceIndirectPointer
+                              directionMultiplier:-1.0];
             break;
+        }
         case UIGestureRecognizerStateCancelled:
         case UIGestureRecognizerStateFailed:
             [self emitScrollAtFramePoint:scrollPoint
@@ -5491,6 +5503,7 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
                                timestamp:timestamp
                                   source:MacWSInputSourceIndirectPointer
                      directionMultiplier:-1.0];
+            [self stopScrollMomentumWithTerminalPhase:NO];
             break;
         default:
             break;
@@ -5503,21 +5516,38 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
                          translation:CGPointZero
                                flags:MacWSInputFlagScrollEnded |
                                      MacWSInputFlagScrollMomentum
-                           timestamp:CACurrentMediaTime()];
+                           timestamp:CACurrentMediaTime()
+                              source:_scrollMomentumSource
+                 directionMultiplier:_scrollMomentumDirectionMultiplier];
     }
     [_scrollMomentumDisplayLink invalidate];
     _scrollMomentumDisplayLink = nil;
     _scrollMomentumVelocity = CGPointZero;
+    _scrollMomentumSource = MacWSInputSourceUnknown;
+    _scrollMomentumDirectionMultiplier = 1.0;
     _scrollMomentumLastTimestamp = 0;
     _scrollMomentumBegan = NO;
 }
 
 - (void)startScrollMomentumWithVelocity:(CGPoint)velocity
                              framePoint:(CGPoint)framePoint {
+    [self startScrollMomentumWithVelocity:velocity
+                               framePoint:framePoint
+                                   source:MacWSInputSourceFinger
+                      directionMultiplier:self.inputMode == MacWSHostInputModeDirect
+                          ? 1.0 : -1.0];
+}
+
+- (void)startScrollMomentumWithVelocity:(CGPoint)velocity
+                             framePoint:(CGPoint)framePoint
+                                 source:(MacWSInputSource)source
+                    directionMultiplier:(CGFloat)directionMultiplier {
     if (!MacWSShouldStartScrollMomentum(velocity.x, velocity.y)) return;
     [self stopScrollMomentumWithTerminalPhase:NO];
     _scrollMomentumVelocity = velocity;
     _scrollMomentumFramePoint = framePoint;
+    _scrollMomentumSource = source;
+    _scrollMomentumDirectionMultiplier = directionMultiplier;
     _scrollMomentumBegan = NO;
     _scrollMomentumLastTimestamp = 0;
     _scrollMomentumDisplayLink = [CADisplayLink
@@ -5553,7 +5583,9 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
     [self emitScrollAtFramePoint:_scrollMomentumFramePoint
                      translation:translation
                            flags:phase | MacWSInputFlagScrollMomentum
-                       timestamp:CACurrentMediaTime()];
+                       timestamp:CACurrentMediaTime()
+                          source:_scrollMomentumSource
+             directionMultiplier:_scrollMomentumDirectionMultiplier];
 }
 
 - (void)twoFingerPanned:(UIPanGestureRecognizer *)recognizer {

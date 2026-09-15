@@ -84,6 +84,9 @@ LSD_PLIST="$GUI_LAUNCHD_DIR/com.macwsguide.lsd.plist"
 LSD_SYSTEM_PLIST="$GUI_LAUNCHD_DIR/com.macwsguide.lsd-system.plist"
 CFPREFSD_DAEMON_PLIST="$GUI_LAUNCHD_DIR/com.macwsguide.cfprefsd-daemon.plist"
 CFPREFSD_AGENT_PLIST="$GUI_LAUNCHD_DIR/com.macwsguide.cfprefsd-agent.plist"
+COREAUDIOD_PLIST="$GUI_LAUNCHD_DIR/com.macwsguide.coreaudiod.plist"
+AUDIO_COMPONENT_REGISTRAR_PLIST="$GUI_LAUNCHD_DIR/com.macwsguide.audiocomponentregistrar.plist"
+AUDIO_OUTPUT_PLIST="$GUI_LAUNCHD_DIR/com.macwsguide.audio-output.plist"
 MACOS_LOCATIOND_PLIST="$GUI_LAUNCHD_DIR/com.macwsguide.macos-locationd.plist"
 CORELOCATIONAGENT_PLIST="$GUI_LAUNCHD_DIR/com.macwsguide.corelocationagent.plist"
 LOCATIONBRIDGE_PLIST="$GUI_LAUNCHD_DIR/com.macwsguide.locationbridge.plist"
@@ -117,6 +120,9 @@ LSD_LABEL=com.macwsguide.lsd
 LSD_SYSTEM_LABEL=com.macwsguide.lsd-system
 CFPREFSD_DAEMON_LABEL=com.macwsguide.cfprefsd-daemon
 CFPREFSD_AGENT_LABEL=com.macwsguide.cfprefsd-agent
+COREAUDIOD_LABEL=com.apple.audio.coreaudiod
+AUDIO_COMPONENT_REGISTRAR_LABEL=com.apple.macosbooter.audio.AudioComponentRegistrar
+AUDIO_OUTPUT_LABEL=com.macwsguide.audio-output
 MACOS_LOCATIOND_LABEL=com.macwsguide.macos-locationd
 CORELOCATIONAGENT_LABEL=com.macwsguide.corelocationagent
 LOCATIONBRIDGE_LABEL=com.macwsguide.locationbridge
@@ -1611,6 +1617,7 @@ base_trust_marker_value() {
     value="v${BASE_TRUST_CLOSURE_VERSION}:${boot_id}"
     for path in \
         /var/jb/usr/macOS/bin/launchdchrootexec \
+        /var/jb/usr/macOS/bin/macwsaudiooutd \
         /var/jb/usr/macOS/lib/libmachook.dylib \
         /var/jb/usr/macOS/lib/libmachook_arm64.dylib \
         "$ROOTFS/usr/lib/libobjc-trampolines.dylib" \
@@ -1643,6 +1650,7 @@ restore_cold_boot_trust() {
     set --
     for path in \
         /var/jb/usr/macOS/bin/launchdchrootexec \
+        /var/jb/usr/macOS/bin/macwsaudiooutd \
         /var/jb/usr/macOS/lib/libmachook.dylib \
         /var/jb/usr/macOS/lib/libmachook_arm64.dylib \
         /var/jb/Applications/MacWSCatalystLauncher.app/MacWSCatalystLauncher \
@@ -1661,6 +1669,10 @@ restore_cold_boot_trust() {
         "$ROOTFS/System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer" \
         "$ROOTFS/System/Library/PrivateFrameworks/SystemStatusServer.framework/Support/systemstatusd" \
         "$ROOTFS/usr/local/libexec/macws-cfprefsd" \
+        "$ROOTFS/usr/sbin/coreaudiod" \
+        "$ROOTFS/System/Library/Frameworks/AudioToolbox.framework/AudioComponentRegistrar" \
+        "$ROOTFS/System/Library/Components/CoreAudio.component/Contents/MacOS/CoreAudio" \
+        "$ROOTFS/System/Library/Components/AudioDSP.component/Contents/MacOS/AudioDSP" \
         "$ROOTFS/usr/libexec/lsd" \
         "$ROOTFS$PLUGINKIT_PKD_BIN" \
         "$ROOTFS/System/Library/CoreServices/Finder.app/Contents/MacOS/Finder" \
@@ -3140,6 +3152,8 @@ production_preflight() {
                    MACWS_AGX_NATIVE \
                    MACWS_AGX_REGISTER_CLASSES \
                    MACWS_PIN_FALLBACK \
+                   MACWS_AUDIO_RENDER_BRIDGE \
+                   MACWS_SDR_SCANOUT \
                    MACWS_CHROMIUM_COMPOSITE_OVERLAYS; do
             if ! plutil "$VSCODE_PLIST" 2>/dev/null |
                  grep -Eq "\"?$key\"?[[:space:]]*=[[:space:]]*1;"; then
@@ -3153,7 +3167,8 @@ production_preflight() {
             '--disable-gpu-sandbox' \
             '--use-angle=metal' \
             '--ignore-gpu-blocklist' \
-            '--disable-features=SkiaGraphite'; do
+            '--disable-features=SkiaGraphite,avfoundation-overlays' \
+            '--disable-avfoundation-overlays'; do
             if ! plutil "$VSCODE_PLIST" 2>/dev/null | grep -Fq -- "$path"; then
                 log "ERROR: required VS Code production argument missing: $path"
                 bad=1
@@ -3176,6 +3191,15 @@ production_preflight() {
             log "ERROR: VS Code native-AGX profile still disables the GPU: $VSCODE_PLIST"
             bad=1
         fi
+        for path in "$COREAUDIOD_PLIST" \
+                    "$AUDIO_COMPONENT_REGISTRAR_PLIST" \
+                    "$AUDIO_OUTPUT_PLIST" \
+                    /var/jb/usr/macOS/bin/macwsaudiooutd; do
+            if [ ! -e "$path" ]; then
+                log "ERROR: VS Code audio bridge prerequisite missing: $path"
+                bad=1
+            fi
+        done
     fi
     if [ -d "$ROOTFS/Applications/Steam.app" ]; then
         for key in MACWS_STEAM_CPU_RENDERING \
@@ -4436,6 +4460,31 @@ start_macos() {
         return 1
     }
     verify_preferences_persistence || return 1
+
+    # Ventura's AudioComponentRegistrar must own a collision-free endpoint:
+    # runtime-confirmed on 2026-09-15, the native iPadOS registrar returned its
+    # iOS catalog and therefore no DefaultOutput component. The private stock
+    # registrar returns Ventura's component, while coreaudiod supplies its
+    # Loopback render unit. macwsaudiooutd consumes the render callback ring in
+    # native iOS context and hands it to mediaserverd/the physical speaker.
+    log "Publishing the private macOS audio catalog and native output bridge..."
+    rm -f "$LOGDIR/macws-audio-component-registrar.log" \
+          "$LOGDIR/macws-coreaudiod.log" \
+          "$LOGDIR/macws-audio-output.log"
+    launchctl load "$AUDIO_COMPONENT_REGISTRAR_PLIST" || return 1
+    launchctl load "$COREAUDIOD_PLIST" || return 1
+    launchctl load "$AUDIO_OUTPUT_PLIST" || return 1
+    for label in "$AUDIO_COMPONENT_REGISTRAR_LABEL" "$COREAUDIOD_LABEL" \
+                 "$AUDIO_OUTPUT_LABEL"; do
+        launchctl list "$label" >/dev/null 2>&1 || {
+            log "ERROR: audio launch contract was not registered: $label"
+            return 1
+        }
+    done
+    # The Adaptive registrar is otherwise dormant until the first renderer;
+    # prime its real catalog before Electron performs AudioComponentFindNext.
+    launchctl kickstart "$AUDIO_COMPONENT_REGISTRAR_LABEL" >/dev/null 2>&1 ||
+        return 1
     log "TIMING start-macos stage=status-preferences seconds=$((SECONDS - macos_stage_started)) total=$((SECONDS - macos_started))"
     macos_stage_started=$SECONDS
 

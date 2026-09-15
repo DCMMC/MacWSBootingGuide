@@ -22172,6 +22172,31 @@ static void install_agx_init_redirect(Class agx) {
 
 @interface MTLTextureDescriptorInternal : MTLTextureDescriptor
 @end
+
+// Chromium's macOS ScreenMac promotes an NSScreen to HDR whenever
+// maximumPotentialExtendedDynamicRangeColorComponentValue is above 1.0, then
+// advertises 10-bit output and RGBA16F scanout. MacWS's visible desktop is an
+// 8-bit BGRA IOSurface, so that capability is not true at this presentation
+// boundary even when the physical iPad panel has EDR headroom. Keep the
+// adapter opt-in for clients (currently Electron/VS Code) that render through
+// the MacWS desktop; native iPadOS applications still see the real panel.
+@interface NSScreen : NSObject
+- (CGFloat)maximumPotentialExtendedDynamicRangeColorComponentValue;
+- (CGFloat)maximumExtendedDynamicRangeColorComponentValue;
+@end
+
+%hook NSScreen
+- (CGFloat)maximumPotentialExtendedDynamicRangeColorComponentValue {
+    if (getenv("MACWS_SDR_SCANOUT")) return 1.0;
+    return %orig;
+}
+
+- (CGFloat)maximumExtendedDynamicRangeColorComponentValue {
+    if (getenv("MACWS_SDR_SCANOUT")) return 1.0;
+    return %orig;
+}
+%end
+
 %hook MTLTextureDescriptorInternal
 - (MTLStorageMode)storageMode {
     MTLStorageMode mode = %orig;
@@ -22334,6 +22359,8 @@ static const char *macws_private_chroot_service_name(const char *name) {
         return "com.apple.macosbooter.cfprefsd.daemon";
     if (!strcmp(name, "com.apple.cfprefsd.agent"))
         return "com.apple.macosbooter.cfprefsd.agent";
+    if (!strcmp(name, "com.apple.audio.AudioComponentRegistrar"))
+        return "com.apple.macosbooter.audio.AudioComponentRegistrar";
     if (!strcmp(name, "com.apple.iconservices"))
         return "com.apple.macosbooter.iconservices";
     if (!strcmp(name, "com.apple.iconservices.store"))
@@ -22733,6 +22760,13 @@ __attribute__((constructor)) static void InitMetalHooks() {
     if (utility_process && strcmp(utility_process, "1") == 0) return;
     macws_record_xpc_service_context_if_requested();
     const char *initialProgram = getprogname();
+    if (initialProgram && strcmp(initialProgram, "coreaudiod") == 0) {
+        // CoreFoundation also reads the HAL plug-in's preferences through
+        // cfprefsd. Route those lookups to MacWS's already-running private
+        // daemon, then avoid every GUI, Metal, LaunchServices, and input hook.
+        macws_install_private_xpc_name_hooks();
+        return;
+    }
     if (initialProgram &&
         (strcmp(initialProgram, "bash") == 0 ||
          strcmp(initialProgram, "sh") == 0 ||

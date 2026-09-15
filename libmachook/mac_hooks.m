@@ -4530,6 +4530,17 @@ static void macws_install_chromium_composite_overlays(
     if (!getenv("MACWS_CHROMIUM_COMPOSITE_OVERLAYS"))
         return;
 
+    static const uint8_t expected_uuid[16] = {
+        0x4c, 0x4c, 0x44, 0x42, 0x55, 0x55, 0x31, 0x44,
+        0xa1, 0xa8, 0x56, 0x41, 0x69, 0xf3, 0xff, 0x00,
+    };
+    const struct mach_header_64 *header =
+        (const struct mach_header_64 *)untyped_header;
+    // Identify the image by its load-command UUID, not dladdr's spelling.
+    // The latter differs between the resolved Versions/A path and framework
+    // symlink path across Electron helper launch routes.
+    if (!macws_macho_uuid_matches(header, expected_uuid)) return;
+
     // Viz owns OverlayProcessorMac in Chromium's dedicated GPU helper. Do not
     // modify the Electron main process: runtime LLDB caught its early
     // fork/exec child faulting on instruction fetch at Electron Framework
@@ -4555,10 +4566,6 @@ static void macws_install_chromium_composite_overlays(
     if (atomic_exchange_explicit(&installed, 1, memory_order_acq_rel))
         return;
 
-    static const uint8_t expected_uuid[16] = {
-        0x4c, 0x4c, 0x44, 0x42, 0x55, 0x55, 0x31, 0x44,
-        0xa1, 0xa8, 0x56, 0x41, 0x69, 0xf3, 0xff, 0x00,
-    };
     static const uint32_t expected_prologue[] = {
         0x6db923e9, // stp d9, d8, [sp, #-0x70]!
         0xa9016ffc, // stp x28, x27, [sp, #0x10]
@@ -4583,16 +4590,6 @@ static void macws_install_chromium_composite_overlays(
     enum { kCaptureAdapterOffset = 0x44 };
     enum { kCaptureStoreIndex = 3 };
     enum { kRenderPassMoveIndex = 4 };
-
-    const struct mach_header_64 *header =
-        (const struct mach_header_64 *)untyped_header;
-    if (!macws_macho_uuid_matches(header, expected_uuid)) {
-        fprintf(stderr,
-            "#### MACWS_CHROMIUM_COMPOSITE_OVERLAYS skipped: "
-            "Electron Framework UUID mismatch\n");
-        atomic_store_explicit(&installed, 0, memory_order_release);
-        return;
-    }
 
     void *process_for_ca_layers = (void *)((uintptr_t)header +
         kProcessForCALayerOverlaysOffset);
@@ -4827,8 +4824,8 @@ static void macws_optimize_stray_steam_overlay_debug_label(
 }
 
 void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) {
-    Dl_info info;
-    dladdr(header, &info);
+    Dl_info info = {};
+    (void)dladdr(header, &info);
     if (info.dli_fname &&
         strstr(info.dli_fname, "gameoverlayrenderer") != NULL) {
         macws_optimize_stray_steam_overlay_debug_label(header);
@@ -4876,8 +4873,7 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
         macws_install_lsd_session_store_isolation();
     }
     if (info.dli_fname &&
-        strstr(info.dli_fname,
-               "/Electron Framework.framework/Versions/A/Electron Framework")) {
+        strstr(info.dli_fname, "Electron Framework") != NULL) {
         macws_install_chromium_composite_overlays(header);
     }
     if(!strncmp(info.dli_fname, SkyLightPath, strlen(SkyLightPath))) {
@@ -10507,6 +10503,15 @@ __attribute__((constructor)) void InitStuff() {
             "GUI/JIT/AGX constructors disabled\n");
         return;
     }
+    const char *initial_program = getprogname();
+    if (initial_program && strcmp(initial_program, "coreaudiod") == 0) {
+        // coreaudiod needs replacement-code admission for the two narrow
+        // libxpc name hooks installed by InitMetalHooks. It must not pay for
+        // (or be mutated by) the GUI/AGX constructor family used by ordinary
+        // MacWS applications.
+        EnableJIT();
+        return;
+    }
     macws_install_glass_blur_ab_if_requested();
     // A tiny root child retained by the settings-extension launch proxy marks
     // the final post-exec process through `jbctl proc_set_debugged`.  Wait only
@@ -13493,6 +13498,15 @@ static const char *macws_private_bootstrap_service_name(const char *name) {
         return "com.apple.macosbooter.cfprefsd.daemon";
     if (!strcmp(name, "com.apple.cfprefsd.agent"))
         return "com.apple.macosbooter.cfprefsd.agent";
+    // iPadOS publishes the AudioComponentRegistrar protocol from
+    // mediaserverd.  Runtime-confirmed on 2026-09-15: an unisolated Ventura
+    // AudioComponentFindNext request was serviced by mediaserverd pid 380 and
+    // returned the iOS component catalog; DefaultOutput was absent even
+    // though Ventura coreaudiod exposed a live Loopback output stream.  Keep
+    // the unchanged Ventura registrar and all chroot clients on their own
+    // bootstrap endpoint so AudioToolbox receives the matching macOS catalog.
+    if (!strcmp(name, "com.apple.audio.AudioComponentRegistrar"))
+        return "com.apple.macosbooter.audio.AudioComponentRegistrar";
     if (!strcmp(name, "com.apple.iconservices"))
         return "com.apple.macosbooter.iconservices";
     if (!strcmp(name, "com.apple.iconservices.store"))
@@ -23126,7 +23140,14 @@ kern_return_t IOServiceOpen_new(io_service_t service, task_port_t owningTask, ui
     // only macOS platform bit 4; preserve the caller's high-word options.
     // Native-reference LLDB captured options=0x10 and type=0x100001, and the
     // KRW probe runtime-confirmed those bits at UC+0x128 and Device+0xd8.
-    type &= ~4;
+    //
+    // This translation is AGX-specific.  The former unconditional mask also
+    // changed IOAudio2's connection type and made the real speaker user
+    // client return kIOReturnUnsupported (0xe00002c7).  Every other IOKit
+    // family must receive the exact type chosen by its own user-space ABI.
+    if (service == agxService) {
+        type &= ~4;
+    }
 
     // Keep the former high-word mask as an explicit diagnostic A/B only.  It
     // is not a fix: queue-only probing shows both types can create equivalent

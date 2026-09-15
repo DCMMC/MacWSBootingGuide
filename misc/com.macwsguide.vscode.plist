@@ -36,7 +36,15 @@
         <!-- Graphite is independent of WebGL/ANGLE. Keep it off because its
              generated MSL is not accepted by the Ventura/iOS 16 Metal stack;
              ANGLE's tracked macabi library remains the WebGL backend. -->
-        <string>--disable-features=SkiaGraphite</string>
+        <!-- Runtime-confirmed in vscode.log: the AVSampleBufferDisplayLayer
+             overlay retries CVPixelBufferCreateWithIOSurface once per video
+             frame and receives kCVReturnInvalidArgument (-6661), which is the
+             HDR black-window trigger. Electron 42's linked Chromium image
+             contains the current BASE_FEATURE name `avfoundation-overlays`;
+             retain the legacy dedicated switch too because older supported
+             Electron builds route the same policy through that switch. -->
+        <string>--disable-features=SkiaGraphite,avfoundation-overlays</string>
+        <string>--disable-avfoundation-overlays</string>
         <!-- Keep Chromium's production JIT scheduling.  The W^X adapter now
              reports successful RX transitions without late retries, while a
              runtime sample with the old no-concurrent option group found the
@@ -45,6 +53,14 @@
     </array>
     <key>EnvironmentVariables</key>
     <dict>
+        <key>MACWS_AUDIO_RENDER_BRIDGE</key>
+        <string>1</string>
+        <!-- Chromium 148's ScreenMac maps EDR>1 directly to HDR10/RGBA16F,
+             but MacWS publishes an 8-bit BGRA desktop IOSurface. Advertise
+             the real scanout boundary so streaming sites choose an SDR track
+             and Chromium does not submit an unrepresentable HDR plane. -->
+        <key>MACWS_SDR_SCANOUT</key>
+        <string>1</string>
         <key>CA_VSYNC_OFF</key>
         <string>1</string>
         <key>CA_DISABLE_SWAP_ICC</key>

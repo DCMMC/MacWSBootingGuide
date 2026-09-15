@@ -5,7 +5,7 @@ include $(dir $(lastword $(MAKEFILE_LIST)))config/production.mk
 include $(THEOS)/makefiles/common.mk
 
 # iOS subprojects
-SUBPROJECTS += MTLCompilerBypassOSCheck MacWSWindowing MacWSCatalystLaunch MTLSimDriverHost launchdchrootexec autosignd macwsallocd macwshostd macwscontrolprobe macwskeychaind macwsthermal macwslocationd mountdevfs ViewBridgeChrootProxy HIServicesChrootProxy OpenAndSavePanelChrootProxy QuickLookUIServiceChrootProxy DockHelperChrootProxy ExtensionKitChrootProxy SettingsExtensionChrootProxy FileCoordinationChrootProxy FileCoordinationMachBridge GeodChrootProxy WriteConfigChrootProxy LocationdChrootProxy mtl_keepalive MacWSHost MacWSCatalystLauncher SettingsExtensionMetadata misc/PingMTLCompilerService
+SUBPROJECTS += MTLCompilerBypassOSCheck MacWSWindowing MacWSCatalystLaunch MTLSimDriverHost launchdchrootexec autosignd macwsallocd macwshostd macwscontrolprobe macwskeychaind macwsthermal macwslocationd macwsaudiooutd mountdevfs ViewBridgeChrootProxy HIServicesChrootProxy OpenAndSavePanelChrootProxy QuickLookUIServiceChrootProxy DockHelperChrootProxy ExtensionKitChrootProxy SettingsExtensionChrootProxy FileCoordinationChrootProxy FileCoordinationMachBridge GeodChrootProxy WriteConfigChrootProxy LocationdChrootProxy mtl_keepalive MacWSHost MacWSCatalystLauncher SettingsExtensionMetadata misc/PingMTLCompilerService
 SUBPROJECTS += macwsairtools
 # macOS subprojects
 SUBPROJECTS += launchservicesd libmachook macwsinputd macwsdisplayd macwsinteropd macwsworkspacectl macwsneofetch
@@ -25,6 +25,14 @@ after-stage::
 	@mkdir -p $(THEOS_STAGING_DIR)/usr/macOS/share/vscode/macwsguide.macws-aquarium-runner-0.0.2
 	@install -m 0644 misc/com.macwsguide.vscode.plist \
 		$(THEOS_STAGING_DIR)/usr/macOS/gui-launchd/com.macwsguide.vscode.plist
+	@install -m 0644 misc/com.macwsguide.coreaudiod.plist \
+		$(THEOS_STAGING_DIR)/usr/macOS/gui-launchd/com.macwsguide.coreaudiod.plist
+	@install -m 0644 misc/com.macwsguide.audiocomponentregistrar.plist \
+		$(THEOS_STAGING_DIR)/usr/macOS/gui-launchd/com.macwsguide.audiocomponentregistrar.plist
+	@install -m 0644 misc/com.macwsguide.audio-output.plist \
+		$(THEOS_STAGING_DIR)/usr/macOS/gui-launchd/com.macwsguide.audio-output.plist
+	@install -m 0644 misc/coreaudiod-ios-audio.entitlements.plist \
+		$(THEOS_STAGING_DIR)/usr/macOS/bin/coreaudiod-ios-audio.entitlements.plist
 	@install -m 0644 misc/com.macwsguide.steam.runtime.plist \
 		$(THEOS_STAGING_DIR)/usr/macOS/gui-launchd/com.macwsguide.steam.runtime.plist
 	@install -m 0644 misc/com.valvesoftware.steam.ipctool.plist \

@@ -28,6 +28,8 @@ LOCATIOND_NATIVE_ENT="/var/jb/usr/macOS/bin/locationd-native-entitlements.plist"
 GEOD_NATIVE_ENT="/var/jb/usr/macOS/bin/geod-native-entitlements.plist"
 DISKARBITRATIOND_NATIVE_ENT="/var/jb/usr/macOS/bin/diskarbitrationd-native-entitlements.plist"
 INTEROP_LOCATION_ENT="/var/jb/usr/macOS/bin/interop-location-entitlements.plist"
+COREAUDIOD_AUDIO_ENT="/var/jb/usr/macOS/bin/coreaudiod-ios-audio.entitlements.plist"
+LOAD_DYLIB_PATCHER="/var/jb/usr/macOS/bin/add_macho_load_dylib.py"
 CODE_REQUIREMENT_WRITER="/var/jb/usr/macOS/bin/write_code_requirement.py"
 WEATHER_PREPARER="/var/jb/usr/macOS/bin/prepare_weather_app.py"
 ASPHALT_CA_INTERMEDIATE="/var/jb/usr/macOS/share/certificates/SectigoPublicServerAuthenticationCAOVR36.pem"
@@ -463,6 +465,100 @@ add_all_trustcache() {
     add_x86_64_trustcache "$path"
 }
 
+# iPadOS rejects the stock Ventura CT policy on these early audio images before
+# autosignd can run. Replace a stale signature through a fresh inode so AMFI
+# cannot retain the old vnode's code-signing state, then trust the exact final
+# CodeDirectory. AudioComponentRegistrar is a standalone daemon and needs the
+# project launch profile; the two Audio Unit bundles are dlopen images and must
+# remain entitlement-free.
+ensure_audio_component_image() {
+    local path="$1" identifier="$2" mode="$3"
+    local current_entitlements="" temporary="" valid=1
+    [ -f "$path" ] || return 1
+    current_entitlements=$(ldid -e "$path" 2>/dev/null || true)
+    ldid -h "$path" 2>/dev/null |
+        grep -Fqx "Identifier=$identifier" || valid=0
+    case "$mode" in
+        daemon)
+            printf '%s\n' "$current_entitlements" |
+                grep -Fq '<key>com.apple.private.graphics-restart-no-kill</key>' ||
+                valid=0
+            ;;
+        plugin)
+            [ -z "$current_entitlements" ] || valid=0
+            ;;
+        *) return 1 ;;
+    esac
+    if [ "$valid" -ne 1 ]; then
+        temporary="${path}.macws-new.$$"
+        rm -f "$temporary"
+        cp -p "$path" "$temporary" || return 1
+        if [ "$mode" = daemon ]; then
+            ldid -I"$identifier" -S"$ENT" -M "$temporary" || {
+                rm -f "$temporary"; return 1;
+            }
+            ldid -I"$identifier" -S"$ENT" -M "$temporary" || {
+                rm -f "$temporary"; return 1;
+            }
+        else
+            ldid -I"$identifier" -S "$temporary" || {
+                rm -f "$temporary"; return 1;
+            }
+            ldid -I"$identifier" -S "$temporary" || {
+                rm -f "$temporary"; return 1;
+            }
+        fi
+        chmod --reference="$path" "$temporary" 2>/dev/null || true
+        chown --reference="$path" "$temporary" 2>/dev/null || true
+        mv -f "$temporary" "$path" || return 1
+    fi
+    add_all_trustcache "$path"
+}
+
+ensure_coreaudiod_runtime() {
+    local path="$ROOTFS/usr/sbin/coreaudiod"
+    local dylib='/usr/local/lib/libmachook.dylib'
+    local temporary="" entitlements="" valid=1
+    [ -f "$path" ] || return 1
+    [ -f "$COREAUDIOD_AUDIO_ENT" ] || return 1
+    [ -f "$LOAD_DYLIB_PATCHER" ] || return 1
+    strings "$path" 2>/dev/null | grep -Fqx "$dylib" || valid=0
+    entitlements=$(ldid -e "$path" 2>/dev/null || true)
+    printf '%s\n' "$entitlements" |
+        grep -Fq '<key>com.apple.private.graphics-restart-no-kill</key>' ||
+        valid=0
+    printf '%s\n' "$entitlements" |
+        grep -Fq '<key>com.apple.private.audio.hal.aop-audio.user-access</key>' ||
+        valid=0
+    ldid -h "$path" 2>/dev/null |
+        grep -Fqx 'Identifier=coreaudiod' || valid=0
+    if [ "$valid" -ne 1 ]; then
+        temporary="${path}.macws-new.$$"
+        rm -f "$temporary"
+        cp -p "$path" "$temporary" || return 1
+        /var/jb/usr/bin/python3 "$LOAD_DYLIB_PATCHER" \
+            "$temporary" "$dylib" || {
+                rm -f "$temporary"; return 1;
+            }
+        # Start from the copied native entitlement set, add the common MacWS
+        # launch policy, then the exact IOAudio2 permissions observed on the
+        # target. Two final passes settle the grown __LINKEDIT page hashes.
+        ldid -Icoreaudiod -S"$ENT" -M "$temporary" || {
+            rm -f "$temporary"; return 1;
+        }
+        ldid -Icoreaudiod -S"$COREAUDIOD_AUDIO_ENT" -M "$temporary" || {
+            rm -f "$temporary"; return 1;
+        }
+        ldid -Icoreaudiod -S"$COREAUDIOD_AUDIO_ENT" -M "$temporary" || {
+            rm -f "$temporary"; return 1;
+        }
+        chmod --reference="$path" "$temporary" 2>/dev/null || true
+        chown --reference="$path" "$temporary" 2>/dev/null || true
+        mv -f "$temporary" "$path" || return 1
+    fi
+    add_all_trustcache "$path"
+}
+
 # Give a stock macOS image the project code-signing policy once, then restore
 # only its persistent CDHashes on subsequent repairs/reboots.  The entitlement
 # marker avoids repeatedly changing the file and accumulating obsolete hashes.
@@ -729,6 +825,17 @@ add_all_trustcache "/var/jb/usr/macOS/bin/launchdchrootexec"
 add_all_trustcache "/var/jb/usr/macOS/bin/launchdchrootexec_debug"
 add_all_trustcache "/var/jb/usr/macOS/bin/macwsinputd"
 add_all_trustcache "/var/jb/usr/macOS/bin/macwsdisplayd"
+add_all_trustcache "/var/jb/usr/macOS/bin/macwsaudiooutd"
+ensure_audio_component_image \
+    "$ROOTFS/System/Library/Frameworks/AudioToolbox.framework/AudioComponentRegistrar" \
+    'com.apple.AudioComponentRegistrar' daemon || exit 1
+ensure_audio_component_image \
+    "$ROOTFS/System/Library/Components/CoreAudio.component/Contents/MacOS/CoreAudio" \
+    'com.apple.audio.units.Components' plugin || exit 1
+ensure_audio_component_image \
+    "$ROOTFS/System/Library/Components/AudioDSP.component/Contents/MacOS/AudioDSP" \
+    'com.apple.audio.AudioDSPComponents' plugin || exit 1
+ensure_coreaudiod_runtime || exit 1
 sign_and_trustcache_merging_native_entitlements \
     "/var/jb/usr/macOS/libexec/MacWSInteropService.app/Contents/MacOS/macwsinteropd" \
     "$INTEROP_LOCATION_ENT" \

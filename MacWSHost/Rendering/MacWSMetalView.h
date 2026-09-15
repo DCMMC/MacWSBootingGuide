@@ -112,6 +112,10 @@ typedef NS_ENUM(NSUInteger, MacWSHostPresentationResolution) {
 - (void)setTrackpadPointerPressed:(BOOL)pressed animated:(BOOL)animated;
 - (void)startScrollMomentumWithVelocity:(CGPoint)velocity
                              framePoint:(CGPoint)framePoint;
+- (void)startScrollMomentumWithVelocity:(CGPoint)velocity
+                             framePoint:(CGPoint)framePoint
+                                 source:(MacWSInputSource)source
+                    directionMultiplier:(CGFloat)directionMultiplier;
 - (void)stopScrollMomentumWithTerminalPhase:(BOOL)terminalPhase;
 - (void)cancelActiveThreeFingerSystemGestureAtTimestamp:
     (NSTimeInterval)timestamp;
