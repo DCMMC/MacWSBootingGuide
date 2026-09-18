@@ -2000,6 +2000,23 @@ prepare_vscode_production_assets() {
     log "VS Code production assets ready (isolated profile=$VSCODE_PROFILE_NAME)."
 }
 
+prepare_metal_library_target_cache() {
+    # This is derived-data versioning, not a feature/debug gate. Compiler
+    # compatibility is always enabled. The helper checks actual chroot roots,
+    # so omitted live clients defer safely instead of losing an mmap-backed
+    # cache. A normal cold startup migrates once before any GUI client starts.
+    /var/jb/usr/bin/python3 "${BASH_SOURCE[0]%/*}/macws_metal_cache_migration.py" \
+        --rootfs "$ROOTFS" --defer-if-running
+}
+
+prepare_production_boot_jobs() {
+    # The boot-scanned jailbreak directory is a separate launch authority.
+    # Historical diagnostics/optional-app jobs there are not covered by the
+    # generated GUI-job preflight. Archive only recognized original jobs;
+    # never unload a live application while auditing an upgrade.
+    /var/jb/usr/bin/python3 "${BASH_SOURCE[0]%/*}/macws_retire_legacy_boot_jobs.py"
+}
+
 write_plists() {
     local vnc_listen_scope=""
     if [ "$WANT_VNC" != 1 ]; then
@@ -5416,6 +5433,7 @@ case "$CMD" in
     start)
         require_root "$@"
         acquire_gui_transaction start || exit $?
+        prepare_production_boot_jobs || exit 1
         start_started=$SECONDS
         start_stage_started=$SECONDS
         write_gui_start_state windowing "verifying the current SpringBoard request bridge"
@@ -5431,6 +5449,7 @@ case "$CMD" in
         log "TIMING gui-start stage=cleanup seconds=$((SECONDS - start_stage_started)) total=$((SECONDS - start_started))"
         start_stage_started=$SECONDS
         write_gui_start_state assets "preparing the production application profile"
+        prepare_metal_library_target_cache || { stop_all; exit 1; }
         prepare_vscode_production_assets || { stop_all; exit 1; }
         enable_experimental_if_requested
         if [ "$WANT_EXPERIMENTAL" = 1 ] && [ "$WANT_DIAGNOSTICS" != 1 ]; then
@@ -5472,6 +5491,7 @@ case "$CMD" in
     restart)
         require_root "$@"
         acquire_gui_transaction restart || exit $?
+        prepare_production_boot_jobs || exit 1
         write_gui_start_state windowing "verifying the current SpringBoard request bridge"
         ensure_windowing_bridge || exit 1
         write_gui_start_state preparing "generating launchd contracts"
@@ -5513,6 +5533,7 @@ case "$CMD" in
         write_gui_start_state cleaning "retiring the active GUI service generation"
         stop_all
         write_gui_start_state assets "preparing the production application profile"
+        prepare_metal_library_target_cache || { stop_all; exit 1; }
         prepare_vscode_production_assets || { stop_all; exit 1; }
         enable_experimental_if_requested
         if [ "$WANT_EXPERIMENTAL" = 1 ] && [ "$WANT_DIAGNOSTICS" != 1 ]; then

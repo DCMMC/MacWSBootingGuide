@@ -175,3 +175,40 @@ fullscreen drag checks stop and release if the owner dies or focus changes.
 This liveness check is not an atomic responder or PID-generation guarantee.
 Four focus-gate tests cover stale metrics and unobservable/system PIDs. These
 tool checks do not change the user's production input routing.
+
+### All launch authorities, not just the generated GUI directory
+
+Runtime-confirmed by the read-only installed-job receipt
+`/tmp/macws-outer-launchd-audit-20260919.json`: the jailbreak's boot-scanned
+`/var/jb/Library/LaunchDaemons` still contained nine historical MacWS jobs
+outside the generated GUI-job audit. Chrome's debug job had both
+`MACWS_SUSPEND_AT_EXEC=1` and `MACWS_JIT_MPROTECT_TRACE=1`; other jobs included
+CPU/JIT/root-directory probes and obsolete application autostarts. Only
+alloc/hostd/keychain belong to the current package's boot-scanned payload.
+These files prove unwanted startup configuration, not that the corresponding
+applications were consuming CPU or caused the reported heat.
+
+The bounded migration now runs from the actual dpkg maintainer entry point,
+the deep repair script, and before ordinary GUI start/restart. It validates
+the whole candidate inventory first, archives only exact observed originals
+(plus the previously supported exact GlassDemo/VS Code launch identities),
+and preserves inode, bytes and metadata outside launchd's scan directory.
+Unknown project jobs fail visibly without being deleted; unrelated iOS jobs
+are not rewritten. Current daemon Program overrides and unexpected environment
+are rejected. The helper never unloads an application or uses a feature flag.
+Fourteen executable tests cover identity, unrelated-job isolation, interrupted
+hard-link archival, repeated migration and both package entry points.
+
+On the device the nine original boot files were archived under
+`/var/jb/usr/macOS/retired-launch-jobs/*.disabled`; a second audit returned
+`LEGACY-BOOT current`. Three old probes additionally remained loaded with
+`active count = 0`, `state = spawn scheduled`, and `last exit code = 78`.
+After verifying each exact loaded program and arguments, only those three
+idle experimental registrations were booted out. Each subsequent lookup
+returned 113 (absent). No application, document or desktop service was stopped.
+
+Metal cache migration is also wired into the real dpkg maintainer script:
+`build_on_ios.sh` intentionally skips the duplicate deep repair script, so
+adding upgrade logic only there would not cover package installs. Cache
+retirement remains deferred while chroot clients are live; neither a successful
+empty fixture nor source startup ordering is a completed cold-boot witness.

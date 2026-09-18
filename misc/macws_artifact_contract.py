@@ -32,6 +32,8 @@ PACKAGE_PATHS = (
     'var/jb/usr/macOS/bin/macws_dense_grid.sh',
     'var/jb/usr/macOS/bin/postinst.sh',
     'var/jb/usr/macOS/bin/macws_diagnostic_flags.sh',
+    'var/jb/usr/macOS/bin/macws_retire_legacy_boot_jobs.py',
+    'var/jb/usr/macOS/bin/macws_metal_cache_migration.py',
     'var/jb/usr/macOS/bin/ensure_settings_extensions_runtime.sh',
     'var/jb/usr/macOS/gui-launchd/com.macwsguide.coreaudiod.plist',
     'var/jb/usr/macOS/gui-launchd/com.macwsguide.audiocomponentregistrar.plist',
@@ -46,6 +48,10 @@ SOURCE_PAYLOADS = {
     'var/jb/usr/macOS/bin/postinst.sh': 'layout/usr/macOS/bin/postinst.sh',
     'var/jb/usr/macOS/bin/macws_diagnostic_flags.sh':
         'layout/usr/macOS/bin/macws_diagnostic_flags.sh',
+    'var/jb/usr/macOS/bin/macws_retire_legacy_boot_jobs.py':
+        'layout/usr/macOS/bin/macws_retire_legacy_boot_jobs.py',
+    'var/jb/usr/macOS/bin/macws_metal_cache_migration.py':
+        'layout/usr/macOS/bin/macws_metal_cache_migration.py',
     'var/jb/usr/macOS/bin/ensure_settings_extensions_runtime.sh':
         'layout/usr/macOS/bin/ensure_settings_extensions_runtime.sh',
     'var/jb/usr/macOS/gui-launchd/com.macwsguide.coreaudiod.plist':

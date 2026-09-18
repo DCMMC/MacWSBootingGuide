@@ -8,6 +8,13 @@ cd $(realpath $HOME/../..)/usr/macOS
 # the generic /Applications trustcache restoration runs.
 ROOTFS=/var/mnt/rootfs
 
+# Cover the boot-scanned directory as well as generated GUI jobs. Exact
+# historical jobs are archived without changing an already-running process.
+/var/jb/usr/bin/python3 "${BASH_SOURCE[0]%/*}/macws_retire_legacy_boot_jobs.py" || {
+    echo "[ERROR] Unresolved legacy MacWS boot launch configuration." >&2
+    exit 1
+}
+
 # Invalidate the same-bootsession Settings ExtensionKit verification cache
 # before an installation can replace any of its signed runtime dependencies.
 rm -f /tmp/macws-settings-runtime.boot-ready \
@@ -1563,6 +1570,15 @@ invalidate_vscode_metal_source_cache() {
 
 invalidate_vscode_metal_source_cache || {
 	echo "[ERROR] Failed to migrate the VS Code Metal source cache." >&2
+	exit 1
+}
+
+# Retire incompatible pre-DAG-fix Metal libraries once, after clients have
+# exited. A live upgrade defers without touching any open cache; normal GUI
+# startup retries at its cleanup boundary. No debug flag enables this fix.
+/var/jb/usr/bin/python3 "${BASH_SOURCE[0]%/*}/macws_metal_cache_migration.py" \
+	--rootfs "$ROOTFS" --defer-if-running || {
+	echo "[ERROR] Failed to migrate the Metal DAG target cache." >&2
 	exit 1
 }
 
