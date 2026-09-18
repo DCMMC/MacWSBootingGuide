@@ -13043,18 +13043,21 @@ static void install_agx_init_redirect(Class agx);
             if (!iogpu) {
                 fprintf(stderr, "#### MACWS_AGX_NATIVE could NOT pre-load IOGPU: %s\n", dlerror());
             }
-            // Verify some critical IOGPU symbols are resolvable
-            const char *probeSyms[] = {
-                "IOGPUResourceCreate",
-                "IOGPUMetalCommonResourceCreate",
-                "IOGPUDeviceCreateWithAPIProperty",
-                "_IOGPUMetalAllocateResource",
-                "IOGPUMetalAllocateResource",
-                NULL
-            };
-            for (int i = 0; probeSyms[i]; i++) {
-                void *p = dlsym(RTLD_DEFAULT, probeSyms[i]);
-                fprintf(stderr, "#### MACWS_AGX_NATIVE dlsym(%s) = %p\n", probeSyms[i], p);
+            // Symbol-availability observations do not bind the driver or
+            // decide readiness. Do not pay for them with diagnostics off.
+            if (macws_runtime_diagnostics_enabled()) {
+                const char *probeSyms[] = {
+                    "IOGPUResourceCreate",
+                    "IOGPUMetalCommonResourceCreate",
+                    "IOGPUDeviceCreateWithAPIProperty",
+                    "_IOGPUMetalAllocateResource",
+                    "IOGPUMetalAllocateResource",
+                    NULL
+                };
+                for (int i = 0; probeSyms[i]; i++) {
+                    void *p = dlsym(RTLD_DEFAULT, probeSyms[i]);
+                    fprintf(stderr, "#### MACWS_AGX_NATIVE dlsym(%s) = %p\n", probeSyms[i], p);
+                }
             }
 
             void *h = dlopen("/System/Library/Extensions/AGXMetal13_3.bundle/Contents/MacOS/AGXMetal13_3", RTLD_NOW);

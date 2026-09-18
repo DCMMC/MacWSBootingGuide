@@ -33,6 +33,7 @@
 #import <poll.h>
 #include <execinfo.h>
 #import "macws_host_protocol.h"
+#import "macws_pointer_activation.h"
 #import "macws_control_protocol.h"
 #import "macws_steam_mach_rendezvous_protocol.h"
 #include "macws_agx_compute_abi.h"
@@ -5607,121 +5608,15 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
         //      value for AGX's framebuffer surfaces in chroot.
 
         // ──────────────────────────────────────────────────────────────────
-        // __objc_superrefs slot patcher for AGXTexture → IOGPUMetalTexture.
-        //
-        // Background discovered 2026-06-17:
-        //   -[AGXTexture initWithDevice:desc:iosurface:plane:] at 0x1e5a5af00
-        //   loads its [super …] receiver class from 0x21a8a96d0 (an entry in
-        //   __objc_superrefs). In a normal binary, dyld would process the
-        //   chained-fixup record at that slot and write the runtime class
-        //   pointer. AGXMetal13_3 was extracted from the DSC and has NO
-        //   LC_DYLD_CHAINED_FIXUPS / LC_DYLD_INFO_ONLY — so the slot keeps
-        //   its raw cache-baked chained-fixup encoding (e.g. high-byte 0x01,
-        //   0xf0 noise bits) and reads back as a pointer to garbage.
-        //
-        //   objc_msgSendSuper2 then class-looks-up the selector against the
-        //   garbage receiver → no method found → 0 return → init nil-exit
-        //   at the cbz x0 immediately after. Our IOGPU_INIT_HOOK never fires
-        //   even though class_getSuperclass(AGXTexture)==IOGPUMetalTexture
-        //   resolves correctly via libobjc's superClassName fallback — the
-        //   ABI-level superref slot is unaffected by that fallback.
-        //
-        // Fix: at AGXMetal13_3 load time, write the LIVE IOGPUMetalTexture
-        // class pointer into 0x21a8a96d0+slide. __objc_superrefs is in plain
-        // __DATA (no PAC auth needed); a raw pointer write suffices.
-        //
-        // Slot is at the very END of __objc_superrefs (size 0x140 from
-        // 0x21a8a9598; offset 0x6d0 from page 0x21a8a9000 → 0x21a8a96d0,
-        // which is 0x138 from the start of __objc_superrefs == the 40th /
-        // last superref entry). Other superref entries used by other AGX
-        // classes are TODO — patch reactively as more nil-exits surface.
-        if (macws_agx_native_enabled()) {
-            // 2026-06-17 lldb-confirmed root cause of texture-init nil-exit
-            // (and the actual fix that worked):
-            //
-            // libobjc's objc_msgSendSuper2 does at +16:
-            //     autda x16, x17     ; PAC-auth super_class->superclass
-            //     ldr   x10, [x16, #0x10]    ; load cache buckets
-            //
-            // AGXTexture's runtime class_t.superclass holds a raw unsigned
-            // 0x1fdfdcfb0 (= IOGPUMetalTexture) — the cache-baked PAC-signed
-            // chained-fixup record at __DATA AGXTexture+0x8 isn't processed
-            // by chroot dyld (DSC extraction strips chained fixups), so
-            // libobjc's name-based class registration left the field as a
-            // raw pointer. autda on a raw pointer fails → x16 becomes 0 (or
-            // poisoned) → ldr [x16+0x10] segfaults at 0x10. WS dies.
-            //
-            // PAC-signing from libmachook is unavailable here — we're built
-            // as arm64 (not arm64e), so macws_pac_sign is a no-op. Instead:
-            // replace the autda inside libobjc with xpacd x16. xpacd just
-            // STRIPS PAC bits without verification — works for both signed
-            // (legit) and raw (our case) pointers. autda x16,x17 and
-            // xpacd x16 are both 4 bytes, so it's a single-instruction patch.
-            //
-            // Patch is per-process (ModifyExecutableRegion does COW), other
-            // processes' libobjc unaffected.
-
-            // (The previous AGXTexture super-init bypass that lived here —
-            // forcing -[AGXTexture initWithDevice:desc:iosurface:plane:] to
-            // return self regardless of IOGPUMetalTexture's super-init result
-            // — was removed 2026-06-18. The IOSurfaceID +0x30 swap on sel=0xa
-            // type=0x82 made the super-init actually succeed, so the bypass
-            // is no longer needed.)
-
-            void *super2 = dlsym(RTLD_DEFAULT, "objc_msgSendSuper2");
-            if (super2) {
-                // dlsym returns a PAC-signed function pointer in an arm64e
-                // process.  Using that value as a data pointer after adding
-                // 0x10 faults with SEGV_ACCERR instead of reading the
-                // instruction.  Runtime witness (agxprobe_e, 2026-07-24):
-                // x0=0x132400019280de00 and loadImageCallback+0xf94 faulted
-                // while reading 0x132400019280de10.  Strip only the pointer
-                // authentication bits used for arithmetic; the instruction
-                // value below still has to match before any patch is made.
-                void *super2_code = ptrauth_strip(
-                    super2, ptrauth_key_function_pointer);
-                // autda is at msgSendSuper2 + 16 (verified by lldb).
-                uint32_t *autda_at =
-                    (uint32_t *)((uint8_t *)super2_code + 16);
-                const uint32_t AUTDA_X16_X17 = 0xdac11a30u;
-                const uint32_t XPACD_X16     = 0xdac147f0u;
-                uint32_t cur = *autda_at;
-                dprintf(2,
-                    "#### MACWS_AGX_OBJC_AUTDA_PATCH msgSendSuper2=%p "
-                    "code=%p autda@%p insn=%#x\n",
-                    super2, super2_code, autda_at, cur);
-                if (cur == XPACD_X16) {
-                    dprintf(2, "####   already patched, skip\n");
-                } else if (cur != AUTDA_X16_X17) {
-                    dprintf(2,
-                        "####   unexpected insn (expected %#x for autda x16,x17) — skip\n",
-                        AUTDA_X16_X17);
-                } else {
-                    ModifyExecutableRegion(autda_at, 4, ^{
-                        *autda_at = XPACD_X16;
-                    });
-                    dprintf(2,
-                        "####   PATCHED autda x16,x17 → xpacd x16 (%#x → %#x)\n",
-                        AUTDA_X16_X17, XPACD_X16);
-                }
-            } else {
-                dprintf(2,
-                    "#### MACWS_AGX_OBJC_AUTDA_PATCH: dlsym(objc_msgSendSuper2)=NULL\n");
-            }
-
-            // Diagnostic (read-only) — useful when triaging future variants.
-            Class agx_tex = objc_getClass("AGXTexture");
-            Class iogpu_tex = objc_getClass("IOGPUMetalTexture");
-            if (agx_tex && iogpu_tex) {
-                uint64_t *super_field = (uint64_t *)((uintptr_t)agx_tex + 8);
-                dprintf(2,
-                    "#### MACWS_AGX_SUPERCLASS_DIAG AGXTexture=%p field@%p=%#llx "
-                    "IOGPUMetalTexture=%p\n",
-                    (void*)agx_tex, super_field,
-                    (unsigned long long)*super_field,
-                    (void*)iogpu_tex);
-            }
-        }
+        // Keep libobjc's superclass authentication and executable pages intact.
+        // The old June-2026 AUTDA-to-XPACD workaround predated the current native
+        // class-registration/fixup path. PAC-enabled processes already have
+        // authenticated AGX class/metaclass superclass fields; PAC-disabled
+        // processes naturally execute AUTDA as a no-op.
+        // Writing objc_msgSendSuper2 also COW'd the adjacent objc_msgSend page:
+        // Terminal fork children inherited it r--/rw- and died in
+        // xpc_atfork_child before exec (Terminal-2026-09-19-043206.ips).
+        // Native Metal setup must not rewrite libobjc to strip valid metadata.
 
         // ──────────────────────────────────────────────────────────────────
         // Runtime diagnostic: dump the cstring at the [super initWith…]
@@ -5740,9 +5635,10 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
         // -[AGXTexture initWithDevice:desc:iosurface:plane:] nil-exits at
         // cbz x0 (static 0x1e5a5af3c) before validate is ever reached.
         //
-        // Print the first 96 bytes at the slid VA so we can see what
-        // actually lives there.
-        if (macws_agx_native_enabled()) {
+        // This is observation only, not class/selector setup. Keep the whole
+        // inspection (including dprintf and method-list allocation) out of
+        // production startup, not just its filtered fprintf calls.
+        if (macws_agx_native_enabled() && macws_runtime_diagnostics_enabled()) {
             uint64_t sel_static = 0x1cffc6f26;
             const char *sel_runtime = (const char *)(sel_static + slide);
             char preview[97] = {0};
@@ -5939,8 +5835,11 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
         // objc_alloc(AGXBuffer) — if the class ref slot at __objc_classrefs is
         // null, alloc returns nil and crashes downstream at addr 0x30 (the
         // *(this+0x28) deref).
-        Class agxbuf = objc_getClass("AGXBuffer");
-        fprintf(stderr, "#### MACWS_AGX_NATIVE objc_getClass(AGXBuffer) = %p\n", (void *)agxbuf);
+        // Skip the observation itself in production, not only its output.
+        if (macws_runtime_diagnostics_enabled()) {
+            Class agxbuf = objc_getClass("AGXBuffer");
+            fprintf(stderr, "#### MACWS_AGX_NATIVE objc_getClass(AGXBuffer) = %p\n", (void *)agxbuf);
+        }
 
         // Read __objc_classlist — list of pointers to OUR OWN classes. If
         // libobjc didn't process them (callback skipped due to dlopen path),
@@ -5955,37 +5854,25 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
         if (classlist) {
             size_t n = classlist_sz / 8;
             fprintf(stderr, "#### MACWS_AGX_NATIVE __objc_classlist: %zu entries\n", n);
-            // Dump first 6 with class name
-            for (size_t i = 0; i < n && i < 6; i++) {
-                if (classlist[i] == 0) continue;
-                Class c = (Class)classlist[i];
-                const char *name = class_getName(c);
-                fprintf(stderr, "####   classlist[%zu] = %p name=%s registered=%p\n",
-                    i, (void *)c, name ?: "?", (void *)objc_getClass(name ?: ""));
+            // Dump first 6 with class name. These observations are separate
+            // from the required driver-class registration below.
+            if (macws_runtime_diagnostics_enabled()) {
+                for (size_t i = 0; i < n && i < 6; i++) {
+                    if (classlist[i] == 0) continue;
+                    Class c = (Class)classlist[i];
+                    const char *name = class_getName(c);
+                    fprintf(stderr, "####   classlist[%zu] = %p name=%s registered=%p\n",
+                        i, (void *)c, name ?: "?", (void *)objc_getClass(name ?: ""));
+                }
             }
-            // Force registration by calling _objc_init-equivalent machinery:
-            // libobjc's `_dyld_objc_register_callbacks` or `_objc_map_images`.
-            // Alternatively: walk __objc_classlist, for each non-null class
-            // pointer, call objc_registerClassPair() — but this fails on
-            // already-registered classes. Try simpler: use the runtime's
-            // class_addMethod/etc on each, which forces registration as a
-            // side effect.
-            //
-            // Most reliable: directly call libobjc's `_objc_register_classes`
-            // private API if exposed.
-            // The classes are in classlist as RAW DATA but not in the
-            // runtime's class table. dlsym a few possible APIs to register
-            // them. Failing all those, use the runtime trick of allocating
-            // a temporary class pair and then PIVOTING the existing class to
-            // it via objc_setClass on instances — but that's incomplete.
-            //
-            // Most reliable: call `objc_duplicateClass(orig_cls, new_name)`
-            // to register via class duplication. Or use the dyld objc
-            // notification API by re-registering ourselves.
-            void (*objc_duplicate)(Class, const char *, size_t) = dlsym(
-                RTLD_DEFAULT, "objc_duplicateClass");
-            fprintf(stderr, "#### MACWS_AGX_NATIVE objc_duplicateClass=%p\n",
-                (void *)objc_duplicate);
+            // Historical symbol-availability observation only: this function
+            // pointer is printed, never called or used for registration.
+            if (macws_runtime_diagnostics_enabled()) {
+                void (*objc_duplicate)(Class, const char *, size_t) = dlsym(
+                    RTLD_DEFAULT, "objc_duplicateClass");
+                fprintf(stderr, "#### MACWS_AGX_NATIVE objc_duplicateClass=%p\n",
+                    (void *)objc_duplicate);
+            }
 
             // Register each class with libobjc via objc_readClassPair.
             //
@@ -7736,7 +7623,7 @@ static uint32_t macws_vnc_proxy_synthetic_modifiers;
 static BOOL macws_vnc_forward_key(unsigned short keyCode, BOOL down,
                                   uint64_t modifiers, unsigned int keySym);
 static void macws_vnc_note_interaction(void);
-static BOOL macws_vnc_coordinate_activation(CGPoint point);
+static BOOL macws_vnc_coordinate_activation(const MacWSInputRecord *pointer);
 
 // Fullscreen Mission Control cards are WindowServer presentation transforms,
 // not ordinary NSWindows. Runtime A/B on iPad13,6 (2026-09-08) sent the same
@@ -8102,7 +7989,9 @@ static void *macws_vnc_pointer_proxy_listener(void *unused) {
                 // new point only selected and reopened the card.
                 (void)postMouse(point, true, 3,
                                 false, false, false);
-                (void)macws_vnc_coordinate_activation(point);
+                // The native post uses Quartz points, but activation's wire
+                // coordinates must retain the original producer extent.
+                (void)macws_vnc_coordinate_activation(&record);
                 activeContact = record.contactID;
                 leftDown = YES;
                 firstResult = postMouse(point, true, 3,
@@ -9413,41 +9302,21 @@ static int macws_vnc_activation_reply_socket(void) {
 // lets an already-active target proceed immediately; repair/timeout preserves
 // the historical 20-ms upper bound instead of sleeping blindly on every
 // click. sampleSequence prevents a late reply from satisfying a newer down.
-static BOOL macws_vnc_coordinate_activation(CGPoint point) {
+static BOOL macws_vnc_coordinate_activation(const MacWSInputRecord *pointer) {
     const double maximumWaitSeconds = 0.020;
     double started = macws_vnc_monotonic_seconds();
     BOOL targetReady = NO;
     uint32_t replyFlags = 0;
-    if (!macws_rfbScreen) goto finish;
-    int width = macws_rfbScreen[0];
-    int height = macws_rfbScreen[2];
-    if (width <= 0 || height <= 0 || width > 8192 || height > 8192)
-        goto finish;
-    if (point.x < 0.0) point.x = 0.0;
-    if (point.y < 0.0) point.y = 0.0;
-    if (point.x >= width) point.x = width - 1;
-    if (point.y >= height) point.y = height - 1;
-
     uint32_t sequence = atomic_fetch_add_explicit(
         &macws_vnc_activation_sequence, 1, memory_order_relaxed) + 1;
     if (sequence == 0) {
         sequence = atomic_fetch_add_explicit(
             &macws_vnc_activation_sequence, 1, memory_order_relaxed) + 1;
     }
-    MacWSInputRecord record = {
-        .magic = MACWS_INPUT_MAGIC,
-        .version = MACWS_INPUT_VERSION,
-        .kind = MacWSInputKindActivateTarget,
-        .sceneID = 0x564e430000000001ull,
-        .timestamp = macws_vnc_event_timestamp_seconds(),
-        .x = (float)point.x,
-        .y = (float)point.y,
-        .contactID = macws_vnc_gesture_id,
-        .frameWidth = (uint32_t)width,
-        .frameHeight = (uint32_t)height,
-        .source = MacWSInputSourceVNC,
-        .sampleSequence = sequence,
-    };
+    MacWSInputRecord record = {0};
+    if (!MacWSGlobalActivationRecord(pointer,
+            macws_vnc_event_timestamp_seconds(), sequence, &record))
+        goto finish;
     int socketFD = macws_vnc_activation_reply_socket();
     if (socketFD < 0) goto finish;
     MacWSInputAck stale = {0};
@@ -9746,7 +9615,14 @@ static void macws_new_vnc_handle_mouse(id self, SEL command,
                 // before a synchronous contextual-menu tracker can occupy its
                 // main thread. The original OSXvnc path below remains the sole
                 // owner and dispatcher of the actual down event.
-                (void)macws_vnc_coordinate_activation(point);
+                MacWSInputRecord pointer = {
+                    .x = (float)point.x,
+                    .y = (float)point.y,
+                    .frameWidth = (uint32_t)macws_rfbScreen[0],
+                    .frameHeight = (uint32_t)macws_rfbScreen[2],
+                    .contactID = macws_vnc_gesture_id,
+                };
+                (void)macws_vnc_coordinate_activation(&pointer);
             }
             BOOL secondaryRelease =
                 (previousPointerButtons & 4u) != 0 &&

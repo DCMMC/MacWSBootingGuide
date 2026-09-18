@@ -211,3 +211,85 @@ SIGKILL in a pure protocol harness and that the admitted protocol tests pass on
 the actual iPad. It does not retroactively pass every failed executable or
 library fixture. Those remaining host harnesses were not rerun on the device;
 native application, geometry and audio acceptance remain separate checks.
+
+## Bounded heat observation and startup-only diagnostic overhead
+
+A read-only, three-sample observation on the iPad at device UTC
+2026-09-18 20:56:18/28/38 used cumulative `ps` CPU time, not only its smoothed
+instantaneous percentage. Over those 20 seconds, WindowServer PID 99427
+advanced from 6:51.65 to 6:54.96 CPU seconds; Host PID 1698 from 2:25.54 to
+2:27.49; Weather PID 9917 from 0:16.78 to 0:18.76. These correspond to 16.6%,
+9.8% and 9.9% of one core respectively. Finder, ControlCenter, Activity
+Monitor and displayd averaged 4.3%, 3.7%, 3.5% and 2.5%. No compiler, test
+probe or debugger appeared among the highest-CPU processes.
+
+AppleSmartBattery reported raw `Temperature=3829` then `3839`,
+`IsCharging=No`, and raw `PowerTelemetryData.SystemLoad=12301` then `10398`.
+These raw observations are not a calibrated temperature/power measurement.
+There may have been user interaction, so this was **not an idle baseline**.
+`ps` also reported zero cumulative time for protected iPadOS services such as
+SpringBoard/backboardd; those entries cannot rule out system-side work. No
+continuous CPU hot loop or cause of sustained heat was established.
+
+Source review identified startup-only observation work that still ran before
+the diagnostic stderr filter: the AGXBuffer class lookup, the first six
+class-name/registration queries, an unused `objc_duplicateClass` symbol
+lookup, and five IOGPU symbol-availability queries. Their results only feed
+diagnostic output. The observations themselves now use the existing
+off-by-default diagnostic gate. A host test compiles the actual guarded
+blocks with counted query stubs and verifies zero calls when diagnostics are
+off, while explicit diagnostics still execute the expected queries.
+
+This does **not** disable native AGX, move IOGPU preload, change driver-class
+registration/fixup ordering, or remove the AGXBuffer allocation witness. It
+removes unnecessary startup observations, not a measured per-frame hot loop;
+the heat complaint is **not claimed fixed by this change**.
+
+## Source, package, installed and mapped identity are separate witnesses
+
+The independent read-only audit began while both checkouts named `842b2a0`;
+the device checkout was clean and the Mac had the follow-up fixes in progress.
+The device's 04:32 candidate package passed `macws_artifact_contract.py
+verify-package`, including the Windowing source/header manifest. This proves
+the checked source payloads and staged/archive bytes, not that every live
+process has remapped those bytes. Non-Windowing binary UUIDs do not encode a
+Git commit, so they are not a substitute for build provenance.
+
+Archive/staging/installed whole-file SHA-256 agreed for Host, Windowing,
+hostd, inputd, displayd, allocd, autosignd and audiooutd. Catalyst and the
+compiler tweak had differing whole-file hashes after installation, but both
+architecture slices retained identical UUIDs and `__text` hashes. Those
+differences therefore do not establish differing executable instructions.
+For example, the compiler's arm64e slice was UUID
+`fa98b3abb0e730f0b60166fadae1a865`, `__text` SHA-256
+`737ddf6607923717157f3454d6353eed5eae6bdb264618189e0c887a1405a0ef`
+in both the archive and installed tweak.
+
+`misc/macws_runtime_image_identity.c` reads only allowlisted image headers and
+at most 8 MiB of instruction bytes from allowlisted processes, without
+attaching, suspending or writing to them. It reports UUID and `__text` hash,
+not a fictitious whole-mapped-file checksum. It has a 15-second deadline,
+bounded image/load-command counts, and tests that exercise the actual parser
+against malformed synthetic images. The following is a point-in-time ledger
+during the explicitly coordinated library replacement, not a claim that the
+final deployment was already complete:
+
+| Component / PID | Independently verified live evidence | Limitation |
+| --- | --- | --- |
+| Host / 1698 | UUID `f68c490943173964841712c039f55fa2`, text `ee75fabe3c1f63e6d0d4e10985aed59a9ce67885557b8daa60f54c02fb7c8c28` matched installed/archive | Instruction identity, not all mutable runtime state |
+| Windowing / SpringBoard 78270 | Live capability reply `ready=yes abi=1 pid=78270 capabilities=0x1f`; installed bytes matched manifest/archive | `task_for_pid=5`; mapped UUID/hash unavailable |
+| Settings bridge / RunningBoard 78311 | Live capability reply `ready=yes abi=1 pid=78311 capabilities=0x01`; installed text matched archive | `task_for_pid=5`; mapped UUID/hash unavailable |
+| inputd / 12779 | Main UUID `72af80e8b82e3054814d8fae41919e8b`, text `e9d1e65cdda9a7021065216c38749a675b8fb006eca296ef35b27bd3c089787c` matched archive/installed | Still mapped the prior libmachook generation below |
+| displayd / 222 | Main UUID `41b0f1d8c66f3dde917dda077645f90e`, text `dc97fe0126e0167257203c5175ff358527fd0934ccf308de6e6fa2f0e7e86b55` matched archive/installed | Still mapped the prior libmachook generation below |
+| WindowServer / 99427 | Mapped prior arm64 libmachook UUID `213837045f0a31229cad6069105f913a`, text `3e56c2f614446546ae29d58268ef78cefbe7e2c09ec8bba30dfdd6787b25f39d` | Replacing the file did not update this live process |
+| OSXvnc / 13078 | Mapped replacement libmachook UUID `208309ba53be3e0dab9643196f810071`, text `400b16249c1a684e862f2437ded18d3211e7b76b12e2f0eab5c3a81296fe54fa` matched replacement disk | Main executable UUID matched disk but text differed; its explicit delivery hooks modify executable instructions, so equality is not assumed |
+| hostd / 92633 | Mapped UUID `8f1a531c1d9d37b5b747ed5a496019a8` matched installed UUID | UUID comparison only |
+| autosignd / 90005 | Mapped UUID `38bb7d6ba3da341ca0bff693cccbac45` matched installed UUID | UUID comparison only |
+| allocd / 438 | Installed bytes matched archive | `proc_pidpath` returned errno 2 despite a visible process record; mapped identity unverified |
+| Compiler / 576, 78327 | Installed tweak UUID/text matched archive | Both returned `task_for_pid=5`; their mapped generations remain unverified |
+
+The same prior libmachook UUID/text was read from inputd and displayd. The
+fresh CoreImage request worker 13338 had already exited before identity
+sampling (`proc_pidpath` errno 3); its request/adapter logs are a separate
+witness, not evidence of a mapped hash. No protected-process permissions were
+changed to bypass these limitations, and this audit performed no restart.
