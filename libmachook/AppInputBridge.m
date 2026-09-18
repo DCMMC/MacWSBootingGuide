@@ -6449,18 +6449,23 @@ static CGSize MacWSEffectiveMinimumFrameSize(id window, CGRect frame,
             maximum.width = fmin(maximum.width, nativeMaximum.width);
         if (isfinite(nativeMaximum.height) && nativeMaximum.height > 0.0)
             maximum.height = fmin(maximum.height, nativeMaximum.height);
-        static char nativeLimitsWitnessKey;
-        CGSize witness[2] = {minimum, maximum};
-        NSData *previous = objc_getAssociatedObject(window, &nativeLimitsWitnessKey);
-        NSData *current = [NSData dataWithBytes:witness length:sizeof(witness)];
-        if (![previous isEqualToData:current]) {
-            objc_setAssociatedObject(window, &nativeLimitsWitnessKey, current,
-                OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-            fprintf(stderr, "#### APP-INPUT NATIVE-CONSTRAINT-LIMITS pid=%d window=%ld "
-                "minimum=%.1fx%.1f maximum=%.1fx%.1f source=appkit-layout-engine\n",
-                getpid(), (long)((MacWSMsgInteger)objc_msgSend)(window,
-                    sel_registerName("windowNumber")), minimum.width, minimum.height,
-                maximum.width, maximum.height);
+        // The witness is only a log deduplicator. Do not allocate/compare
+        // NSData or modify associated objects at every production metrics poll.
+        // The real native limit query and all constraint math stay above.
+        if (MacWSRuntimeDiagnosticsEnabled()) {
+            static char nativeLimitsWitnessKey;
+            CGSize witness[2] = {minimum, maximum};
+            NSData *previous = objc_getAssociatedObject(window, &nativeLimitsWitnessKey);
+            NSData *current = [NSData dataWithBytes:witness length:sizeof(witness)];
+            if (![previous isEqualToData:current]) {
+                objc_setAssociatedObject(window, &nativeLimitsWitnessKey, current,
+                    OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                fprintf(stderr, "#### APP-INPUT NATIVE-CONSTRAINT-LIMITS pid=%d window=%ld "
+                    "minimum=%.1fx%.1f maximum=%.1fx%.1f source=appkit-layout-engine\n",
+                    getpid(), (long)((MacWSMsgInteger)objc_msgSend)(window,
+                        sel_registerName("windowNumber")), minimum.width, minimum.height,
+                    maximum.width, maximum.height);
+            }
         }
     }
     if (contentDrivenHeight) {
@@ -10743,6 +10748,19 @@ static void MacWSWindowGeometryObserverCallback(id observer, SEL command,
     }
 }
 
+// Observation must not introduce selectors absent on AppKit's private window
+// classes. Runtime-confirmed in Preview PID 17619: its stock NSPopoverFrame
+// appears in NSApplication.windows but does not implement resizeIncrements.
+// The production constraint query already checks that capability; the extra
+// diagnostic query did not, and aborted an otherwise functioning popover.
+// NaN here means "not exposed" in a diagnostic line, never a resize policy.
+static CGSize MacWSOptionalDiagnosticWindowSize(id window, SEL selector) {
+    if (window && ((MacWSMsgBoolSEL)objc_msgSend)(window,
+            sel_registerName("respondsToSelector:"), selector))
+        return ((MacWSMsgSize)objc_msgSend)(window, selector);
+    return (CGSize){NAN, NAN};
+}
+
 static void MacWSPublishWindowMetrics(void) {
     Class applicationClass = objc_getClass("NSApplication");
     if (!applicationClass || !MacWSWindowMetricsPath[0]) return;
@@ -10828,20 +10846,20 @@ static void MacWSPublishWindowMetrics(void) {
                 window, sel_registerName("title"));
             NSUInteger styleMask = ((MacWSMsgUInteger)objc_msgSend)(
                 window, sel_registerName("styleMask"));
-            CGSize apiMinimum = ((MacWSMsgSize)objc_msgSend)(
+            CGSize apiMinimum = MacWSOptionalDiagnosticWindowSize(
                 window, sel_registerName("minSize"));
-            CGSize apiMaximum = ((MacWSMsgSize)objc_msgSend)(
+            CGSize apiMaximum = MacWSOptionalDiagnosticWindowSize(
                 window, sel_registerName("maxSize"));
-            CGSize apiContentMinimum = ((MacWSMsgSize)objc_msgSend)(
+            CGSize apiContentMinimum = MacWSOptionalDiagnosticWindowSize(
                 window, sel_registerName("contentMinSize"));
-            CGSize apiContentMaximum = ((MacWSMsgSize)objc_msgSend)(
+            CGSize apiContentMaximum = MacWSOptionalDiagnosticWindowSize(
                 window, sel_registerName("contentMaxSize"));
             CGSize requiredMinimum = CGSizeZero;
             CGSize requiredMaximum = {MACWS_STREAM_MAX_DIMENSION,
                                        MACWS_STREAM_MAX_DIMENSION};
             MacWSRequiredContentSizeLimits(window, &requiredMinimum,
                                            &requiredMaximum);
-            CGSize apiIncrements = ((MacWSMsgSize)objc_msgSend)(
+            CGSize apiIncrements = MacWSOptionalDiagnosticWindowSize(
                 window, sel_registerName("resizeIncrements"));
             [diagnosticEntries addObject:[NSString stringWithFormat:
                 @"id=%ld class=%s title=%@ style=%#lx frame=%.1fx%.1f min=%.1fx%.1f max=%.1fx%.1f resizable=%@ fixed=%@x%@ level=%ld visible=%@ transient=%@ api-min=%.1fx%.1f api-max=%.1fx%.1f content-min=%.1fx%.1f content-max=%.1fx%.1f required-min=%.1fx%.1f required-max=%.1fx%.1f increments=%.1fx%.1f",

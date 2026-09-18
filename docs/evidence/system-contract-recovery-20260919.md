@@ -153,3 +153,25 @@ by no-clobber hard-link archival under
 only the old launch-directory names. Current generated production jobs and
 application data were not changed. These files were not evidence of active
 tracing or the cause of the user's heat report.
+
+### Observation must not change application behavior
+
+Runtime-confirmed via `/tmp/macws-preview-mount-ab-20260919.log`: an isolated
+Preview test with diagnostics enabled aborted with
+`-[NSPopoverFrame resizeIncrements]: unrecognized selector sent to instance`,
+from `MacWSPublishWindowMetrics +2112`. The production constraint calculation
+already checked selector availability, but the additional diagnostic query did
+not. Optional diagnostic size queries now honor actual object capabilities;
+missing values are reported as NaN, not used to invent size limits. Three
+executable tests cover partial objects, exact returned sizes, and zero native
+constraint witness allocations/associated-object accesses with diagnostics off.
+The real native constraint queries and resize calculations remain unchanged.
+This diagnostic-only crash is distinct from Preview's default-mode FileCache
+recursion and is not evidence that the latter is fixed.
+
+The test tools also rejected a dead application whose old, change-driven
+metrics file still said "focused". Menu actions now require a live target;
+fullscreen drag checks stop and release if the owner dies or focus changes.
+This liveness check is not an atomic responder or PID-generation guarantee.
+Four focus-gate tests cover stale metrics and unobservable/system PIDs. These
+tool checks do not change the user's production input routing.

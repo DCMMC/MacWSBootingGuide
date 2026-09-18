@@ -21,6 +21,15 @@ HEADER = struct.Struct("<IHHHHQiIQIIII")
 NODE = struct.Struct("<QQIIiIIII")
 
 
+def require_live_target(pid: int) -> None:
+    if pid <= 1:
+        raise RuntimeError('refusing application action for invalid/system PID')
+    try:
+        os.kill(pid, 0)
+    except OSError as error:
+        raise RuntimeError(f'refusing action: target pid={pid} is not observable/alive') from error
+
+
 def require_focused_target(pid: int, window_id: int) -> None:
     """Fail closed before actions; the menu ABI does not select a responder.
 
@@ -29,6 +38,10 @@ def require_focused_target(pid: int, window_id: int) -> None:
     during a probe, and verify the native result independently afterwards.
     The sidecar is change-driven, so its mtime is not a heartbeat.
     """
+    # A crashed application's change-driven sidecar can survive its process.
+    # Its old focused bit must not authorize a new global pointer operation.
+    # This is a liveness guard, not an atomic responder/identity guarantee.
+    require_live_target(pid)
     name = f"macws_window_metrics.{pid}.bin"
     host_path = f"/var/mnt/rootfs/private/tmp/{name}"
     path = host_path if os.path.exists(host_path) else f"/private/tmp/{name}"

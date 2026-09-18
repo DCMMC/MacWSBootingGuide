@@ -15,6 +15,7 @@ import time
 from host_input_matrix import (record, ACTIVATE_TARGET, TOUCH_DOWN, TOUCH_MOVE,
                               TOUCH_UP, GLOBAL_SYSTEM_SURFACE)
 from macws_window_metrics_dump import read_metrics
+from macws_menu_probe import require_live_target
 
 
 def main():
@@ -38,11 +39,19 @@ def main():
         print(json.dumps({'action': 'none', 'requires': '--perform', 'arguments': vars(args)}))
         return
     path = f'/var/mnt/rootfs/private/tmp/macws_window_metrics.{args.pid}.bin'
+    require_live_target(args.pid)
+    require_live_target(args.dock)
     before = read_metrics(path)
     if not any(w['window_id'] == args.window for w in before['windows']):
         parser.error('requested window does not exist in the exact owner metrics')
     observations = []
     def observe(phase):
+        try:
+            require_live_target(args.pid)
+        except RuntimeError as error:
+            observations.append({'phase': phase, 'time': time.time(),
+                                 'focused': [], 'error': str(error)})
+            return False
         metrics = read_metrics(path)
         focused = [w['window_id'] for w in metrics['windows'] if 'focused' in w['flags']]
         observations.append({'phase': phase, 'time': time.time(),
@@ -68,8 +77,8 @@ def main():
                 transport.sendto(record(TOUCH_MOVE, step+2, args.dock, 0,
                     *args.frame, *point, pressure=1, contact=contact,
                     flags=GLOBAL_SYSTEM_SURFACE), destination)
-                if step in (5, 10, 15, 20):
-                    observe('during')
+                if step in (5, 10, 15, 20) and not observe('during'):
+                    break  # Release immediately; don't keep dragging a wrong/dead target.
         finally:
             transport.sendto(record(TOUCH_UP, 23, args.dock, 0,
                 *args.frame, *point, contact=contact, flags=GLOBAL_SYSTEM_SURFACE), destination)
