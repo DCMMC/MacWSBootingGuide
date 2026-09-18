@@ -41,7 +41,7 @@ env	DRAW_DELAY	off	standalone probe	Delays the drawtest test window.
 env	ELECTRON_RUN_AS_NODE	transient	VS Code shell environment resolver	Official VS Code marker paired with VSCODE_RESOLVING_ENVIRONMENT; never set by a production plist.
 env	HOME	auto	chroot/iOS launchers	Launcher-owned home directory appropriate to the target execution namespace.
 env	LOGNAME	auto	Steam launchd job	Matches the uid-501 chroot user identity expected by Valve's bootstrap.
-env	NO_COLOR	off	macwsneofetch	Optional output-colour override; never set by a production launch job.
+env	NO_COLOR	auto	macwsneofetch user preference	Optional standard CLI output-colour preference, not a diagnostic or forbidden production setting.
 env	IOSCLEAR_DRAW_MODE	off	standalone probe	Selects an iosclear reference draw experiment.
 env	IOSCLEAR_DUMP_AGX_METHODS	off	standalone probe	Dumps AGX methods from iosclear_ref.
 env	IOSCLEAR_EARLY_DELAY	off	standalone probe	Delays the early iosclear reference path.
@@ -59,7 +59,7 @@ env	MACWS_IOS_NV12_TEXTURE_HOLD	off	standalone probe	Stops the native iOS NV12 t
 env	MACWS_IOS_NV12_TEXTURE_PROBE	off	standalone probe	Creates native iOS R8/RG8 views of a 420v surface and dumps their AGX descriptors without GPU submission.
 env	MACWS_ABORT_TRACE	off	diagnostic	Abort/backtrace flight recorder.
 env	MACWS_APP_EXTENSION	auto	Settings ExtensionKit child	Marks the exact ViewBridgeChrootProxy app-extension target for its identity and bounded JIT/ExtensionKit startup compatibility.
-env	MACWS_CATALOG_REGISTRATION	off	macwsworkspacectl register-settings-extensions	Production launch plists keep this unset; the catalog transaction sets it to 1 only for the short-lived stock registration of all standalone System Settings extensions.
+env	MACWS_CATALOG_REGISTRATION	auto	macwsworkspacectl register-settings-extensions	Functional transaction-scoped launch contract; the catalog transaction sets it to 1 only for the short-lived stock registration of all standalone System Settings extensions.
 env	MACWS_APP_LIFECYCLE_TRACE	off	diagnostic	System Settings/Maps AppKit lifecycle boundary trace; never enable in production.
 env	MACWS_APP_MOUNT_COMPAT	auto	Finder, custom-path apps, generic Catalyst children and UIKitSystem	Launcher/job-owned scoped root-volume/statfs/fsgetpath compatibility; Finder needs it while resolving document handlers, and UIKitSystem needs the same logical-root contract while its CoreServices repository resolves Catalyst bundles.
 env	MACWS_APP_MOUNT_COMPAT_DIAGNOSTIC	off	diagnostic	Temporarily applies the chroot mount-namespace model to one otherwise-unlisted process; never set by a production plist.
@@ -173,7 +173,7 @@ env	MACWS_STEAM_SEM_CALLER_DIAGNOSTICS	off	Steam diagnostic	Optional semaphore-n
 env	MACWS_STEAM_SHM_DIAGNOSTICS	off	Steam diagnostic	Logs bounded Steam shared-memory open/unlink results and object metadata without changing the operation.
 env	MACWS_STEAM_THREAD_DIAGNOSTICS	off	Steam diagnostic	Logs Steam Helper pthread creation results and caller chains.
 env	MACWS_STEAM_UE4_DIAGNOSTICS	off	Stray diagnostic	Installs UUID-bound, read-only UE4 fatal/config snapshots only for an explicitly diagnosed Stray runtime process.
-env	MACWS_STRAY_AGX_COMPAT	off	Stray game	Enables the runtime-confirmed exact Stray subtype-1/subtype-3 producer-version AGX ABI adapters and exact-manifest MetalFX macabi function routing without synchronous per-submit diagnostics; the Steam launcher injects it only into Stray-Mac-Shipping.
+env	MACWS_STRAY_AGX_COMPAT	auto	Stray game	Functional exact-process launch contract: enables validated Stray subtype-1/subtype-3 AGX ABI adapters and exact-manifest MetalFX routing without synchronous per-submit diagnostics; the Steam launcher injects it only into Stray-Mac-Shipping.
 env	MACWS_STRAY_TARGET_FPS	on	Stray launched by Steam	Publishes the calibrated synthetic-completion target in the versioned render-activity record; production value 54 Hz yields about 50 completed UE frames while preventing pointer movement from switching the full game desktop to 120 Hz.
 env	MACWS_STRAY_DISABLE_DISPLAY_SYNC	on	Stray launched by Steam	Exact-process presentation policy: sets the public CAMetalLayer displaySyncEnabled property to NO before calling the original nextDrawable; selected by thermally-valid actual-gameplay A/B, never fabricates a drawable or bypasses validation.
 env	MACWS_CFPREFERENCES_CLIENT	transient	macos_gui defaults probe	Selects the narrow headless CFPreferences client path: installs only the private XPC name mapping and skips GUI/Metal/input hook initialization for the bounded defaults persistence probe.

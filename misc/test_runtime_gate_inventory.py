@@ -141,6 +141,90 @@ int main(void) {
                 self.assertEqual(job['EnvironmentVariables']['CA_VSYNC_OFF'], '1')
                 self.assertEqual(list(Path(directory).iterdir()), [path])
 
+    @staticmethod
+    def migrate_jobs(paths):
+        script = (ROOT / 'layout/usr/macOS/bin/macos_gui.sh').read_text()
+        body = script.split("<<'MACWS_JOB_MIGRATION'\n", 1)[1]
+        body = body.split('\nMACWS_JOB_MIGRATION\n', 1)[0]
+        return subprocess.run([sys.executable, '-',
+            '/var/jb/usr/macOS/bin/launchdchrootexec', '/var/mnt/rootfs',
+            *map(str, paths)], input=body, text=True, capture_output=True)
+
+    def test_optional_legacy_job_migrates_without_changing_functional_settings(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'com.macwsguide.chrome150.plist'
+            job = plistlib.loads((ROOT / 'misc' / path.name).read_bytes())
+            job['EnvironmentVariables']['MACWS_PIN_FALLBACK'] = '1'
+            job['EnvironmentVariables']['NO_COLOR'] = '1'
+            path.write_bytes(plistlib.dumps(job))
+            path.chmod(0o640)
+            expected = plistlib.loads(path.read_bytes())
+            del expected['EnvironmentVariables']['MACWS_PIN_FALLBACK']
+            result = self.migrate_jobs([path, Path(directory) / 'missing.plist'])
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(plistlib.loads(path.read_bytes()), expected)
+            self.assertEqual(path.stat().st_mode & 0o777, 0o640)
+            self.assertEqual(list(Path(directory).iterdir()), [path])
+            self.assertFalse(audit.production_environment_errors(audit.load_manifest(), [path]))
+            migrated_bytes = path.read_bytes()
+            result = self.migrate_jobs([path])
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, '')
+            self.assertEqual(path.read_bytes(), migrated_bytes)
+
+    def test_legacy_job_migration_retains_real_diagnostic_rejection(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'com.macwsguide.chrome150.plist'
+            job = plistlib.loads((ROOT / 'misc' / path.name).read_bytes())
+            job['EnvironmentVariables'].update(MACWS_PIN_FALLBACK='1', MallocScribble='1')
+            path.write_bytes(plistlib.dumps(job))
+            result = self.migrate_jobs([path])
+            self.assertEqual(result.returncode, 0, result.stderr)
+            errors = audit.production_environment_errors(audit.load_manifest(), [path])
+            self.assertEqual(len(errors), 1)
+            self.assertIn('MallocScribble', errors[0])
+
+    def test_legacy_job_migration_fails_closed_before_modifying_any_job(self):
+        with tempfile.TemporaryDirectory() as directory:
+            valid = Path(directory) / 'com.macwsguide.chrome150.plist'
+            invalid = Path(directory) / 'com.macwsguide.steam.runtime.plist'
+            job = plistlib.loads((ROOT / 'misc' / valid.name).read_bytes())
+            job['EnvironmentVariables']['MACWS_PIN_FALLBACK'] = '1'
+            valid.write_bytes(plistlib.dumps(job))
+            unchanged = valid.read_bytes()
+            bad_jobs = [b'not a plist', plistlib.dumps({'Label': 'com.apple.WindowServer'}),
+                        plistlib.dumps(dict(job, EnvironmentVariables=['not', 'a', 'dictionary']))]
+            for content in bad_jobs:
+                invalid.write_bytes(content)
+                result = self.migrate_jobs([valid, invalid])
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(valid.read_bytes(), unchanged)
+                self.assertEqual(invalid.read_bytes(), content)
+
+    def test_actual_managed_plists_are_accepted_by_migration(self):
+        with tempfile.TemporaryDirectory() as directory:
+            sources = [ROOT / 'layout/usr/macOS/LaunchDaemons/com.apple.WindowServer.plist']
+            sources += [ROOT / 'misc' / name for name in
+                        ('com.macwsguide.vscode.plist', 'com.macwsguide.chrome150.plist',
+                         'com.macwsguide.steam.runtime.plist')]
+            paths = []
+            for source in sources:
+                path = Path(directory) / source.name
+                path.write_bytes(source.read_bytes())
+                paths.append(path)
+            result = self.migrate_jobs(paths)
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_user_preferences_and_scoped_production_contracts_are_not_debug(self):
+        manifest = audit.load_manifest()
+        result = subprocess.run(['bash', '-c',
+            'source "$1"; macws_diagnostic_environment_pattern', 'cleanup-test',
+            str(audit.CLEANUP_HELPER)], check=True, capture_output=True, text=True)
+        forbidden = result.stdout.strip().split('|')
+        for name in ('NO_COLOR', 'MACWS_CATALOG_REGISTRATION', 'MACWS_STRAY_AGX_COMPAT'):
+            self.assertEqual(manifest['env', name][0], 'auto')
+            self.assertNotIn(name, forbidden)
+
 
 if __name__ == '__main__':
     unittest.main()

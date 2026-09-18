@@ -3080,10 +3080,97 @@ clear_diagnostic_state() {
         -exec rm -f {} \; 2>/dev/null
 }
 
+normalize_managed_production_jobs() {
+    # Optional jobs can outlive the package that originally installed them.
+    # Migrate only known formerly-shipped settings in these exact MacWS jobs;
+    # do not silently erase arbitrary diagnostics or rewrite stock iOS jobs.
+    /var/jb/usr/bin/python3 - "$CHROOTEXEC" "$ROOTFS" \
+        "$WINDOWSERVER_PLIST" "$VNC_PLIST" "$TERM_PLIST" \
+        "$VSCODE_PLIST" "$CHROME150_PLIST" "$STEAM_PLIST" <<'MACWS_JOB_MIGRATION'
+import os
+import plistlib
+import stat
+import sys
+import tempfile
+
+chrootexec, rootfs, *paths = sys.argv[1:]
+identities = {
+    'com.apple.WindowServer.plist': 'windowserver',
+    'com.macwsguide.osxvnc.plist': 'osxvnc',
+    'com.macwsguide.terminal.plist': 'terminal',
+    'com.macwsguide.vscode.plist': 'vscode',
+    'com.macwsguide.chrome150.plist': 'chrome150',
+    'com.macwsguide.steam.runtime.plist': 'steam',
+}
+retired_shipped_environment = {'MACWS_PIN_FALLBACK'}
+updates = []
+try:
+    # Validate every candidate before writing any file. A broken or unrelated
+    # optional job is a configuration error, never a reason to skip preflight.
+    for path in paths:
+        if not os.path.lexists(path):
+            continue
+        metadata = os.lstat(path)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise ValueError(f'{path}: expected a regular managed job')
+        identity = identities.get(os.path.basename(path))
+        with open(path, 'rb') as stream:
+            job = plistlib.load(stream)
+        if not identity or not isinstance(job, dict):
+            raise ValueError(f'{path}: unknown managed job')
+        labels = ('com.macwsguide.' + identity,
+                  'UIKitApplication:com.macwsguide.' + identity)
+        arguments = job.get('ProgramArguments')
+        valid_arguments = (isinstance(arguments, list) and
+                           all(isinstance(value, str) for value in arguments))
+        direct_chroot = (valid_arguments and len(arguments) >= 5 and
+                         arguments[0] == chrootexec and arguments[3] == rootfs)
+        # Steam's shipped job intentionally runs the exact iOS preflight
+        # script before that script execs launchdchrootexec as uid 501.
+        steam_preflight = (identity == 'steam' and arguments == [
+            '/var/jb/usr/bin/bash',
+            os.path.join(os.path.dirname(chrootexec), 'prepare_steam_runtime.sh')])
+        if (job.get('Label') not in labels or
+                not (direct_chroot or steam_preflight)):
+            raise ValueError(f'{path}: managed chroot launch identity mismatch')
+        environment = job.get('EnvironmentVariables', {})
+        if (not isinstance(environment, dict) or
+                not all(isinstance(key, str) and isinstance(value, str)
+                        for key, value in environment.items())):
+            raise ValueError(f'{path}: invalid EnvironmentVariables dictionary')
+        removed = sorted(retired_shipped_environment.intersection(environment))
+        if removed:
+            for key in removed:
+                del environment[key]
+            updates.append((path, job, metadata, removed))
+    for path, job, metadata, removed in updates:
+        descriptor, temporary = tempfile.mkstemp(
+            prefix='.macws-job-migration-', dir=os.path.dirname(path))
+        try:
+            with os.fdopen(descriptor, 'wb') as stream:
+                plistlib.dump(job, stream, sort_keys=False)
+                if (os.geteuid(), os.getegid()) != (metadata.st_uid, metadata.st_gid):
+                    os.fchown(stream.fileno(), metadata.st_uid, metadata.st_gid)
+                os.fchmod(stream.fileno(), stat.S_IMODE(metadata.st_mode))
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, path)
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
+        print('[macos_gui] Migrated retired production environment: ' +
+              path + ' (' + ', '.join(removed) + ')')
+except (OSError, ValueError, plistlib.InvalidFileException) as error:
+    print('[macos_gui] ERROR: managed job migration: ' + str(error), file=sys.stderr)
+    sys.exit(1)
+MACWS_JOB_MIGRATION
+}
+
 production_preflight() {
     local path plist key bad=0
     local expected_vscode_profile_dir="$ROOTFS/private/tmp/macws-vscode-profile-agx-native-production1"
     clear_diagnostic_state
+    normalize_managed_production_jobs || return 1
 
     # No production launch job may enable allocator/debug flight recorders via
     # environment.  Functional compatibility variables are documented and
