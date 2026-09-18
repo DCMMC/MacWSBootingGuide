@@ -287,6 +287,9 @@ static bool macws_runtime_diagnostics_enabled(void) {
 // directly in Stray's preserving gameplay sample on 2026-08-23.  The launch
 // environment cannot change for the lifetime of a process, so resolve each
 // switch once instead of paying that lock on every ObjC/IOSurface operation.
+// Native AGX and its driver-class registration are production defaults even
+// when the variables are absent. Only explicit zero selects a diagnostic
+// rollback; tracing remains independently disabled by default.
 bool macws_agx_native_enabled(void) {
     static _Atomic int cached = -1;
     int value = atomic_load_explicit(&cached, memory_order_acquire);
@@ -5922,12 +5925,12 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
 #endif
 
         // ──────────────────────────────────────────────────────────────────
-        // EVERYTHING BELOW (class registration via objc_readClassPair, AGX
-        // class-method swizzles, initFull subDis fix) is gated behind
-        // MACWS_AGX_REGISTER_CLASSES=1. This is the still-experimental "full
-        // strict AGX-native" path. Default off so the prior stable baseline
-        // (MACWS_AGX_NATIVE=1 only → MTLSim path with stable nil-tolerate
-        // hooks) keeps working without regressions.
+        // Register the native driver's cross-image classes and install its
+        // scoped initializer adapters as part of ordinary production startup.
+        // No opt-in variable is required; MACWS_AGX_REGISTER_CLASSES=0 is an
+        // explicit diagnostic rollback. Optional tracing and historical
+        // allocation experiments below retain their separate off-by-default
+        // diagnostic gates; native AGX does not select the MTLSim baseline.
         if (!macws_agx_register_classes_enabled()) {
             return;
         }
@@ -6962,8 +6965,8 @@ static void macws_install_assert_bypass(void) {
     // masked real composite-state-stack leaks (Unbalanced Composites at
     // MetalContext.mm:411). See AGENTS.md "Patch Discipline" + memory
     // [[feedback-no-lazy-nop-ret-bypass]]. Opt-IN by setting
-    // MACWS_KEEP_ASSERT_BYPASS=1 in WS plist to restore the old bypass
-    // while debugging upstream.
+    // MACWS_KEEP_ASSERT_BYPASS=1 only in an explicit diagnostic environment
+    // while debugging upstream. Production preflight rejects that variable.
     if (!getenv("MACWS_KEEP_ASSERT_BYPASS")) {
         fprintf(stderr,
             "#### MACWS_ASSERT_BYPASS DISABLED (set MACWS_KEEP_ASSERT_BYPASS=1 "
@@ -10578,9 +10581,8 @@ __attribute__((constructor)) void InitStuff() {
     }
     // Optional: trace which abort_with_payload site fires (opt-in via env).
     macws_install_abort_trace();
-    // Assert bypass needs no env gate — it's strictly defensive against
-    // CA::OGL::MetalContext assert() calls that fire as a downstream
-    // consequence of a failed pipeline build.
+    // The installer returns without hooking in production. Its historical
+    // assert bypass is diagnostic-only; real assertions must remain visible.
     macws_install_assert_bypass();
     // Broader bulk hook (one stub per public `IOHIDEventSystem*` symbol)
     // is opt-in and currently unstable — see the comment block in
@@ -13271,11 +13273,10 @@ DYLD_INTERPOSE(pthread_jit_write_protect_np_new,
 // returns nil — either because the slot isn't bound or because libobjc's
 // alloc dispatch fails on an under-realized class — Mempool gets nil buffers
 // and setupDeferred crashes at +0x180 dereferencing the first buffer field.
-// Interpose objc_alloc so every AGX-named class allocation gets logged AND
-// gets a class_createInstance fallback if libobjc's alloc returns nil.
-// objc_alloc trace: ONLY active when the experimental "register AGX classes"
-// flag is set. Otherwise it's a pure passthrough (same behavior as no
-// interpose) so the prior stable baseline stays unaffected.
+// Observe a bounded number of AGX allocations only when runtime diagnostics
+// are explicitly enabled and native class registration is active. Production
+// performs no allocation logging. Always preserve objc_alloc's real result,
+// including nil; this observer never substitutes a synthetic instance.
 extern id objc_alloc(Class);
 id objc_alloc_trace(Class cls) {
     id r = objc_alloc(cls);

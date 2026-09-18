@@ -13008,7 +13008,8 @@ static void macws_install_quartzcore_update_image(
 static void install_agx_init_redirect(Class agx);
 
 %hookf(Class, getMetalPluginClassForService, int service) {
-    // MACWS_AGX_NATIVE=1: both slices return the real AGX device class.
+    // Native AGX is the default with or without an environment setting:
+    // both slices return the real AGX device class unless explicitly disabled.
     // dlopen the AGXMetal13_3 bundle on demand so its ObjC classes register,
     // then look up AGXG13GFamilyDevice.
     static int agx_once = 0;
@@ -22010,9 +22011,9 @@ static void install_agx_init_redirect(Class agx) {
                 // sel=0x9 type=0x80). SkyLight's PrepareForUse already has
                 // a tolerate-nil hook in mac_hooks.m, so nil should flow
                 // through.
-                // Env-gated MACWS_AGX_SKIP_PINNED_ALLOC (default ON when
-                // MACWS_AGX_NATIVE=1) so we can A/B against the old
-                // vm_remap path.
+                // The current native redirect defaults on. Only the explicit
+                // MACWS_AGX_KEEP_PINNED_ALLOC diagnostic retains the old
+                // path for A/B comparison; no enable variable is required.
                 // 2026-06-20 — Widened gate. Previously only fired when
                 // pinnedGPUAddress != 0, but runtime traces show this init
                 // is called with pinnedGPUAddress=0 from
@@ -22184,9 +22185,10 @@ static void install_agx_init_redirect(Class agx) {
 // maximumPotentialExtendedDynamicRangeColorComponentValue is above 1.0, then
 // advertises 10-bit output and RGBA16F scanout. MacWS's visible desktop is an
 // 8-bit BGRA IOSurface, so that capability is not true at this presentation
-// boundary even when the physical iPad panel has EDR headroom. Keep the
-// adapter opt-in for clients (currently Electron/VS Code) that render through
-// the MacWS desktop; native iPadOS applications still see the real panel.
+// boundary even when the physical iPad panel has EDR headroom. Report that
+// actual transport capability by default for macOS clients; an explicit
+// MACWS_SDR_SCANOUT=0 is a diagnostic rollback. Native iPadOS applications
+// still see the real panel.
 @interface NSScreen : NSObject
 - (CGFloat)maximumPotentialExtendedDynamicRangeColorComponentValue;
 - (CGFloat)maximumExtendedDynamicRangeColorComponentValue;
@@ -22866,8 +22868,9 @@ __attribute__((constructor)) static void InitMetalHooks() {
     // unusual dyld ordering, but wrap the specialization boundary first.
     macws_install_qc_desktop_function_compatibility();
 
-    // Install plugin-class hook unconditionally — it inspects MACWS_AGX_NATIVE
-    // at first invocation and decides whether to return AGXG13GFamilyDevice or Nil.
+    // Install the plugin-class hook unconditionally. It reads the shared
+    // cached policy, which selects native AGX by default and the legacy path
+    // only for an explicit MACWS_AGX_NATIVE=0 diagnostic rollback.
     MSImageRef sys = MSGetImageByName("/System/Library/Frameworks/Metal.framework/Metal");
     %init(getMetalPluginClassForService = MSFindSymbol(sys, "_getMetalPluginClassForService"));
 

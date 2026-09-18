@@ -92,7 +92,9 @@ variables. `MallocScribble` is explicitly forbidden.
   This selection does not start a proxy, weaken TLS, or affect another app.
   See
   [`catalyst-keychain-bridge-20260812.md`](catalyst-keychain-bridge-20260812.md).
-- VS Code and Chrome set `MACWS_CHROMIUM_COMPOSITE_OVERLAYS=1`. For the exact
+- Chromium composite-overlay compatibility defaults on without an environment
+  setting; the shipped VS Code and Chrome jobs also state that policy
+  explicitly with `MACWS_CHROMIUM_COMPOSITE_OVERLAYS=1`. For the exact
   UUID-checked Chromium 148 Electron Framework, this marks the root
   `AggregatedRenderPass` with Chromium's real `video_capture_enabled` field
   before its unmodified `CALayerOverlayProcessor` runs. Chromium then rejects
@@ -113,8 +115,10 @@ variables. `MallocScribble` is explicitly forbidden.
   `vm-compressor-space-shortage`. Minidumps then establish that its native
   GPU child was being killed while Crashpad attempted to send the hard-
   immovable task port, after which CEF selected SwiftShader. The exact owner
-  of every page in the 9.16-GiB footprint remains unproven. Native AGX remains
-  a separately validated opt-in profile, not the default download UI. The iOS kernel
+  of every page in the 9.16-GiB footprint remains unproven. GPU-composited Steam
+  CEF UI remains a separately validated opt-in profile, not the default
+  download UI; that app rendering policy does not disable libmachook's
+  default native-AGX device selection for actual Metal consumers. The iOS kernel
   returns `ENOSYS` for CEF 126's `__sandbox_ms("AMFI", 0x60, ...)` query even
   though task ports are hard-immovable; the exact compatibility result makes
   Chromium use its native no-task-port path. Valve's top-level browser and its

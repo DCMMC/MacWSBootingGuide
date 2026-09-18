@@ -103,6 +103,64 @@ trust walk paused at the existing thermal admission check (`fair`, raw 1,
 38.69 C), before WindowServer started. No thermal guard was bypassed; this
 intermediate attempt is not counted as a completed GUI startup.
 
+The next real startup exposed a separate existing shell contract error: all
+three audio jobs loaded/listed successfully, but bare-label `launchctl
+kickstart` returned 64 with `Unrecognized target specifier.` The verified
+target is `user/foreground/com.apple.macosbooter.audio.AudioComponentRegistrar`;
+`launchctl print` resolved it to the actual `user/501` domain. Startup now uses
+that target and reports a failed launch visibly. Its executable shell-block
+regression tests cover both success and propagated failure.
+
+After that correction, ordinary Host startup completed without enabling any
+diagnostic flags. `WindowServer` PID 99427 produced the first frame; startup
+logged `TIMING gui-start stage=first-frame seconds=0 total=97`, and control
+status became `busy=no`, `windowserver=yes`, phase `就绪`.
+
+The exact obsolete VS Code job under `/var/jb/Library/LaunchDaemons` also
+contained an invalid XML comment and the retired PIN setting. Its recognized
+original bytes were moved, not discarded, to the content-addressed
+`/var/jb/usr/macOS/retired-launch-jobs/*.plist.disabled` quarantine. The actual
+generated VS Code job was unchanged. The quarantine is outside auto-loading
+directories and is never consumed by the production launcher.
+
+## Installed geometry and audio acceptance
+
+On 2026-09-19 the user independently confirmed both audio and window sizing
+work correctly. Automated/runtime witnesses supplement that acceptance:
+
+- The complete iPadOS composite capture (2778x1940, native capture helper)
+  shows About Finder correctly fitted, without the former oversized black
+  margins, alongside other Stage Manager windows.
+- About Finder window 62 was discovered at time 1789763558.827. Its first
+  scene geometry at 1789763559.681 was already 301x374 (301x326 AppKit content
+  plus 48 points of Host chrome). The postcondition was `landed=YES`,
+  `action=keep-initial-layout`; four window scenes remained foreground.
+- Get Info window 73 advertised width 265...400, fixed height 342. Its
+  configure acknowledgement applied the requested 265x342 logical size.
+  The sidecar is a constraints/ACK witness, not itself a screenshot.
+- The real native audio smoke ran without `MACWS_AUDIO_RENDER_BRIDGE`:
+  GenericOutput rendered one offline callback without taking ring ownership;
+  DefaultOutput returned status 0, rendered 140 callbacks and published
+  71,680 frames (probe/owner PID 99677), exit 0.
+- A fresh VS Code launch returned PID 4696. Audio helper PID 5921 had no
+  audio opt-in variable. Bounded WebAudio playback reported a running 48 kHz
+  context and advanced the ring by 115,456 frames / 451 callbacks. Native
+  output logged `output start status=0 preroll=4800`, then returned to idle.
+
+Read-only flag audit found zero present paths among 86 inventoried
+diagnostic/retired paths in each of the iOS and rootfs namespaces (172 checks),
+and zero among 19 exact old persisted/readiness paths. All six active managed
+job configurations were free of forbidden diagnostic environment settings.
+The source inventory covered 275 environment names and 77 currently consumed
+flag files (423 total ledger records). Host Python regressions passed 218
+tests with 7 tool-dependent skips; device archive-contract tests separately
+passed all 12 cases. Protocol and notifyd fault-injection tests passed.
+
+No complete iPad reboot was performed. The initial package required one
+authorized respring; later script-only fixes did not. The physical Magic
+Keyboard double-click recognizer is not claimed as a new hardware acceptance
+result; its downstream indirect-pointer transport was verified separately.
+
 ## Native test-harness admission on iPad
 
 The first broad device run (`/tmp/macws-device-regressions-20260919.log`)
