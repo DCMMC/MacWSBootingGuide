@@ -169,8 +169,7 @@ if [ -x "$KEYCHAIND" ]; then
     if [ -f "$KEYCHAIND_PLIST" ]; then
         chown root:wheel "$KEYCHAIND_PLIST" || exit 1
         chmod 0644 "$KEYCHAIND_PLIST" || exit 1
-        /var/jb/usr/bin/launchctl unload "$KEYCHAIND_PLIST" 2>/dev/null || true
-        /var/jb/usr/bin/launchctl load "$KEYCHAIND_PLIST" || exit 1
+        /var/jb/usr/bin/python3 /var/jb/usr/macOS/bin/macws_refresh_managed_job.py keychain || exit 1
     fi
 fi
 
@@ -731,36 +730,20 @@ else
     echo 'macOS rootfs is not mounted; chroot runtime sync deferred.'
 fi
 
-# Input protocol receivers keep the executable/libmachook mapping they had at
-# launch. Runtime disassembly on 2026-09-07 showed a live ABI-5 Dock still
-# rejecting ABI-6 fullscreen pointer records after package files had already
-# been replaced. Reload only jobs that are currently loaded; a package install
-# while macOS is stopped must preserve that stopped state.
-reload_loaded_input_job() {
-    label="$1"
-    plist="$2"
-    [ -f "$plist" ] || return 0
-    if ! /var/jb/usr/bin/launchctl list "$label" >/dev/null 2>&1; then
-        return 0
-    fi
-    /var/jb/usr/bin/launchctl unload "$plist" 2>/dev/null || true
-    if ! /var/jb/usr/bin/launchctl load "$plist"; then
-        echo "ERROR: failed to reload live input job $label" >&2
-        return 1
-    fi
-    echo "Reloaded live input job $label."
-}
-
-reload_loaded_input_job \
-    'UIKitApplication:com.macwsguide.input' \
-    '/var/jb/usr/macOS/LaunchDaemons/com.macwsguide.input.plist' || exit 1
-reload_loaded_input_job \
-    'com.macwsguide.dock' \
-    '/var/jb/usr/macOS/gui-launchd/com.macwsguide.dock.plist' || exit 1
+# Running input/Dock receivers retain their existing executable mappings.
+# Publish package files now, but report their deferred activation instead of
+# interrupting a live user's session. Stopped GUI jobs must stay stopped.
+for managed_gui_job in input dock; do
+    /var/jb/usr/bin/python3 /var/jb/usr/macOS/bin/macws_refresh_managed_job.py \
+        "$managed_gui_job" || exit 1
+done
 
 if [ -f "$HOSTD_PLIST" ]; then
-    /var/jb/usr/bin/launchctl unload "$HOSTD_PLIST" 2>/dev/null || true
-    /var/jb/usr/bin/launchctl load "$HOSTD_PLIST" 2>/dev/null || true
+    # Old hostd versions placed GUI children in their own launchd process
+    # group. Unloading that job can terminate unsaved Word/Terminal windows.
+    # Defer every loaded job, even if a snapshot currently shows no children:
+    # the old daemon could spawn a child between the check and an unload.
+    /var/jb/usr/bin/python3 /var/jb/usr/macOS/bin/macws_refresh_managed_job.py hostd || exit 1
 fi
 
 if [ -x /var/jb/usr/bin/uicache ]; then

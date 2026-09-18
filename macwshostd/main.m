@@ -671,9 +671,20 @@ static int SpawnMacOSApplication(pid_t *pid,
     }
     if (error == 0)
         error = posix_spawnattr_setsigdefault(&attributes, &defaultSignals);
+    // An application owns its lifetime, not the launcher's launchd process
+    // group. Runtime-confirmed on 2026-09-19: Word 8439 and Terminal 13515
+    // both inherited hostd's PGID 92633. Reloading that job can therefore
+    // include user documents and shells in launchd's group cleanup. Set the
+    // child's group atomically at spawn (0 means the new child's own PID),
+    // retaining waitpid/reaping and the existing AppKit scheduling contract.
+    // The package installer separately defers reload for old shared groups;
+    // this only establishes the invariant for newly launched applications.
+    if (error == 0)
+        error = posix_spawnattr_setpgroup(&attributes, 0);
     if (error == 0) {
         error = posix_spawnattr_setflags(
-            &attributes, POSIX_SPAWN_SETSIGMASK | POSIX_SPAWN_SETSIGDEF);
+            &attributes, POSIX_SPAWN_SETSIGMASK | POSIX_SPAWN_SETSIGDEF |
+                         POSIX_SPAWN_SETPGROUP);
     }
     if (error == 0 && applicationProcessType) {
         error = posix_spawnattr_setprocesstype_np(

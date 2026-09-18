@@ -143,6 +143,13 @@ class ArtifactContract(unittest.TestCase):
             contract.verify_package(package, staging, self.binary)
 
     @unittest.skipUnless(shutil.which('dpkg-deb'), 'dpkg-deb required')
+    def test_missing_safe_lifecycle_helper_stops_installation(self):
+        name = 'var/jb/usr/macOS/bin/macws_refresh_managed_job.py'
+        package, staging = self.package(omitted=name)
+        with self.assertRaisesRegex(ValueError, 'missing runtime payload'):
+            contract.verify_package(package, staging, self.binary)
+
+    @unittest.skipUnless(shutil.which('dpkg-deb'), 'dpkg-deb required')
     def test_old_staged_startup_script_is_rejected(self):
         package, staging = self.package()
         for name, source in contract.SOURCE_PAYLOADS.items():

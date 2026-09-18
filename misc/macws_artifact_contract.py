@@ -34,6 +34,7 @@ PACKAGE_PATHS = (
     'var/jb/usr/macOS/bin/macws_diagnostic_flags.sh',
     'var/jb/usr/macOS/bin/macws_retire_legacy_boot_jobs.py',
     'var/jb/usr/macOS/bin/macws_metal_cache_migration.py',
+    'var/jb/usr/macOS/bin/macws_refresh_managed_job.py',
     'var/jb/usr/macOS/bin/ensure_settings_extensions_runtime.sh',
     'var/jb/usr/macOS/gui-launchd/com.macwsguide.coreaudiod.plist',
     'var/jb/usr/macOS/gui-launchd/com.macwsguide.audiocomponentregistrar.plist',
@@ -54,6 +55,8 @@ SOURCE_PAYLOADS = {
         'layout/usr/macOS/bin/macws_retire_legacy_boot_jobs.py',
     'var/jb/usr/macOS/bin/macws_metal_cache_migration.py':
         'layout/usr/macOS/bin/macws_metal_cache_migration.py',
+    'var/jb/usr/macOS/bin/macws_refresh_managed_job.py':
+        'layout/usr/macOS/bin/macws_refresh_managed_job.py',
     'var/jb/usr/macOS/bin/ensure_settings_extensions_runtime.sh':
         'layout/usr/macOS/bin/ensure_settings_extensions_runtime.sh',
     'var/jb/usr/macOS/gui-launchd/com.macwsguide.coreaudiod.plist':
