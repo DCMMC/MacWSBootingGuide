@@ -27,8 +27,6 @@
         <string>1</string>
         <key>MACWS_AGX_REGISTER_CLASSES</key>
         <string>1</string>
-        <key>MACWS_PIN_FALLBACK</key>
-        <string>1</string>
         <key>XPC_SERVICE_NAME</key>
         <string>com.macwsguide.extensionkit</string>
     </dict>

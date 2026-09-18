@@ -310,7 +310,7 @@ def start_game(remote: Remote, log_path: pathlib.Path, stat_fps: bool,
         "SteamAppId=1332010", "SteamGameId=1332010",
         "SteamOverlayGameId=1332010", "SteamClientLaunch=1",
         "MACWS_AGX_NATIVE=1", "MACWS_AGX_REGISTER_CLASSES=1",
-        "MACWS_PIN_FALLBACK=1", "MACWS_STRAY_AGX_COMPAT=1",
+        "MACWS_STRAY_AGX_COMPAT=1",
     ]
     if not production_profile:
         environment.append("MACWS_APP_INPUT_DIAGNOSTICS=1")

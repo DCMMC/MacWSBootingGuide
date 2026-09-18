@@ -15,7 +15,7 @@
 # Options for start/restart:
 #   coexist | exclusive   display mode (default: coexist)
 #   --experimental        compatibility alias; native-AGX path is now the default
-#   --no-experimental     explicit control run without the native-AGX VNC adapters
+#   --no-experimental     rejected: production compatibility is built in
 #   --diagnostics         also enable high-overhead AGX flight recorders/traces
 #   --no-terminal         start WindowServer + VNC only, no Terminal
 #   --no-vnc              disable remote VNC; keep the localhost pointer proxy
@@ -43,7 +43,6 @@ set -u
 
 # ─── Paths ──────────────────────────────────────────────────────────────────
 ROOTFS=/var/mnt/rootfs
-FLAG="$ROOTFS/tmp/ws_headless"                 # coexistence flag (chroot /tmp/ws_headless)
 MACOS_DAEMONS=/var/jb/usr/macOS/LaunchDaemons  # WindowServer + required macOS services
 WINDOWSERVER_PLIST="$MACOS_DAEMONS/com.apple.WindowServer.plist"
 LAUNCHSERVICESD_PLIST="$MACOS_DAEMONS/com.apple.coreservices.launchservicesd.plist"
@@ -1453,8 +1452,7 @@ BOOT_TRUSTCACHE_INFO=""
 BASE_TRUST_BOOT_MARKER=/tmp/macws-base-trust.boot-ready
 BASE_TRUST_CLOSURE_VERSION=7
 BASE_TRUST_READY=0
-WINDOWING_READY_WITNESS=/tmp/com.macwsguide.dense-grid.loaded
-WINDOWING_REQUIRED_VERSION=29
+WINDOWING_STATUS_PROBE=/var/jb/usr/macOS/bin/macws_control_probe
 WINDOWING_TWEAK=/var/jb/Library/MobileSubstrate/DynamicLibraries/MacWSWindowing.dylib
 WINDOWING_VALIDATED_CACHE=/var/jb/var/mobile/macws-cross-build/MacWSWindowing.dylib
 WINDOWING_VALIDATED_SHA=/var/jb/var/mobile/macws-cross-build/MacWSWindowing.sha256
@@ -1504,68 +1502,26 @@ current_springboard_pid() {
 }
 
 windowing_bridge_ready() {
-    local springboard_pid="" witness_pid="" witness_version=""
-    springboard_pid=$(current_springboard_pid)
-    [ -n "$springboard_pid" ] || return 1
-    witness_pid=$(sed -n 's/.* pid=\([0-9][0-9]*\).*/\1/p' \
-        "$WINDOWING_READY_WITNESS" 2>/dev/null)
-    witness_version=$(sed -n 's/^version=\([0-9][0-9]*\).*/\1/p' \
-        "$WINDOWING_READY_WITNESS" 2>/dev/null)
-    case "$witness_version" in
-        ''|*[!0-9]*) return 1 ;;
-    esac
-    [ "$witness_version" -ge "$WINDOWING_REQUIRED_VERSION" ] || return 1
-    [ "$witness_pid" = "$springboard_pid" ] || return 1
-    # Runtime-confirmed 2026-09-12: v59 was loaded in the current SpringBoard
-    # and had installed its observers, but the old implementation-description
-    # check rejected "initial=preactivation-lower-per-item-calculator". Every
-    # cold start then needlessly resprung and failed again. The initial-size
-    # wire protocol is the compatibility boundary, not the hook's prose name.
-    grep -Fq \
-        'fullscreen=exact-scene-activate-then-maximization-toggle-action-17' \
-        "$WINDOWING_READY_WITNESS" 2>/dev/null && grep -Eq \
-        '(^|[[:space:]])initial-size-protocol=1([[:space:]]|$)' \
-        "$WINDOWING_READY_WITNESS" 2>/dev/null
+    [ -x "$WINDOWING_STATUS_PROBE" ] &&
+        "$WINDOWING_STATUS_PROBE" windowing-status >/dev/null 2>&1
 }
 
-# MacWSWindowing is a SpringBoard-resident request bridge. Package replacement
-# cannot update an already-running SpringBoard image, and a stale readiness
-# file previously made Host wait for a fullscreen transaction that no process
-# could receive. Refresh only SpringBoard (not backboardd or the whole
-# userspace) when the witness PID/version does not match, then require the new
-# observer generation before starting WindowServer. This may close the Host
-# once after an upgrade; reopening macPad needs no terminal command.
+# Read live protocol state, never infer service availability from a flag.
+# An upgrade cannot replace a running SpringBoard image. Do not turn a missing
+# file or incompatible service into a surprise respring/retry loop at launch.
+# A fresh SpringBoard automatically publishes after installing its observers.
 ensure_windowing_bridge() {
-    local old_pid="" waited=0 new_pid="" witness_pid=""
+    local waited=0
     restore_windowing_bridge_binary || return 1
-    if windowing_bridge_ready; then
-        log "iPad windowing bridge ready for the current SpringBoard generation."
-        return 0
-    fi
-    old_pid=$(current_springboard_pid)
-    log "Refreshing the stale iPad windowing bridge (SpringBoard pid=${old_pid:-none})..."
-    rm -f "$WINDOWING_READY_WITNESS"
-    if [ -n "$old_pid" ]; then
-        /var/jb/usr/bin/killall SpringBoard 2>/dev/null || return 1
-    else
-        launchctl load "$SPRINGBOARD" 2>/dev/null || true
-    fi
-    while [ "$waited" -lt 80 ]; do
+    while [ "$waited" -lt 12 ]; do
         if windowing_bridge_ready; then
-            new_pid=$(current_springboard_pid)
-            witness_pid=$(sed -n 's/.* pid=\([0-9][0-9]*\).*/\1/p' \
-                "$WINDOWING_READY_WITNESS" 2>/dev/null)
-            log "iPad windowing bridge refreshed (SpringBoard pid=$new_pid witness=$witness_pid)."
-            if [ -x /var/jb/usr/bin/uicache ]; then
-                /var/jb/usr/bin/uicache -p \
-                    /var/jb/Applications/MacWSHost.app 2>/dev/null || true
-            fi
+            log "iPad windowing bridge ready for the current SpringBoard generation."
             return 0
         fi
         sleep 0.25
         waited=$((waited + 1))
     done
-    log "ERROR: iPad windowing bridge did not publish a current observer witness within 20 seconds."
+    log "ERROR: running SpringBoard has no compatible MacWSWindowing service. Complete the package upgrade and restart SpringBoard once; no restart was performed."
     return 1
 }
 
@@ -2050,6 +2006,25 @@ write_plists() {
         vnc_listen_scope="        <string>-localhost</string>"
     fi
     mkdir -p "$GUI_LAUNCHD_DIR"
+    source "${BASH_SOURCE[0]%/*}/macws_diagnostic_flags.sh" || return 1
+
+    # VNC is an explicit session transport choice, not a feature sentinel.
+    # Rewrite the job's own environment before launchctl loads it so both
+    # cold start and launchd recovery retain the requested no-VNC policy.
+    /var/jb/usr/bin/python3 - "$WINDOWSERVER_PLIST" "$WANT_VNC" <<'PY' || return 1
+import os
+import plistlib
+import sys
+path, vnc = sys.argv[1:]
+with open(path, 'rb') as stream:
+    job = plistlib.load(stream)
+job.setdefault('EnvironmentVariables', {})['MACWS_VNC_SHARE'] = vnc
+temporary = path + '.new-' + str(os.getpid())
+with open(temporary, 'wb') as stream:
+    plistlib.dump(job, stream, sort_keys=False)
+os.chmod(temporary, os.stat(path).st_mode)
+os.replace(temporary, path)
+PY
 
     # Remove the pre-xpcproxy scaffold on upgrade.  A normal launchd Mach job
     # cannot provide an Application-type XPC service's AppKit main-thread
@@ -2627,7 +2602,6 @@ PLIST
         <key>CA_VSYNC_OFF</key><string>1</string>
         <key>MACWS_AGX_NATIVE</key><string>1</string>
         <key>MACWS_AGX_REGISTER_CLASSES</key><string>1</string>
-        <key>MACWS_PIN_FALLBACK</key><string>1</string>
     </dict>
     <key>RunAtLoad</key><true/>
     <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
@@ -3024,65 +2998,23 @@ stop_watchdogs() {
 
 # Every sentinel below changes code paths, installs tracing, records submit
 # payloads, or performs an unsafe A/B readback.  Production startup removes the
-# complete list before it creates the small set of required functional flags.
+# complete list; functional compatibility no longer needs enable files.
 # Keep this list in sync with docs/runtime-switches.tsv; the host-side
 # misc/audit_runtime_switches.py check fails when a newly-added source sentinel
 # is not recorded there.
 diagnostic_flag_paths() {
-    printf '%s\n' \
-        /private/tmp/macws_agx_dump_methods \
-        /private/tmp/macws_agx_trace_reserve \
-        /tmp/macws_app_input_diagnostics \
-        /tmp/macws_asphalt_identity_diag \
-        /tmp/macws_asphalt_random_diag \
-        /tmp/macws_file_panel_diag \
-        /private/tmp/macws_mtl_data_diag \
-        /private/tmp/macws_mtl_library_diag \
-        /private/tmp/macws_pipeline_ab_diag \
-        /private/tmp/macws_tile_descriptor_diag \
-        /private/tmp/macws_texture_stride_diag \
-        /tmp/macws_pipeline_diag \
-        /tmp/macws_allow_unsafe_pf550_capture \
-        /tmp/macws_command_error_diag \
-        /tmp/macws_cvdl_trace \
-        /tmp/macws_disp_copy \
-        /tmp/macws_disp_dump \
-        /tmp/macws_disp_fill \
-        /tmp/macws_dump_rejected_vnc \
-        /tmp/macws_inband_pf550 \
-        /tmp/macws_inspect_failed_pf550 \
-        /tmp/macws_iogpu_error_diag \
-        /tmp/macws_kcmd_field_4d0_diag \
-        /tmp/macws_kcmd_field_5e3_diag \
-        /tmp/macws_kcmd_field_6bc_diag \
-        /tmp/macws_kcmd_field_a4_diag \
-        /tmp/macws_kcmd_stray_subtype3_diag \
-        /tmp/macws_observe_pf550 \
-        /tmp/macws_owned_no_read \
-        /tmp/macws_owned_unlocked_read \
-        /tmp/macws_pf550_metadata_diag \
-        /tmp/macws_probe_small_pf550 \
-        /tmp/macws_queue_qos_diag \
-        /tmp/macws_real_swapend \
-        /tmp/macws_res_diag \
-        /tmp/macws_runtime_diagnostics \
-        /tmp/macws_stop_after_clear \
-        /tmp/macws_stray_render_trace \
-        /tmp/macws_stray_rt_capture_now \
-        /tmp/macws_submit_diag \
-        /tmp/macws_submit_fast_ring \
-        /tmp/macws_submit_ring \
-        /tmp/macws_trace_small_pf550_bind \
-        /tmp/macws_vnc_native_all \
-        /tmp/macws_video_diag \
-        /tmp/macws_vnc_test \
-        /private/tmp/macws_xpc_proxy_trace
+    # Generated from the authoritative manifest so new diagnostics cannot be
+    # silently omitted from production cleanup or the preflight check.
+    source "${BASH_SOURCE[0]%/*}/macws_diagnostic_flags.sh" || return 1
+    macws_diagnostic_flag_paths
 }
 
 clear_diagnostic_state() {
     local path
     diagnostic_flag_paths | while IFS= read -r path; do
-        rm -f "$ROOTFS$path"
+        # The same exact debug token can be consumed in iOS or in the macOS
+        # chroot. Clear both namespaces; never include IPC payloads/caches.
+        rm -f "$ROOTFS$path" "$path"
     done
     rm -f "$MTLCOMPILER_DIAGNOSTICS" "$MTLCOMPILER_HOLD" \
         "$STEAM_ANGLE_ASSET_BUILD" \
@@ -3106,6 +3038,14 @@ clear_diagnostic_state() {
         /var/mobile/iosclear_hires \
         /var/mobile/iosclear_terminal_size \
         /var/mobile/iosclear_draw_mode
+    # Exact retired preference/readiness records cannot control production.
+    # Current bridge readiness is live notifyd capability state, not a file.
+    rm -f /var/mobile/Library/Preferences/com.macwsguide.dense-grid.disabled \
+        /var/mobile/Library/Preferences/com.macwsguide.dense-grid.loaded \
+        "$LOGDIR/macws_catalyst_launch.trace" \
+        "$LOGDIR/macws-runningboard-settings-bridge.ready" \
+        /tmp/macws-runningboard-settings-bridge.ready \
+        /tmp/macws-settings-runtime.boot-ready
     # Request/reply captures are created only by the compiler diagnostic
     # sentinel.  Remove these exact project-owned directories before an
     # ordinary session so neither stale evidence nor bounded binary dumps add
@@ -3148,19 +3088,15 @@ production_preflight() {
     # No production launch job may enable allocator/debug flight recorders via
     # environment.  Functional compatibility variables are documented and
     # intentionally excluded from this deny-list.
+    source "${BASH_SOURCE[0]%/*}/macws_diagnostic_flags.sh" || return 1
+    local diagnostic_environment_pattern
+    diagnostic_environment_pattern=$(macws_diagnostic_environment_pattern)
     for plist in "$WINDOWSERVER_PLIST" "$VNC_PLIST" "$TERM_PLIST" \
                  "$VSCODE_PLIST" "$CHROME150_PLIST" "$STEAM_PLIST"; do
         [ -f "$plist" ] || continue
         if plutil "$plist" 2>/dev/null | grep -Eq \
-            '"?(MallocScribble|MallocStackLogging|MACWS_RUNTIME_DIAGNOSTICS|MACWS_APP_INPUT_DIAGNOSTICS|MACWS_FILE_PANEL_DIAG|MACWS_SUBMIT_FAST_RING|MACWS_ABORT_TRACE|MACWS_AGX_CRASH_DIAG|MACWS_IOSURF_TRACE|MACWS_JIT_MPROTECT_TRACE|MACWS_MACH_MSG_TRACE|MACWS_VNC_TRACE_CLIENT_MESSAGES|MACWS_XPC_DEBUG|MACWS_RANDOM_DIAGNOSTICS|MACWS_IDENTITY_DIAGNOSTICS|MACWS_XPC_NAME_TRACE)"?[[:space:]]*='; then
+            "\"?($diagnostic_environment_pattern)\"?[[:space:]]*="; then
             log "ERROR: production debug environment found in $plist"
-            bad=1
-        fi
-    done
-    for key in MACWS_AGX_NATIVE MACWS_AGX_REGISTER_CLASSES MACWS_PIN_FALLBACK; do
-        if ! plutil "$WINDOWSERVER_PLIST" 2>/dev/null |
-             grep -Eq "\"?$key\"?[[:space:]]*=[[:space:]]*1;"; then
-            log "ERROR: required native-AGX environment $key=1 missing from $WINDOWSERVER_PLIST"
             bad=1
         fi
     done
@@ -3174,13 +3110,7 @@ production_preflight() {
                    MACWS_JIT_FAULT_WRITE_COMPAT \
                    MACWS_AMFI_IMMOVABLE_TASK_PORT_COMPAT \
                    MACWS_MACOS_SYSTEM_POLICY_COMPAT \
-                   MACWS_APP_MOUNT_COMPAT \
-                   MACWS_AGX_NATIVE \
-                   MACWS_AGX_REGISTER_CLASSES \
-                   MACWS_PIN_FALLBACK \
-                   MACWS_AUDIO_RENDER_BRIDGE \
-                   MACWS_SDR_SCANOUT \
-                   MACWS_CHROMIUM_COMPOSITE_OVERLAYS; do
+                   MACWS_APP_MOUNT_COMPAT; do
             if ! plutil "$VSCODE_PLIST" 2>/dev/null |
                  grep -Eq "\"?$key\"?[[:space:]]*=[[:space:]]*1;"; then
                 log "ERROR: required VS Code production environment $key=1 missing from $VSCODE_PLIST"
@@ -3239,8 +3169,7 @@ production_preflight() {
                 bad=1
             fi
         done
-        for key in MACWS_AGX_NATIVE MACWS_AGX_REGISTER_CLASSES \
-                   MACWS_PIN_FALLBACK; do
+        for key in MACWS_AGX_NATIVE MACWS_AGX_REGISTER_CLASSES; do
             if plutil "$STEAM_PLIST" 2>/dev/null |
                  grep -Eq "\"?$key\"?[[:space:]]*=[[:space:]]*1;"; then
                 log "ERROR: Steam CPU-download profile unexpectedly enables $key: $STEAM_PLIST"
@@ -3260,22 +3189,13 @@ production_preflight() {
             bad=1
         fi
     fi
-    for path in /tmp/macws_kcmd_fix /tmp/macws_kcmd_wrapped_fix \
-                /tmp/macws_cancel_completion /tmp/macws_final_composite \
-                /tmp/macws_owned_scanout; do
-        if [ ! -e "$ROOTFS$path" ]; then
-            log "ERROR: required native-AGX production flag missing: $path"
-            bad=1
-        fi
-    done
-    if [ "$WANT_VNC" = 1 ]; then
-        for path in /tmp/macws_vnc_share /tmp/macws_owned_scanout; do
-            if [ ! -e "$ROOTFS$path" ]; then
-                log "ERROR: required production VNC flag missing: $path"
-                bad=1
-            fi
-        done
-    elif ! plutil "$VNC_PLIST" 2>/dev/null | grep -Fq -- '"-localhost"'; then
+    if ! plutil "$WINDOWSERVER_PLIST" 2>/dev/null |
+         grep -Eq "\"?MACWS_VNC_SHARE\"?[[:space:]]*=[[:space:]]*$WANT_VNC;"; then
+        log "ERROR: WindowServer VNC transport does not match this session."
+        bad=1
+    fi
+    if [ "$WANT_VNC" != 1 ] &&
+       ! plutil "$VNC_PLIST" 2>/dev/null | grep -Fq -- '"-localhost"'; then
         log "ERROR: local pointer-proxy VNC job is not restricted to localhost: $VNC_PLIST"
         bad=1
     fi
@@ -3288,6 +3208,7 @@ production_preflight() {
     done
     diagnostic_flag_paths | while IFS= read -r path; do
         [ ! -e "$ROOTFS$path" ] || echo "$path"
+        [ ! -e "$path" ] || echo "iOS:$path"
     done > "$ROOTFS/private/tmp/macws_production_preflight.bad"
     if [ -s "$ROOTFS/private/tmp/macws_production_preflight.bad" ]; then
         log "ERROR: diagnostic flag survived production cleanup:"
@@ -3391,7 +3312,6 @@ cleanup_macos() {
 
 mode_coexist() {
     log "Display mode: COEXISTENCE — iPad panel stays on iOS, macOS renders to VNC only."
-    touch "$FLAG"
     # Make sure the iOS UI is up (a previous 'exclusive' run may have unloaded it).
     launchctl load "$BACKBOARDD"  2>/dev/null
     launchctl load "$SPRINGBOARD" 2>/dev/null
@@ -3401,7 +3321,6 @@ mode_exclusive() {
     log "Display mode: EXCLUSIVE — macOS takes over the physical panel (and VNC)."
     log "WARNING: exclusive mode drives the panel from WindowServer; on this device"
     log "         that GPU path is the most panic-prone. coexist is the safer choice."
-    rm -f "$FLAG"
     # Hand the panel to macOS: stop iOS SpringBoard/backboardd (SpringBoard first).
     launchctl unload "$SPRINGBOARD" 2>/dev/null
     launchctl unload "$BACKBOARDD"  2>/dev/null
@@ -4908,7 +4827,6 @@ start_macos() {
 
 stop_all() {
     cleanup_macos
-    rm -f "$FLAG"
     # A watchdog stop does not pass back through macwshostd, so it must clear
     # the diagnostic sentinels itself.  Otherwise the next ordinary CLI start
     # silently inherits experimental protocol behavior.
@@ -4936,10 +4854,10 @@ status() {
         echo "thermal   : not sampled (watchdog is stopped or has not armed yet)"
     fi
     echo "memory    : guard disabled (managed by iOS/XNU memorystatus)"
-    if [ -e "$FLAG" ]; then
-        echo "mode flag : present  -> COEXISTENCE (panel = iOS, macOS = VNC)"
+    if proc_running backboardd; then
+        echo "display   : COEXISTENCE (live iPadOS backboardd owns the panel)"
     else
-        echo "mode flag : absent   -> EXCLUSIVE (macOS owns the panel) / or stopped"
+        echo "display   : no iPadOS backboardd (exclusive workspace or stopped UI)"
     fi
     echo
     echo "-- processes --"
@@ -4968,14 +4886,10 @@ switch_status() {
     echo "=== MacWS production switch audit ==="
     echo "profile defaults: AGX-native=ON compatibility=ON diagnostics=OFF mode=coexist"
     echo
-    echo "-- required functional flags --"
-    for path in /tmp/macws_kcmd_fix /tmp/macws_kcmd_wrapped_fix \
-                /tmp/macws_cancel_completion /tmp/macws_final_composite \
-                /tmp/macws_vnc_share \
-                /tmp/macws_owned_scanout /tmp/macws_coexist_pace_us; do
-        if [ -e "$ROOTFS$path" ]; then actual=ON; else actual=OFF; fi
-        printf '%-48s actual=%s\n' "$path" "$actual"
-    done
+    echo "-- built-in production compatibility --"
+    echo "native command ABI, cancelled-swap completion, owned scanout and final composite: default ON (no flag files)"
+    echo "VNC CPU publication: configured by this session's --no-vnc choice"
+    echo "idle completion pace: built-in 100000 us; diagnostic override is optional"
     echo
     echo "-- diagnostic/A-B flags (production expected OFF) --"
     diagnostic_flag_paths | while IFS= read -r path; do
@@ -5029,8 +4943,8 @@ $LOGDIR/macos_gui_watchdog.log.
 
 The production profile enables native AGX and its required command/completion
 compatibility adapters by default. High-overhead flight recorders and read-only
-method tracing remain off unless --diagnostics is explicitly present. Use
---no-experimental only for an intentional control experiment. Interactive
+method tracing remain off unless --diagnostics is explicitly present. The
+obsolete --no-experimental mode is rejected. Interactive
 sessions have no arbitrary wall-clock timeout, while
 thermal/crash-loop protection stays armed. Automated runs may add
 --runtime-cap=300 (minimum 60 seconds).
@@ -5060,7 +4974,10 @@ for a in "$@"; do
         coexist|coexistence|co)  MODE=coexist ;;
         exclusive|full|excl)     MODE=exclusive ;;
         --experimental)          WANT_EXPERIMENTAL=1 ;;
-        --no-experimental)       WANT_EXPERIMENTAL=0 ;;
+        --no-experimental)
+            echo "macos_gui.sh: production compatibility is built in and cannot be disabled by a marker-file mode" >&2
+            exit 64
+            ;;
         --diagnostics)           WANT_DIAGNOSTICS=1 ;;
         --pace-us=*)             COEXIST_PACE_US="${a#--pace-us=}" ;;
         --runtime-cap=*)         WD_MAX_RUNTIME="${a#--runtime-cap=}" ;;
@@ -5097,14 +5014,8 @@ if [ "$WD_MAX_RUNTIME" -ne 0 ] &&
     exit 1
 fi
 
-# The stable interactive A/B uses a 100 ms idle completion interval and lets
-# VNC activity temporarily select 16.667 ms for one second.  Make that tested
-# pair the experimental default so the one-click command does not silently
-# fall back to the hot, fixed 60 Hz scaffold. An explicit --pace-us still
-# selects a different idle value.
-if [ "$WANT_EXPERIMENTAL" = 1 ] && [ -z "$COEXIST_PACE_US" ]; then
-    COEXIST_PACE_US=100000
-fi
+# The tested 100-ms idle interval now lives in the renderer itself. Only an
+# explicit diagnostic --pace-us request writes a temporary override.
 
 if [ -n "$COEXIST_PACE_US" ]; then
     if [ "$WANT_EXPERIMENTAL" != 1 ]; then
@@ -5128,12 +5039,12 @@ enable_experimental_if_requested() {
     # MacWSHost consumes WindowServer's already-composited native-AGX surface
     # directly. This transport is independent of RFB and remains enabled when
     # --no-vnc is selected; the owned BGRA target is its render destination.
-    touch "$EXPERIMENTAL_KCMD" "$EXPERIMENTAL_WRAPPED_KCMD" \
+    # Remove obsolete production switches on upgrade. The implementation owns
+    # these invariants even when /tmp starts completely empty.
+    rm -f "$EXPERIMENTAL_KCMD" "$EXPERIMENTAL_WRAPPED_KCMD" \
         "$EXPERIMENTAL_COMPLETION" "$EXPERIMENTAL_FINAL_COMPOSITE" \
-        "$EXPERIMENTAL_OWNED_SCANOUT"
-    if [ "$WANT_VNC" = 1 ]; then
-        touch "$EXPERIMENTAL_VNC_SHARE" "$EXPERIMENTAL_OWNED_SCANOUT"
-    else
+        "$EXPERIMENTAL_OWNED_SCANOUT" "$EXPERIMENTAL_VNC_SHARE"
+    if [ "$WANT_VNC" != 1 ]; then
         # RFB is optional. Keep the native final-composite transport active
         # for MacWSHost, but do not allocate the separate mmap framebuffer or
         # run its CPU damage copier when there is no VNC consumer.
@@ -5162,9 +5073,9 @@ enable_experimental_if_requested() {
         echo "$COEXIST_PACE_US" > "$EXPERIMENTAL_PACE"
     fi
     if [ "$WANT_VNC" = 1 ]; then
-        log "NATIVE-AGX-SCAFFOLD: command ABI (direct + validated wrapper forms) + cancelled-swap completion + owned BGRA scanout + stable VNC mmap enabled."
+        log "NATIVE-AGX: built-in command ABI + cancelled-swap completion + owned BGRA scanout + VNC mmap enabled."
     else
-        log "NATIVE-AGX-SCAFFOLD: command ABI + cancelled-swap completion + native final-composite IOSurface enabled; RFB mmap/CPU damage bridge disabled."
+        log "NATIVE-AGX: built-in command ABI + cancelled-swap completion + final-composite IOSurface enabled; requested RFB CPU bridge disabled."
     fi
     if [ "$WANT_DIAGNOSTICS" = 1 ]; then
         log "DIAGNOSTICS: AGX fast submit recorder, lifecycle witnesses, PF550 observer, and command-error hooks enabled."
@@ -5406,8 +5317,8 @@ case "$CMD" in
         # stop/start below, so this changes latency rather than correctness.
         restart_ws=$(ws_pid)
         restart_mode_matches=0
-        if { [ "$MODE" = coexist ] && [ -f "$FLAG" ]; } ||
-           { [ "$MODE" = exclusive ] && [ ! -f "$FLAG" ]; }; then
+        if { [ "$MODE" = coexist ] && proc_running backboardd; } ||
+           { [ "$MODE" = exclusive ] && ! proc_running backboardd; }; then
             restart_mode_matches=1
         fi
         case "$restart_ws" in

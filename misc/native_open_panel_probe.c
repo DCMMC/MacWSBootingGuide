@@ -86,6 +86,22 @@ static void PrintPanelRuntimeInventory(void) {
         fprintf(stderr, "\n");
     }
     free(classes);
+    Class local = objc_getClass("NSLocalSavePanel");
+    Class remote = objc_getClass("NSSavePanel");
+    const char *selectors[] = {
+        "_setShowsFormats:", "setShowsFormats:",
+        "_setFormatFileTypes:", "setFormatFileTypes:",
+        "_setFormatTitles:", "setFormatTitles:",
+        "_showsFormats", "showsFormats",
+    };
+    for (unsigned i = 0; i < sizeof(selectors) / sizeof(selectors[0]); i++) {
+        SEL selector = sel_registerName(selectors[i]);
+        Method localMethod = local ? class_getInstanceMethod(local, selector) : NULL;
+        Method remoteMethod = remote ? class_getInstanceMethod(remote, selector) : NULL;
+        fprintf(stderr, "native-panel selector=%s local=%s remote=%s\n",
+                selectors[i], localMethod ? method_getTypeEncoding(localMethod) : "nil",
+                remoteMethod ? method_getTypeEncoding(remoteMethod) : "nil");
+    }
 }
 
 int main(void) {
@@ -108,6 +124,10 @@ int main(void) {
     }
     if (getenv("MACWS_NATIVE_PANEL_INVENTORY"))
         PrintPanelRuntimeInventory();
+    if (getenv("MACWS_NATIVE_PANEL_INVENTORY_ONLY")) {
+        objc_autoreleasePoolPop(pool);
+        return 0;
+    }
     if (getenv("MACWS_NATIVE_PANEL_HOLD")) {
         fprintf(stderr, "native-panel stage=lldb-hold pid=%d\n", getpid());
         fflush(stderr);

@@ -103,13 +103,14 @@ def preflight(remote):
     native = remote.run(
         "plutil /var/jb/usr/macOS/LaunchDaemons/com.apple.WindowServer.plist "
         "2>/dev/null | grep -E "
-        "'MACWS_AGX_NATIVE|MACWS_AGX_REGISTER_CLASSES|MACWS_PIN_FALLBACK'",
+        "'MACWS_AGX_NATIVE|MACWS_AGX_REGISTER_CLASSES'",
         check=False,
     )
     native_keys = {
-        key: bool(re.search(rf'"{key}"\s*=\s*1;', native))
-        for key in ("MACWS_AGX_NATIVE", "MACWS_AGX_REGISTER_CLASSES",
-                    "MACWS_PIN_FALLBACK")
+        # Native selection and driver registration are enabled when omitted;
+        # only the explicit diagnostic opt-out selects another path.
+        key: not bool(re.search(rf'"?{key}"?\s*=\s*"?0"?;', native))
+        for key in ("MACWS_AGX_NATIVE", "MACWS_AGX_REGISTER_CLASSES")
     }
     diagnostics_off = remote.run(
         "test ! -e /var/mnt/rootfs/private/tmp/macws_runtime_diagnostics; "

@@ -124,10 +124,50 @@ int main(void) {
         self.assertIn('result != 0', preparation)
         self.assertNotIn('ldid', preparation)
 
-    def test_runningboard_marker_requires_embedded_pane_generation(self):
-        self.assertIn(r'schema=2\npid=%d\n', SOURCE)
-        self.assertIn(r'schema=2\npid=%d\n',
-                      (ROOT / 'MacWSCatalystLaunch/Tweak.x').read_text())
+    def test_runningboard_live_capability_requires_installed_hook(self):
+        tweak = (ROOT / 'MacWSCatalystLaunch/Tweak.x').read_text()
+        constructor = tweak.split('%ctor {', 1)[1]
+        self.assertLess(constructor.index('if (!method) return;'),
+                        constructor.index('%init;'))
+        self.assertLess(constructor.index('%init;'), constructor.index(
+            'if (method_getImplementation(method) == original) return;'))
+        self.assertLess(constructor.index(
+            'if (method_getImplementation(method) == original) return;'),
+            constructor.index('MacWSPublishRunningBoardBridgeReadiness();'))
+        self.assertTrue('MACWS_SETTINGS_BRIDGE_REFRESH_NAME' in constructor,
+                        'live producer must answer a capability refresh')
+        start = SOURCE.index('static pid_t RunningBoardSettingsBridgePublisherPID(')
+        consumer = SOURCE[start:SOURCE.index('\n}', start) + 2]
+        self.assertTrue('MacWSSettingsBridgeLiveCapabilities(&state)' in consumer,
+                        'hostd must verify the live publisher')
+        self.assertFalse('macws-runningboard-settings-bridge.ready' in SOURCE + tweak,
+                         'Settings readiness must not depend on a file')
+
+    @unittest.skipUnless(shutil.which('cc'), 'C compiler required')
+    def test_runningboard_capability_protocol_rejects_other_daemon_and_old_abi(self):
+        program = r'''
+#include "macws_settings_bridge_protocol.h"
+#include "macws_windowing_protocol.h"
+#include <assert.h>
+int main(void) {
+    uint64_t state = MacWSSettingsBridgeState(500);
+    assert(MacWSSettingsBridgeStateSupports(state));
+    assert(MacWSSettingsBridgePublisher(state) == 500);
+    assert(!MacWSSettingsBridgeStateSupports(0));
+    assert(!MacWSSettingsBridgeStateSupports(MacWSSettingsBridgeState(1)));
+    assert(!MacWSSettingsBridgeStateSupports(state ^ (UINT64_C(1) << 40)));
+    assert(!MacWSSettingsBridgeStateSupports(state & ~(UINT64_C(1) << 32)));
+    assert(!MacWSSettingsBridgeStateSupports(
+        MacWSWindowingState(500, MacWSWindowingRequired)));
+    return 0;
+}
+'''
+        with tempfile.TemporaryDirectory() as directory:
+            binary = Path(directory) / 'settings-bridge-protocol'
+            subprocess.run(['cc', '-x', 'c', '-', '-I', str(ROOT / 'include'),
+                            '-O2', '-o', str(binary)], input=program, text=True,
+                           capture_output=True, check=True)
+            subprocess.run([str(binary)], capture_output=True, check=True)
 
 
 if __name__ == '__main__':

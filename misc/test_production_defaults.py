@@ -50,10 +50,8 @@ class ProductionDefaults(unittest.TestCase):
         sources = {
             'MacWSWindowing/Tweak.x': (
                 '/tmp/com.macwsguide.dense-grid.disabled',
-                '/tmp/com.macwsguide.dense-grid.loaded',
             ),
             'MacWSHost/main.m': (
-                '/tmp/com.macwsguide.dense-grid.loaded',
                 '/tmp/iosclear_run',
             ),
             'MTLCompilerBypassOSCheck/Tweak.x': (

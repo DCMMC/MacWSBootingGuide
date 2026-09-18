@@ -29,8 +29,12 @@ static const char MacWSInputSocketPath[] =
 // full-display mmap remains available only for controlled compatibility A/Bs;
 // it must never silently stand in for a native stream.
 BOOL MacWSLegacyFramebufferFallbackEnabled(void) {
-    return [NSUserDefaults.standardUserDefaults
-        boolForKey:@"MacWSLegacyFramebufferFallback"];
+    static dispatch_once_t once;
+    static BOOL enabled;
+    dispatch_once(&once, ^{
+        enabled = access("/tmp/com.macwsguide.host.legacy-framebuffer", F_OK) == 0;
+    });
+    return enabled;
 }
 
 BOOL MacWSAppInputEndpointReady(int32_t pid) {

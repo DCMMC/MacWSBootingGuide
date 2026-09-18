@@ -45,6 +45,7 @@
 #include "../include/macws_steam_mach_rendezvous_protocol.h"
 #include "../include/macws_steam_semaphore_protocol.h"
 #include "../include/macws_stream_protocol.h"
+#include "../include/macws_settings_bridge_notify.h"
 
 extern char **environ;
 
@@ -86,17 +87,12 @@ static const char *const kSettingsExtensionsRuntime =
     "/var/jb/usr/macOS/bin/ensure_settings_extensions_runtime.sh";
 static const char *const kSettingsExtensionsRuntimeLog =
     "/var/jb/var/mobile/settings-extensions-runtime.log";
-static const char *const kRunningBoardSettingsBridgeMarker =
-    "/tmp/macws-runningboard-settings-bridge.ready";
 static const char *const kFrame = "/var/mnt/rootfs/private/tmp/macws_vnc_fb";
 static const char *const kInputSocket = "/var/mnt/rootfs/private/tmp/macws_host_input.sock";
 static const char *const kVNCPointerProxySocket =
     "/var/mnt/rootfs/private/tmp/macws_vnc_pointer_proxy.sock";
-static const char *const kShareFlag = "/var/mnt/rootfs/private/tmp/macws_vnc_share";
 static const char *const kCaptureFlag = "/var/mnt/rootfs/tmp/macws_capture_final";
 static const char *const kCaptureAck = "/var/mnt/rootfs/tmp/macws_capture_done";
-static const char *const kExperimentalKCmd = "/var/mnt/rootfs/private/tmp/macws_kcmd_fix";
-static const char *const kExperimentalCompletion = "/var/mnt/rootfs/private/tmp/macws_cancel_completion";
 static const char *const kWindowServerLog = "/var/jb/var/mobile/WindowServer.err";
 static const char *const kSafetyTrip = "/tmp/macws_safety_trip";
 static const char *const kWindowServerLabel =
@@ -341,13 +337,6 @@ static void SetState(BOOL busy, NSString *phase, NSString *error) {
     os_unfair_lock_unlock(&gStateLock);
     HostLog(@"state busy=%@ phase=%@ error=%@", busy ? @"YES" : @"NO",
             phase ?: gPhase, error ?: gLastError);
-}
-
-static BOOL TouchPath(const char *path) {
-    int fd = open(path, O_WRONLY | O_CREAT | O_CLOEXEC, 0644);
-    if (fd < 0) return NO;
-    close(fd);
-    return YES;
 }
 
 static BOOL HasExecutableFileMode(const char *path) {
@@ -1107,8 +1096,9 @@ static void AddStatus(xpc_object_t reply) {
     xpc_dictionary_set_uint64(reply, "frame_width", width);
     xpc_dictionary_set_uint64(reply, "frame_height", height);
     xpc_dictionary_set_uint64(reply, "frame_generation", frameGeneration);
-    xpc_dictionary_set_bool(reply, "experimental_mode",
-        access(kExperimentalKCmd, F_OK) == 0 || access(kExperimentalCompletion, F_OK) == 0);
+    // Kept for older Host clients; production compatibility is built in and
+    // is no longer represented as an experimental marker-file mode.
+    xpc_dictionary_set_bool(reply, "experimental_mode", false);
     SetString(reply, "startup_log",
               (startupActive || startupRetryAvailable)
                   ? StartupLogText(startupBeganAt,
@@ -1284,29 +1274,15 @@ static void RotateWindowServerLog(void) {
 static BOOL StopGUI(NSString **message);
 
 static BOOL StartGUI(BOOL experimental, NSString **message) {
+    (void)experimental; // Legacy wire field; production adapters are mandatory.
     if (!RootFSReady()) {
         *message = @"macOS rootfs 或启动组件不完整";
-        return NO;
-    }
-    if (!TouchPath(kShareFlag)) {
-        *message = [NSString stringWithFormat:@"无法准备共享帧标志: %s", strerror(errno)];
         return NO;
     }
     RemovePath(kFrame);
     RemovePath(kCaptureFlag);
     RemovePath(kCaptureAck);
     RemovePath(kSafetyTrip);
-    if (experimental) {
-        // Explicitly diagnostic: these flags do not represent protocol fixes.
-        if (!TouchPath(kExperimentalKCmd) || !TouchPath(kExperimentalCompletion)) {
-            *message = @"无法启用实验兼容模式";
-            return NO;
-        }
-        HostLog(@"DIAGNOSTIC-SCAFFOLD enabled: macws_kcmd_fix + macws_cancel_completion");
-    } else {
-        RemovePath(kExperimentalKCmd);
-        RemovePath(kExperimentalCompletion);
-    }
 
     RotateWindowServerLog();
     SetState(YES, @"检查并修复启动环境…", @"");
@@ -1375,11 +1351,8 @@ static BOOL StopGUI(NSString **message) {
     gSteamOwnerWasPresent = NO;
     gNextSteamProcessDiscovery = 0;
     RemovePath(kFrame);
-    RemovePath(kShareFlag);
     RemovePath(kCaptureFlag);
     RemovePath(kCaptureAck);
-    RemovePath(kExperimentalKCmd);
-    RemovePath(kExperimentalCompletion);
     if (rc != 0) {
         *message = [NSString stringWithFormat:@"停止脚本失败（退出码 %d）", rc];
         return NO;
@@ -2477,23 +2450,10 @@ static BOOL EnsureSystemSettingsCatalog(BOOL *repairedOut,
     return YES;
 }
 
-static pid_t RunningBoardSettingsBridgeMarkerPID(void) {
-    int descriptor = open(kRunningBoardSettingsBridgeMarker,
-                          O_RDONLY | O_CLOEXEC);
-    if (descriptor < 0) return 0;
-    char payload[96] = {0};
-    ssize_t count;
-    do {
-        count = read(descriptor, payload, sizeof(payload) - 1);
-    } while (count < 0 && errno == EINTR);
-    close(descriptor);
-    if (count <= 0) return 0;
-    payload[count] = '\0';
-    int pid = 0;
-    char trailing = '\0';
-    if (sscanf(payload, "schema=2\npid=%d\n%c", &pid, &trailing) != 1 ||
-        pid <= 1) return 0;
-    return (pid_t)pid;
+static pid_t RunningBoardSettingsBridgePublisherPID(void) {
+    uint64_t state = 0;
+    return MacWSSettingsBridgeLiveCapabilities(&state)
+        ? (pid_t)MacWSSettingsBridgePublisher(state) : 0;
 }
 
 // RunningBoard is a stock iOS daemon and can predate Dopamine's injection
@@ -2501,21 +2461,30 @@ static pid_t RunningBoardSettingsBridgeMarkerPID(void) {
 // image list lacked MacWSCatalystLaunch.dylib; the next Settings request then
 // reached launchd with the real macOS Appearance path and failed with
 // OSLaunchdErrorDomain/148. Restart exactly that daemon only when the tweak's
-// constructor marker does not identify the current process generation, and
-// require the new hook-installed marker before any pane request is submitted.
+// live capability does not identify the current process generation, and
+// require the new hook-installed capability before submitting a pane request.
 static BOOL EnsureRunningBoardSettingsBridge(NSString **message) {
     NSString *runningBoardPath = @"/usr/libexec/runningboardd";
     pid_t currentPID = FindRunningRootExecutable(runningBoardPath);
-    pid_t markerPID = RunningBoardSettingsBridgeMarkerPID();
-    if (currentPID > 1 && markerPID == currentPID) {
+    pid_t publisherPID = RunningBoardSettingsBridgePublisherPID();
+    // notifyd can ask a live publisher to restore its state after a service
+    // reconnect. Give that asynchronous reply a bounded chance before the
+    // existing cold-boot recovery restarts a pre-jailbreak RunningBoard.
+    if (currentPID > 1 && publisherPID != currentPID) {
+        for (unsigned attempt = 0; attempt < 4; attempt++) {
+            usleep(25000);
+            publisherPID = RunningBoardSettingsBridgePublisherPID();
+            if (publisherPID == currentPID) break;
+        }
+    }
+    if (currentPID > 1 && publisherPID == currentPID) {
         HostLog(@"system-settings runningboard-bridge result=verified pid=%d",
                 currentPID);
         return YES;
     }
 
     HostLog(@"system-settings runningboard-bridge action=restart "
-            "current-pid=%d marker-pid=%d", currentPID, markerPID);
-    unlink(kRunningBoardSettingsBridgeMarker);
+            "current-pid=%d publisher-pid=%d", currentPID, publisherPID);
     const char *restart[] = {
         kLaunchctl, "kickstart", "-k",
         "user/foreground/com.apple.runningboardd", NULL,
@@ -2531,9 +2500,9 @@ static BOOL EnsureRunningBoardSettingsBridge(NSString **message) {
     pid_t replacementPID = 0;
     do {
         replacementPID = FindRunningRootExecutable(runningBoardPath);
-        markerPID = RunningBoardSettingsBridgeMarkerPID();
+        publisherPID = RunningBoardSettingsBridgePublisherPID();
         if (replacementPID > 1 && replacementPID != currentPID &&
-            markerPID == replacementPID) {
+            publisherPID == replacementPID) {
             HostLog(@"system-settings runningboard-bridge result=recovered "
                     "old-pid=%d new-pid=%d", currentPID, replacementPID);
             return YES;
@@ -2542,8 +2511,8 @@ static BOOL EnsureRunningBoardSettingsBridge(NSString **message) {
     } while (deadline.timeIntervalSinceNow > 0);
 
     HostLog(@"system-settings runningboard-bridge result=failed old-pid=%d "
-            "replacement-pid=%d marker-pid=%d", currentPID, replacementPID,
-            markerPID);
+            "replacement-pid=%d publisher-pid=%d", currentPID, replacementPID,
+            publisherPID);
     *message = @"系统设置启动桥接器未进入就绪状态";
     return NO;
 }
@@ -3639,7 +3608,6 @@ static BOOL LaunchRootExecutable(const char *identifier,
     if (nativeAGX) {
         additions[additionCount++] = "MACWS_AGX_NATIVE=1";
         additions[additionCount++] = "MACWS_AGX_REGISTER_CLASSES=1";
-        additions[additionCount++] = "MACWS_PIN_FALLBACK=1";
         HostLog(@"launch-metal-profile executable=%@ native=YES", rootPath);
     }
     if (strcmp(identifier, "terminal") == 0) {
@@ -6301,11 +6269,9 @@ static void ServeRequest(xpc_object_t request) {
                 // preserve, so enter the same production StartGUI transaction
                 // used by the primary button and require all of its service
                 // endpoint witnesses before reporting success.
-                BOOL experimental = access(kExperimentalKCmd, F_OK) == 0 ||
-                    access(kExperimentalCompletion, F_OK) == 0;
                 SetState(YES, @"桌面会话离线，正在完整恢复…", @"");
                 NSString *startMessage = nil;
-                ok = StartGUI(experimental, &startMessage);
+                ok = StartGUI(NO, &startMessage);
                 message = ok
                     ? @"macOS 桌面会话已重新启动；Dock、桌布、菜单服务与最终合成已恢复"
                     : [NSString stringWithFormat:
@@ -6339,14 +6305,11 @@ static void ServeRequest(xpc_object_t request) {
                         // persistent LaunchServices catalog nor trust state.
                         // Fall back to the full production transaction only
                         // when its real pixel/input postconditions fail.
-                        BOOL experimental =
-                            access(kExperimentalKCmd, F_OK) == 0 ||
-                            access(kExperimentalCompletion, F_OK) == 0;
                         SetState(YES, @"快速切换失败，正在完整恢复桌面…", @"");
                         NSString *stopMessage = nil;
                         NSString *startMessage = nil;
                         BOOL stopped = StopGUI(&stopMessage);
-                        BOOL started = stopped && StartGUI(experimental,
+                        BOOL started = stopped && StartGUI(NO,
                                                            &startMessage);
                         ok = stopped && started;
                         message = ok
@@ -6404,7 +6367,7 @@ static void ServeRequest(xpc_object_t request) {
             int wsPID = 0;
             uint64_t generation = 0;
             ok = JobHasPID(kWindowServerLabel, &wsPID) &&
-                 TouchPath(kShareFlag) && (generation = ArmCapture()) != 0 &&
+                 (generation = ArmCapture()) != 0 &&
                  WaitForCapture(wsPID, generation, 60.0, NULL);
             message = ok ? @"共享帧已刷新并由 WindowServer 确认" :
                 @"WindowServer 未在 60 秒内确认刷新帧";

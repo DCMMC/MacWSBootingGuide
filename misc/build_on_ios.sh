@@ -1,6 +1,6 @@
 #!/bin/bash
 # Build and install MacWSBootingGuide on-device (iOS shell with Theos)
-# Usage: bash misc/build_on_ios.sh [--fast|--fast-force|--resume]
+# Usage: bash misc/build_on_ios.sh [--fast|--fast-force|--resume|--package-only]
 #
 # This is the on-device equivalent of misc/build.sh (which builds from macOS).
 # All files (scripts, libmachook.dylib) are installed via the .deb package.
@@ -24,9 +24,12 @@ cd "$PROJECT_DIR"
 FAST=${FAST:-0}
 FAST_FORCE=${FAST_FORCE:-0}
 SKIP_CLEAN=${SKIP_CLEAN:-0}
+PACKAGE_ONLY=0
 for arg in "$@"; do [ "$arg" = "--fast" ] && FAST=1; done
 for arg in "$@"; do [ "$arg" = "--fast-force" ] && FAST=1 && FAST_FORCE=1; done
 for arg in "$@"; do [ "$arg" = "--resume" ] && SKIP_CLEAN=1; done
+for arg in "$@"; do [ "$arg" = "--package-only" ] && PACKAGE_ONLY=1; done
+if [ "$PACKAGE_ONLY" = 1 ]; then FAST=0; fi
 
 # MacWSWindowing is injected into arm64e SpringBoard. The iPad's lld emits
 # unauthenticated plain binds for __CFConstantStringClassReference; merely
@@ -37,6 +40,7 @@ for arg in "$@"; do [ "$arg" = "--resume" ] && SKIP_CLEAN=1; done
 WINDOWING_CROSS_DIR=/var/jb/var/mobile/macws-cross-build
 WINDOWING_CROSS_BINARY="$WINDOWING_CROSS_DIR/MacWSWindowing.dylib"
 WINDOWING_CROSS_SHA="$WINDOWING_CROSS_DIR/MacWSWindowing.sha256"
+WINDOWING_CROSS_MANIFEST="$WINDOWING_CROSS_DIR/MacWSWindowing.build.json"
 
 # Guardrail: FAST only copies libmachook.{arm64,arm64e}.dylib to the rootfs.
 # Any other build artefact (CydiaSubstrate tweak under TweakInject, iOS-side
@@ -53,7 +57,7 @@ if [ "$FAST" = "1" ] && [ "$FAST_FORCE" != "1" ]; then
                      MacWSCatalystLaunch MTLSimDriverHost \
                      launchdchrootexec autosignd macwsallocd macwshostd \
                      macwskeychaind \
-                     macwsthermal macwslocationd \
+                     macwsthermal macwslocationd macwsaudiooutd \
                      mountdevfs ViewBridgeChrootProxy \
                      HIServicesChrootProxy OpenAndSavePanelChrootProxy \
                      QuickLookUIServiceChrootProxy \
@@ -70,7 +74,7 @@ if [ "$FAST" = "1" ] && [ "$FAST_FORCE" != "1" ]; then
                      SettingsExtensionMetadata misc/PingMTLCompilerService \
                      macwsinputd macwsdisplayd macwsinteropd \
                      macwsworkspacectl macwsneofetch launchservicesd \
-                     Makefile control layout \
+                     Makefile control layout include config \
                      -type f -newer "$MARKER" 2>/dev/null \
                 | grep -v '/\._' | head -3)
         if [ -z "$STALE" ] && [ -f misc/iosclear_ref.m ] &&
@@ -108,6 +112,12 @@ if [ "$FAST" != "1" ]; then
         echo "Error: cached MacWSWindowing hash mismatch; refusing unsafe SpringBoard package." >&2
         exit 1
     fi
+    # A self-consistent old binary/SHA pair is not evidence that it implements
+    # this checkout's Host protocol. Include transitive shared headers so a
+    # source migration cannot package the Sep-15 tweak with a Sep-19 Host.
+    python3 "$SCRIPT_DIR/macws_artifact_contract.py" verify \
+        --root "$PROJECT_DIR" --binary "$WINDOWING_CROSS_BINARY" \
+        --manifest "$WINDOWING_CROSS_MANIFEST"
     echo "==> SpringBoard linker invariant: validated cached Apple-ld64 MacWSWindowing"
 fi
 
@@ -256,6 +266,19 @@ DEB=$(ls -t packages/*.deb 2>/dev/null | head -1)
 if [ -z "$DEB" ]; then
     echo "Error: No .deb package found in packages/"
     exit 1
+fi
+
+# Verify the archive dpkg will actually install, not only .theos/obj. Missing
+# audio jobs and stale staged Host/tweak files must stop the build transaction.
+python3 "$SCRIPT_DIR/macws_artifact_contract.py" verify-package \
+    --root "$PROJECT_DIR" --binary "$WINDOWING_CROSS_BINARY" \
+    --manifest "$WINDOWING_CROSS_MANIFEST" \
+    --staging "$PROJECT_DIR/.theos/_" --package "$DEB"
+
+if [ "$PACKAGE_ONLY" = 1 ]; then
+    echo "==> Verified package candidate: $DEB"
+    echo '==> Package-only build complete; nothing was installed or restarted.'
+    exit 0
 fi
 
 echo "==> Installing $DEB..."

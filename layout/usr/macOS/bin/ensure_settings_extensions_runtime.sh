@@ -20,9 +20,7 @@ UICACHE=/var/jb/usr/bin/uicache
 BASE_CARRIER_APP=/var/jb/Applications/SettingsExtensionProxy.app
 BASE_CARRIER_EXECUTABLE="$BASE_CARRIER_APP/SettingsExtensionProxy"
 CARRIER_ENTITLEMENTS="/tmp/macws-settings-carrier-entitlements.$$"
-BOOT_READY_MARKER=/tmp/macws-settings-runtime.boot-ready
 TRUST_MANIFEST=/var/jb/var/mobile/macws-settings-runtime.trust-hashes
-SYSCTL=/var/jb/usr/sbin/sysctl
 UICACHE_LIST=""
 TRUSTCACHE_INFO=""
 RUNTIME_SCHEMA="macws-settings-extension-runtime-v2"
@@ -30,7 +28,6 @@ RUNTIME_BASE_FINGERPRINT=""
 RUNTIME_HOOK_HASH=""
 RUNTIME_SUBSTRATE_HASH=""
 RUNTIME_TRAMPOLINES_HASH=""
-CURRENT_BOOT_ID=""
 
 if [ ! -d "$EXTENSIONS_ROOT" ]; then
     echo '[INFO] Settings extension runtime deferred: macOS rootfs is not mounted'
@@ -77,30 +74,9 @@ RUNTIME_TRAMPOLINES_HASH=$(selected_cdhash "$TRAMPOLINES")
     exit 1
 }
 RUNTIME_BASE_FINGERPRINT="$RUNTIME_SCHEMA|$RUNTIME_HOOK_HASH|$RUNTIME_SUBSTRATE_HASH|$RUNTIME_TRAMPOLINES_HASH"
-if [ -x "$SYSCTL" ]; then
-    CURRENT_BOOT_ID=$($SYSCTL -n kern.bootsessionuuid 2>/dev/null || true)
-fi
-
-# A full 48-pane verification reads every bundle, LaunchServices registration
-# and trustcache entry.  That is essential after a reboot or binary update,
-# but it used to run synchronously before every WindowServer launch.  The
-# bootsession UUID plus the three load-bearing dependency CDHashes make a
-# same-boot success reusable without hiding a cold-boot or package-update
-# failure.  The success marker is written only after the deep verifier passes.
-if [ "$#" -eq 1 ] && [ "$1" = "--verify" ] &&
-   [ -n "$CURRENT_BOOT_ID" ] && [ -f "$BOOT_READY_MARKER" ] &&
-   [ "$(sed -n '1p' "$BOOT_READY_MARKER" 2>/dev/null)" = \
-     "$CURRENT_BOOT_ID|$RUNTIME_BASE_FINGERPRINT" ] &&
-   [ -z "$(sed -n '2p' "$BOOT_READY_MARKER" 2>/dev/null)" ]; then
-    echo "[INFO] Settings ExtensionKit runtime verification reused for bootsession: $CURRENT_BOOT_ID"
-    exit 0
-fi
-
-# Any preparation invalidates the aggregate marker before touching a pane.
-# The following --verify must prove that the complete set is coherent again.
-if ! { [ "$#" -eq 1 ] && [ "$1" = "--verify" ]; }; then
-    rm -f "$BOOT_READY_MARKER"
-fi
+# Verification reads the real pane/runtime identities and current trustcache.
+# No boot-ready flag can substitute for those prerequisites. The production
+# Python verifier above batches the same checks into one process.
 
 $LDID -e "$BASE_CARRIER_EXECUTABLE" > "$CARRIER_ENTITLEMENTS" 2>/dev/null
 [ ! -x "$UICACHE" ] || UICACHE_LIST=$($UICACHE -l 2>/dev/null || true)
@@ -151,16 +127,6 @@ write_runtime_trust_manifest() {
     }
     chmod 0644 "$temporary" || return 1
     mv -f "$temporary" "$TRUST_MANIFEST"
-}
-
-publish_boot_ready_marker() {
-    local temporary
-    [ -n "$CURRENT_BOOT_ID" ] || return 0
-    temporary="${BOOT_READY_MARKER}.new-$$"
-    printf '%s\n' "$CURRENT_BOOT_ID|$RUNTIME_BASE_FINGERPRINT" > \
-        "$temporary" || return 1
-    chmod 0644 "$temporary" || return 1
-    mv -f "$temporary" "$BOOT_READY_MARKER"
 }
 
 # The dynamic trustcache is recreated after a device boot.  Re-add only the
@@ -560,13 +526,8 @@ repair_dependency_runtime() {
     done
     [ "$repaired_count" -gt 0 ] || return 1
     write_runtime_trust_manifest || return 1
-    # This loop has now checked the same executable/carrier/setuid/uicache,
-    # dependency-copy, marker and trustcache predicates as the complete
-    # verifier while updating each dependency transactionally. Publish the
-    # aggregate marker only after every pane converges, so macwshostd's
-    # mandatory post-repair --verify remains fail-closed but can prove this
-    # exact bootsession/fingerprint in O(1) instead of rescanning 48 panes.
-    publish_boot_ready_marker || return 1
+    # The caller's mandatory post-repair --verify checks actual signatures
+    # and live trustcache membership; do not publish a ready-file shortcut.
     echo "[INFO] Settings dependency runtimes reconciled and verified incrementally: $repaired_count"
 }
 
@@ -578,10 +539,6 @@ if [ "$#" -eq 1 ] && [ "$1" = "--verify" ]; then
     }
     write_runtime_trust_manifest || {
         echo '[ERROR] Settings runtime trust manifest update failed' >&2
-        exit 1
-    }
-    publish_boot_ready_marker || {
-        echo '[ERROR] Settings runtime boot marker update failed' >&2
         exit 1
     }
     exit 0

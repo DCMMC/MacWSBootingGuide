@@ -15,7 +15,8 @@ import sys
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 MANIFEST = ROOT / "docs" / "runtime-switches.tsv"
-SOURCE_SUFFIXES = {".c", ".m", ".mm", ".x", ".xm", ".h", ".swift"}
+SOURCE_SUFFIXES = {".c", ".m", ".mm", ".x", ".xm", ".h", ".swift", ".sh"}
+CLEANUP_HELPER = ROOT / 'layout/usr/macOS/bin/macws_diagnostic_flags.sh'
 EXCLUDED_PARTS = {
     ".git",
     ".theos",
@@ -55,15 +56,84 @@ def load_manifest() -> dict[tuple[str, str], tuple[str, str, str]]:
     return entries
 
 
-def source_texts() -> list[str]:
-    texts: list[str] = []
+def source_files() -> dict[pathlib.Path, str]:
+    texts: dict[pathlib.Path, str] = {}
     for directory, children, files in os.walk(ROOT):
         children[:] = [name for name in children if name not in EXCLUDED_PARTS]
         for name in files:
             path = pathlib.Path(directory) / name
             if path.suffix in SOURCE_SUFFIXES:
-                texts.append(path.read_text(errors="ignore"))
+                texts[path] = path.read_text(errors="ignore")
     return texts
+
+
+def source_texts() -> list[str]:
+    return list(source_files().values())
+
+
+def diagnostic_cleanup_script(manifest) -> str:
+    paths = sorted(name for (kind, name), (state, _, _) in manifest.items()
+                   if kind == 'flag' and state in {'off', 'transient'})
+    for path in paths:
+        if not re.fullmatch(r'/(?:private/)?tmp/[A-Za-z0-9_.-]+', path):
+            raise ValueError(f'flag is not an exact boot-local path: {path}')
+    quoted = ' \\\n'.join('        ' + name for name in paths)
+    environment = sorted(name for (kind, name), (state, _, _) in manifest.items()
+                         if kind == 'env' and state == 'off'
+                         and name not in EXPLICIT_DISABLED_ENVIRONMENT)
+    pattern = '|'.join(environment)
+    return ('# Generated from docs/runtime-switches.tsv; do not edit by hand.\n'
+            '# All entries are diagnostics or retired switches, never payloads.\n'
+            'macws_diagnostic_flag_paths() {\n'
+            "    printf '%s\\n' \\\n" + quoted + '\n}\n\n'
+            'macws_diagnostic_environment_pattern() {\n'
+            "    printf '%s\\n' '" + pattern + "'\n}\n")
+
+
+def normalized_c_source(text: str) -> str:
+    # Preserve string literals while dropping comments, then join C's adjacent
+    # literal spelling. This covers split getenv arguments and macro paths.
+    token = re.compile(r'"(?:\\.|[^"\\])*"|//[^\n]*|/\*[\s\S]*?\*/')
+    text = token.sub(lambda match: match[0] if match[0].startswith('"')
+                     else ' ', text)
+    return re.sub(r'"\s*"', '', text)
+
+
+def discovered_switches(files):
+    env_names, flag_names = set(), set()
+    for path, text in files.items():
+        source = normalized_c_source(text) if path.suffix != '.sh' else text
+        env_names.update(re.findall(r'getenv\s*\(\s*"([A-Z][A-Z0-9_]+)"', source))
+        # Launcher environment dictionaries and VAR=value spawn strings also
+        # carry process contracts even when no local getenv consumer exists.
+        env_names.update(re.findall(r'"(MACWS_[A-Z][A-Z0-9_]+)(?:=|"|:)', source))
+        if path.suffix == '.sh':
+            env_names.update(re.findall(r'\$\{(MACWS_[A-Z][A-Z0-9_]+):[-+?=]', source))
+        # Objective-C environment dictionary reads are equivalent opt-ins.
+        env_names.update(re.findall(r'environment\]\s*\[\s*@"([A-Z][A-Z0-9_]+)"', source))
+        # Include literal consumers, macro-generated readers and named flag
+        # constants: the previous access-only regexp missed all three classes.
+        patterns = (
+            r'access\s*\(\s*"([^"]+)"',
+            r'(?:fileExistsAtPath|isReadableFileAtPath):\s*@?"([^"]+)"',
+            r'MACWS_DEFINE_STARTUP_FLAG\s*\(\s*\w+\s*,\s*"([^"]+)"',
+        )
+        for pattern in patterns:
+            flag_names.update(value for value in re.findall(pattern, source)
+                              if re.match(r'/(?:private/)?tmp/(?:macws_|iosclear_|com\.macwsguide\.)', value))
+        constants = {}
+        for name, value in re.findall(r'\b(\w+)\s*(?:\[\])?\s*=\s*@?"([^"]+)"', source):
+            constants.setdefault(name, set()).add(value)
+        consumers = re.findall(r'access\s*\(\s*(\w+)\s*,', source)
+        consumers += re.findall(r'(?:fileExistsAtPath|isReadableFileAtPath):\s*(\w+)\b', source)
+        if path.suffix == '.sh':
+            consumers += re.findall(r'\[\s*!?\s*-(?:e|f|r)\s+"\$\{?(\w+)', source)
+        for name in consumers:
+            for value in constants.get(name, ()):
+                value = re.sub(r'^(?:\$ROOTFS|/var/mnt/rootfs|/private/var/mnt/rootfs)', '', value)
+                if re.match(r'/(?:private/)?tmp/(?:macws[_.-]|iosclear_|com\.macwsguide\.)', value):
+                    flag_names.add(value)
+    return env_names, flag_names
 
 
 def production_plists() -> list[pathlib.Path]:
@@ -117,19 +187,27 @@ def plist_environment_names() -> set[str]:
 
 def main() -> int:
     manifest = load_manifest()
-    texts = source_texts()
-    joined = "\n".join(texts)
-    env_names = set(re.findall(r'getenv\("([A-Z][A-Z0-9_]+)"\)', joined))
+    files = source_files()
+    env_names, flag_names = discovered_switches(files)
     env_names.update(plist_environment_names())
-    flag_names = set(
-        re.findall(r'access\("(/(?:private/)?tmp/macws_[^" ]+)"', joined)
-    )
 
     missing_env = sorted(name for name in env_names if ("env", name) not in manifest)
     missing_flags = sorted(
-        name for name in flag_names if ("flag", name) not in manifest
+        name for name in flag_names
+        if not any((kind, alias) in manifest
+                   for kind in ('flag', 'state', 'artifact')
+                   for alias in (name, name.replace('/private/tmp/', '/tmp/', 1)))
     )
     errors = production_environment_errors(manifest, production_plists())
+    for (kind, name), (state, _, _) in manifest.items():
+        if kind == 'flag' and state not in {'off', 'transient'}:
+            errors.append(f'production function depends on a flag: {name} ({state})')
+    expected_cleanup = diagnostic_cleanup_script(manifest)
+    if '--write-cleanup' in sys.argv:
+        CLEANUP_HELPER.write_text(expected_cleanup)
+    if not CLEANUP_HELPER.exists() or CLEANUP_HELPER.read_text() != expected_cleanup:
+        errors.append('diagnostic cleanup inventory is stale; run '
+                      'python3 misc/audit_runtime_switches.py --write-cleanup')
     if missing_env:
         errors.append("unrecorded environment switches:\n  " + "\n  ".join(missing_env))
     if missing_flags:

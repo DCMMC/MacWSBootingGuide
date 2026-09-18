@@ -10041,6 +10041,26 @@ static BOOL MacWSMenuAppendTree(id menu, uint64_t parentItemID,
             item, sel_registerName("state"));
         NSString *title = ((MacWSMsgID)objc_msgSend)(
             item, sel_registerName("title"));
+        // AppKit's placeholder first root can remain literally
+        // "Application" in NSApplication.mainMenu even though the native
+        // macOS menu bar presents the bundle's CFBundleName.  The target's
+        // Word window showed exactly that split (macPad: Application,
+        // WindowServer: Word), and Word's Info.plist declares
+        // CFBundleName=Word.  Mirror the real displayed title in the
+        // serialized menu without replacing or mutating the NSMenuItem;
+        // its identity and index path remain valid for action dispatch.
+        if (depth == 0 && index == 0 && submenu &&
+            [title isEqualToString:MacWSRuntimeString("Application")]) {
+            id bundle = ((MacWSMsgID)objc_msgSend)(
+                (id)objc_getClass("NSBundle"),
+                sel_registerName("mainBundle"));
+            id bundleName = bundle ? ((MacWSMsgIDID)objc_msgSend)(
+                bundle, sel_registerName("objectForInfoDictionaryKey:"),
+                MacWSRuntimeString("CFBundleName")) : nil;
+            if ([bundleName isKindOfClass:objc_getClass("NSString")] &&
+                [bundleName length] > 0)
+                title = bundleName;
+        }
         NSString *shortcut = MacWSMenuShortcutForItem(item);
         BOOL bridgedQuit = MacWSMenuItemIsStandardApplicationQuit(
             item, depth, title, shortcut, separator, hidden, submenu,

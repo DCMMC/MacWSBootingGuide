@@ -27,8 +27,6 @@
         <string>1</string>
         <key>MACWS_AGX_REGISTER_CLASSES</key>
         <string>1</string>
-        <key>MACWS_PIN_FALLBACK</key>
-        <string>1</string>
     </dict>
     <key>ProcessType</key>
     <string>Interactive</string>

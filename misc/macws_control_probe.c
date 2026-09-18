@@ -18,6 +18,8 @@
 
 #include "macws_control_protocol.h"
 #include "macws_steam_semaphore_protocol.h"
+#include "macws_windowing_notify.h"
+#include "macws_settings_bridge_notify.h"
 
 // Procursus/Theos' public iOS 16 XPC shim intentionally declares only a
 // small subset of libxpc.  Keep this witness buildable on-device without
@@ -282,6 +284,25 @@ static int run_steam_semaphore_timed_wait_selftest(
 // it is not a shell bridge and cannot launch arbitrary commands.
 int main(int argc, const char *argv[]) {
     const char *operation = argc > 1 ? argv[1] : MACWS_CONTROL_OP_STATUS;
+    if (strcmp(operation, "windowing-status") == 0) {
+        uint64_t state = 0;
+        bool ready = MacWSWindowingLiveCapabilities(
+            MacWSWindowingRequired, &state);
+        printf("windowing ready=%s abi=%u pid=%u capabilities=0x%02x\n",
+               ready ? "yes" : "no", (unsigned)((state >> 40) & 0xffu),
+               MacWSWindowingPublisher(state),
+               (unsigned)((state >> 32) & 0xffu));
+        return ready ? 0 : 69;
+    }
+    if (strcmp(operation, "settings-bridge-status") == 0) {
+        uint64_t state = 0;
+        bool ready = MacWSSettingsBridgeLiveCapabilities(&state);
+        printf("settings-bridge ready=%s abi=%u pid=%u capabilities=0x%02x\n",
+               ready ? "yes" : "no", (unsigned)((state >> 40) & 0xffu),
+               MacWSSettingsBridgePublisher(state),
+               (unsigned)((state >> 32) & 0xffu));
+        return ready ? 0 : 69;
+    }
     uint8_t *metalSource = NULL;
     size_t metalSourceLength = 0;
     uint64_t metalSourceHash = 0;

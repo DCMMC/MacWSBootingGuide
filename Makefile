@@ -87,6 +87,10 @@ ifneq ($(strip $(MACWS_WINDOWING_CROSS_PREBUILT)),)
 after-stage::
 	@test -s "$(MACWS_WINDOWING_CROSS_PREBUILT)" || { \
 		echo 'ERROR: validated MacWSWindowing cross-build is missing.' >&2; exit 1; }
+	@python3 "$(THEOS_PROJECT_DIR)/misc/macws_artifact_contract.py" verify \
+		--root "$(THEOS_PROJECT_DIR)" \
+		--binary "$(MACWS_WINDOWING_CROSS_PREBUILT)" \
+		--manifest "$(dir $(MACWS_WINDOWING_CROSS_PREBUILT))MacWSWindowing.build.json"
 	@mkdir -p $(THEOS_STAGING_DIR)/Library/MobileSubstrate/DynamicLibraries
 	@install -m 0755 "$(MACWS_WINDOWING_CROSS_PREBUILT)" \
 		$(THEOS_STAGING_DIR)/Library/MobileSubstrate/DynamicLibraries/MacWSWindowing.dylib

@@ -36,6 +36,8 @@
 #import "macws_control_protocol.h"
 #import "macws_steam_mach_rendezvous_protocol.h"
 #include "macws_agx_compute_abi.h"
+#include "macws_production_policy.h"
+#include "macws_diagnostics_policy.h"
 
 // These macOS code-signing entry points are present in the iPadOS shared
 // cache and used by Ventura's CoreLocationAgent, but the iPhoneOS SDK omits
@@ -285,13 +287,12 @@ static bool macws_runtime_diagnostics_enabled(void) {
 // directly in Stray's preserving gameplay sample on 2026-08-23.  The launch
 // environment cannot change for the lifetime of a process, so resolve each
 // switch once instead of paying that lock on every ObjC/IOSurface operation.
-static bool macws_agx_native_enabled(void) {
+bool macws_agx_native_enabled(void) {
     static _Atomic int cached = -1;
     int value = atomic_load_explicit(&cached, memory_order_acquire);
     if (value < 0) {
         const char *setting = getenv("MACWS_AGX_NATIVE");
-        value = setting != NULL && setting[0] != '\0' &&
-            strcmp(setting, "0") != 0;
+        value = MacWSProductionDefaultEnabled(setting);
         atomic_store_explicit(&cached, value, memory_order_release);
     }
     return value != 0;
@@ -302,8 +303,7 @@ static bool macws_agx_register_classes_enabled(void) {
     int value = atomic_load_explicit(&cached, memory_order_acquire);
     if (value < 0) {
         const char *setting = getenv("MACWS_AGX_REGISTER_CLASSES");
-        value = setting != NULL && setting[0] != '\0' &&
-            strcmp(setting, "0") != 0;
+        value = MacWSProductionDefaultEnabled(setting);
         atomic_store_explicit(&cached, value, memory_order_release);
     }
     return value != 0;
@@ -398,36 +398,6 @@ static bool macws_jit_trace_enabled(void) {
 // remain allocation- and environment-independent until our constructor has
 // started running.
 static _Atomic bool g_macws_libsystem_runtime_ready = false;
-
-static bool macws_kcmd_fix_enabled(void) {
-    static _Atomic int cached = -1;
-    int value = atomic_load_explicit(&cached, memory_order_acquire);
-    if (value < 0) {
-        value = access("/tmp/macws_kcmd_fix", F_OK) == 0;
-        atomic_store_explicit(&cached, value, memory_order_release);
-    }
-    return value != 0;
-}
-
-static bool macws_kcmd_wrapped_fix_enabled(void) {
-    static _Atomic int cached = -1;
-    int value = atomic_load_explicit(&cached, memory_order_acquire);
-    if (value < 0) {
-        value = access("/tmp/macws_kcmd_wrapped_fix", F_OK) == 0;
-        atomic_store_explicit(&cached, value, memory_order_release);
-    }
-    return value != 0;
-}
-
-static bool macws_cancel_completion_enabled(void) {
-    static _Atomic int cached = -1;
-    int value = atomic_load_explicit(&cached, memory_order_acquire);
-    if (value < 0) {
-        value = access("/tmp/macws_cancel_completion", F_OK) == 0;
-        atomic_store_explicit(&cached, value, memory_order_release);
-    }
-    return value != 0;
-}
 
 static bool macws_real_swapend_diagnostic_enabled(void) {
     static _Atomic int cached = -1;
@@ -4528,7 +4498,8 @@ static void macws_install_desktop_volume_diagnostic(
 
 static void macws_install_chromium_composite_overlays(
         const struct mach_header *untyped_header) {
-    if (!getenv("MACWS_CHROMIUM_COMPOSITE_OVERLAYS"))
+    if (!MacWSProductionDefaultEnabled(
+            getenv("MACWS_CHROMIUM_COMPOSITE_OVERLAYS")))
         return;
 
     static const uint8_t expected_uuid[16] = {
@@ -5109,7 +5080,7 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
             char exe[PATH_MAX]; uint32_t exelen = sizeof(exe);
             if(_NSGetExecutablePath(exe, &exelen) == 0 &&
                strstr(exe, "SkyLight.framework/Resources/WindowServer") != NULL &&
-               (is_process_running("backboardd") || access("/tmp/ws_headless", F_OK) == 0)) {
+               is_process_running("backboardd")) {
                 const uint32_t *swapSubmit = (const uint32_t *)(
                     OFF_IOMobileFramebuffer_kern_SwapEnd_submit + (uintptr_t)header);
                 if (*swapSubmit == 0x94001f64) {
@@ -5326,14 +5297,14 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
             }
         }
     } else if(!strncmp(info.dli_fname, QuartzCorePath, strlen(QuartzCorePath))) {
-        // The cancellation-completion experiment observes QuartzCore state
+        // The coexistence completion adapter observes QuartzCore state
         // immediately after its real FrameInfo registration without changing
         // IOMFB's function or import slot.  Install that narrow observer only
-        // when explicitly requested before this image loads; with no sentinel
-        // the baseline is byte-for-byte untouched.
+        // for the virtual-display lifecycle that actually cancels swaps.
+        // Its callback/ownership checks remain mandatory; no flag file owns
+        // this production protocol requirement.
 #ifdef FORCE_M1_DRIVER
-        if (atomic_load(&g_macws_iomfb_coexist_swap_cancel) &&
-            macws_cancel_completion_enabled()) {
+        if (atomic_load(&g_macws_iomfb_coexist_swap_cancel)) {
             macws_install_quartzcore_frame_info_hook(header);
             macws_install_quartzcore_coexist_pacing_hooks(header);
         }
@@ -6301,7 +6272,7 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
                                 }
                             }
                         }
-                        // PIN-FALLBACK (MACWS_PIN_FALLBACK=1): when the 7-arg
+                        // DIAGNOSTIC ONLY (MACWS_PIN_FALLBACK=1): when the 7-arg
                         // initFull returns nil (chroot kernel rejected the
                         // resInArgs-shaped IOConnect call), try the 6-arg
                         // `initWithDevice:length:options:isSuballocDisabled:
@@ -6313,8 +6284,11 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
                         // holding the desired GPU VA; passing 0 lets the
                         // framework pick. Logs both empirical signal (does it
                         // work in chroot at all?) and wires up a real fallback
-                        // if it does.
-                        if (!r && getenv("MACWS_PIN_FALLBACK")) {
+                        // if it does. This historical probe is not required
+                        // by the validated native allocation path and must
+                        // never be injected by a production launcher.
+                        if (!r && MacWSDiagnosticSwitchEnabled(
+                                getenv("MACWS_PIN_FALLBACK"))) {
                             static SEL pin5_sel = NULL;
                             static int pin5_known_missing = 0;
                             if (!pin5_sel) {
@@ -6377,7 +6351,8 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
                 {
                     SEL initArgs = sel_registerName("initWithDevice:options:args:argsSize:");
                     Method m_args = class_getInstanceMethod(agxbuf_after, initArgs);
-                    if (m_args && getenv("MACWS_PIN_FALLBACK") &&
+                    if (m_args && MacWSDiagnosticSwitchEnabled(
+                            getenv("MACWS_PIN_FALLBACK")) &&
                         macws_runtime_diagnostics_enabled()) {
                         IMP orig_args = method_getImplementation(m_args);
                         IMP trace_args = imp_implementationWithBlock(^id(
@@ -10292,8 +10267,10 @@ static void macws_install_osxvnc_hooks(void) {
     const char *prog = getprogname();
     if (!prog || !strstr(prog, "OSXvnc")) return;
     macws_vnc_test_on = (access("/tmp/macws_vnc_test", F_OK) == 0);
-    macws_vnc_share_on = (getenv("MACWS_VNC_SHARE") ||
-                          access("/tmp/macws_vnc_share", F_OK) == 0);
+    // A VNC process always consumes the shared-frame backend. Optional
+    // --no-vnc sessions disable only WindowServer's CPU publisher through
+    // its launch configuration; this reader never needs an enable marker.
+    macws_vnc_share_on = 1;
     const char *inputMode = getenv("MACWS_VNC_INPUT_MODE");
     macws_vnc_native_all = getenv("MACWS_VNC_NATIVE_ALL") != NULL ||
         access("/tmp/macws_vnc_native_all", F_OK) == 0;
@@ -16787,7 +16764,7 @@ static int caller_is_libmachook(void *ret) {
     return strncmp(base, "libmachook", 10) == 0;
 }
 
-// Diagnostic protocol adapter for coexistence-mode IOMFB cancellation.
+// Protocol adapter for coexistence-mode IOMFB cancellation.
 //
 // Runtime-confirmed on 2026-07-25 with the exact QuartzCore image
 // CF853BBD-01B6-3F46-ADA1-EC70FD2DC9DC:
@@ -16798,11 +16775,10 @@ static int caller_is_libmachook(void *ret) {
 //   * no frame_info_callback fired, so the vector and 15-MiB IOSurfaces grew
 //     until Jetsam (792819 x 16-KiB resident pages).
 // A cancelled swap has no physical-display completion notification.  Observe
-// Apple's enabled registration state and exact callback/context so the opt-in
-// diagnostic can synthesize the missing *cancellation completion* after the
-// successful Cancel returns.
-// This is deliberately gated by /tmp/macws_cancel_completion until runtime
-// proves callback ordering, bounded ownership, and unchanged VNC pixels.
+// Apple's enabled registration state and exact callback/context to deliver
+// the missing *cancellation completion* after successful Cancel and the real
+// submitted GPU completion. The current bounded ordering is implemented below
+// and is a production invariant, independent of diagnostic files.
 typedef void *MacwsIOMobileFramebufferRef;
 typedef void (*MacwsIOMFBFrameInfoCallback)(
     MacwsIOMobileFramebufferRef framebuffer, uint32_t swap_id,
@@ -17020,8 +16996,7 @@ static _Thread_local unsigned g_macws_iomfbserver_finish_depth;
 static uintptr_t macws_iomfbserver_begin_skylight_update(
     void *server, void *update) {
     if (atomic_load_explicit(&g_macws_iomfb_coexist_swap_cancel,
-                             memory_order_acquire) &&
-        macws_cancel_completion_enabled()) {
+                             memory_order_acquire)) {
         uint32_t pace_us = macws_coexist_activity_pace_us(
             macws_coexist_completion_pace_us());
         uint32_t slept_us =
@@ -17132,9 +17107,6 @@ static void macws_iomfb_complete_cancelled_swap(
     io_connect_t client, uint32_t swap_id,
     uint64_t requested_presentation_time,
     void *submitted_command_buffer_witness) {
-    if (!macws_cancel_completion_enabled())
-        return;
-
     struct macws_iomfb_frame_registration registration = {0};
     pthread_mutex_lock(&g_macws_iomfb_frame_lock);
     for (unsigned i = 0; i < g_macws_iomfb_frame_reg_count; i++) {
@@ -17307,8 +17279,8 @@ static void macws_iomfb_complete_cancelled_swap(
 // is intentionally opt-in: ordinary WindowServer submits are far too frequent
 // for an unconditional deep dump.
 //
-// /tmp/macws_kcmd_fix enables a SEPARATE TEMPORARY ABI-TRANSLATION
-// EXPERIMENT.  It is not a production fix.  Historical native-iOS versus
+// The production ABI translator below is independent of that recorder.
+// Historical native-iOS versus
 // macOS-chroot byte captures found a subtype-3 record whose macOS form had a
 // 16-byte zero pad before the same 12-byte terminal sentinel.  We only remove
 // that pad when every structural field and every signature byte matches.  A
@@ -18397,8 +18369,8 @@ static void macws_subtype1_semantic_field_diagnostic(
     }
 }
 
-// Validated ABI translation for the wrapped single-segment form.  It remains
-// behind the explicit /tmp/macws_kcmd_wrapped_fix experimental-mode gate.
+// Validated ABI translation for the wrapped single-segment form. It is part
+// of the native-AGX submission path; every framing check below is required.
 //
 // Project LLDB stopped at the first non-InnocentVictim IOGPU completion on
 // 2026-07-26, before IOGPUMetalCommandBuffer released its storage.  The raw
@@ -18560,8 +18532,8 @@ static unsigned macws_translate_agx_wrapped_single_subtype1(
 // is deliberately larger than the inner subtype-1 range.  Preserve the two
 // wrapper records byte-for-byte, normalize only the same two RE-confirmed
 // macOS-only subtype-1 padding windows, then shift both exact ranges.  This is
-// diagnostic scaffolding under /tmp/macws_kcmd_wrapped_fix, not a claim that
-// type-3 wrapper semantics have been fully reconstructed.
+// a deliberately bounded adapter for the captured forms, not a claim that
+// every possible type-3 wrapper has been reconstructed.
 static unsigned macws_translate_agx_trailing_wrapped_subtype1(
     unsigned sequence, unsigned char *commands, size_t *total_io,
     unsigned char *segment_list, size_t segment_length) {
@@ -18705,10 +18677,9 @@ static unsigned macws_translate_agx_trailing_wrapped_subtype1(
 // once as an 8-byte-aligned {start,end} pair in the actual segment list.
 // Use those cross-buffer invariants instead of assuming a C struct stride.
 //
-// This remains a diagnostic scaffold.  It deliberately handles only the
-// already-observed subtype-1, subtype-2 and subtype-3 macOS layouts and is
-// still gated
-// by /tmp/macws_kcmd_fix at the caller.
+// This deliberately handles only the already-observed subtype-1, subtype-2
+// and subtype-3 macOS layouts. Unknown layouts keep the original command
+// bytes; enabling the production adapter never relaxes its structural checks.
 //
 // The original minimum count of two was correct for the direct-list cases
 // that motivated this walker, but too strict for an independently framed
@@ -20452,8 +20423,7 @@ macws_inspect_agx_submit(const uint64_t *in, uint32_t inCnt,
         if (verbose) macws_submit_save_kcmd(result.sequence, descriptor_index,
                                             "pre", commands, total);
 
-        if (allow_fix && segment_length >= 0x38 &&
-            macws_kcmd_wrapped_fix_enabled()) {
+        if (allow_fix && segment_length >= 0x38) {
             unsigned wrapped_fixed =
                 macws_translate_agx_wrapped_single_subtype1(
                     result.sequence, commands, &total,
@@ -21836,8 +21806,9 @@ IOReturn IOConnectCallMethod_new(io_connect_t client, uint32_t selector, const u
         selector == 0x1a;
     int submit_diag_active = translated_agx_submit &&
         macws_submit_diag_enabled();
-    int submit_fix_active = translated_agx_submit &&
-        macws_kcmd_fix_enabled();
+    // The byte-validated native-AGX ABI translation is part of submitting
+    // this foreign producer's command buffer, independent of debug files.
+    int submit_fix_active = translated_agx_submit;
     // The ABI translator and the byte-dump diagnostic are independent gates.
     // Previously, macws_kcmd_fix was silently inert unless submit_diag also
     // existed, which made the same PF80 submit complete in exclusive tests but
@@ -22323,16 +22294,13 @@ extern IOReturn IOMobileFramebufferSwapEnd(MacwsIOMobileFramebufferRef framebuff
 extern IOReturn IOMobileFramebufferSwapCancel(
     MacwsIOMobileFramebufferRef framebuffer, uint32_t swap_id);
 
-// Diagnostic-only pacing knob for the cancelled-swap completion scaffold.
-// The production default stays at one 60-Hz interval. A bounded slower value
-// lets an A/B test distinguish a producer/backpressure problem from a command
-// ABI or resource-lifetime problem without changing either command bytes or
-// completion semantics. This is intentionally not presented as a refresh-rate
-// implementation: the synthetic completion is still not a real display/GPU
-// completion signal.
+// The production idle interval is part of the virtual-display lifecycle,
+// independent of temporary files. Real input/render activity selects the
+// separate interactive cadence below. Explicit diagnostic overrides preserve
+// the same command bytes and completion ownership for bounded A/B testing.
 static uint32_t macws_coexist_completion_pace_us(void) {
     enum {
-        kDefaultPaceUS = 16667,
+        kDefaultPaceUS = 100000,
         kMinimumPaceUS = 8333,
         // Static macOS desktops still kept the iPad AGX at 27% device
         // utilization with the previous 100-ms ceiling.  Permit a slower

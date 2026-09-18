@@ -118,7 +118,7 @@ static void macws_configure_native_agx_environment(void) {
     setenv("CA_VSYNC_OFF", "1", 1);
     setenv("MACWS_AGX_NATIVE", "1", 1);
     setenv("MACWS_AGX_REGISTER_CLASSES", "1", 1);
-    setenv("MACWS_PIN_FALLBACK", "1", 1);
+    unsetenv("MACWS_PIN_FALLBACK");
     setenv("COMMAND_MODE", "unix2003", 1);
     setenv("MACWS_CATALYST_REQUEST_INITIAL_SCENE", "1", 1);
     setenv("MACWS_CATALYST_REGISTER_APPLICATION", "1", 1);

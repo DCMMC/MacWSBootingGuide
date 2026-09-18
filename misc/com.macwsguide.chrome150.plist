@@ -40,8 +40,6 @@
         <string>1</string>
         <key>MACWS_AGX_REGISTER_CLASSES</key>
         <string>1</string>
-        <key>MACWS_PIN_FALLBACK</key>
-        <string>1</string>
         <key>MACWS_JIT_MPROTECT_COMPAT</key>
         <string>1</string>
         <key>MACWS_AMFI_IMMOVABLE_TASK_PORT_COMPAT</key>

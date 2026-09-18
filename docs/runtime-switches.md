@@ -2,9 +2,13 @@
 
 The machine-readable source of truth is
 [`runtime-switches.tsv`](runtime-switches.tsv). Run
-`python3 misc/audit_runtime_switches.py` after adding a new `getenv()` or
-`/tmp/macws_*` `access()` gate; the audit fails if the switch has no recorded
-production state.
+`python3 misc/audit_runtime_switches.py` after adding a runtime gate. It scans
+split-string environment reads, launch environment entries, literal and named
+file checks, Objective-C file checks, macro gates and shell configuration.
+Every discovered switch needs a recorded production state. The generated
+`layout/usr/macOS/bin/macws_diagnostic_flags.sh` owns the exact diagnostic
+cleanup list and forbidden launch environment names. Regenerate it with
+`python3 misc/audit_runtime_switches.py --write-cleanup` after inventory edits.
 
 ## One-click production profile
 
@@ -16,8 +20,8 @@ sudo bash /var/jb/usr/macOS/bin/macos_gui.sh production
 the required command/completion/VNC compatibility enabled, VNC and Terminal
 started, the mandatory health watchdog armed, and diagnostics disabled.
 `--experimental` remains
-an accepted compatibility alias. Only an intentional control run should use
-`--no-experimental`; only an evidence-gathering run should add
+an accepted compatibility alias. `--no-experimental` is rejected because the
+production adapters are built in. Only evidence-gathering runs add
 `--diagnostics`.
 
 Use this command to inspect the configured launch environments and the actual
@@ -34,12 +38,21 @@ variables. `MallocScribble` is explicitly forbidden.
 
 ## Production invariants
 
-- `MACWS_AGX_NATIVE=1`: rendering uses the real iOS AGX driver, never MTLSim.
-- Cross-image AGX class registration and the current allocation compatibility
-  remain enabled because they are functional prerequisites, not diagnostics.
+- Native AGX and driver class registration default on even with no environment
+  setting. Only explicit diagnostic zero values select a different path.
+- `MACWS_PIN_FALLBACK` is an old failed-initializer experiment, not a production
+  allocation requirement. Shipped jobs and GUI launchers no longer enable it;
+  the original allocator's failure remains a failure in production.
 - Direct/wrapped KCMD translation, cancelled-swap completion, owned BGRA
   scanout and the VNC mmap bridge are enabled for the current coexistence
-  implementation.
+  implementation without enable-marker files. The tested idle completion
+  interval is built in at 100000 us; explicit `--pace-us` experiments alone
+  create a temporary diagnostic override.
+- `--no-vnc` is a user transport choice. It sets `MACWS_VNC_SHARE=0` in the
+  actual WindowServer job before launch, omitting optional CPU framebuffer
+  copying while keeping the native final composite active. With no setting,
+  shared-frame capture is available by default. Panel ownership follows the
+  live iPadOS `backboardd`, not a `ws_headless` marker.
 - The same completed owned BGRA scanout is published to macwsdisplayd through
   the authenticated `com.macwsguide.display.final-composite` Mach service.
   Fullscreen Host imports that IOSurface directly and therefore preserves

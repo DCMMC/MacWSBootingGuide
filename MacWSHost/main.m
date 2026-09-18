@@ -48,6 +48,7 @@
 #include "macws_touch_policy.h"
 #include "macws_viewport_math.h"
 #include "macws_window_configuration.h"
+#include "macws_windowing_notify.h"
 
 @interface UIWindowScene (MacWSFullscreenState)
 @property(nonatomic, readonly, getter=isFullScreen) BOOL fullScreen;
@@ -101,8 +102,6 @@ static NSString *MacWSWindowIdentity(int32_t ownerPID, uint32_t windowID,
 static NSMutableDictionary<NSString *, NSNumber *> *MacWSClosingWindowIdentities;
 static NSString *const MacWSSceneBindingsDefaultsKey =
     @"MacWSPersistedSceneWindowBindings";
-static NSString *const MacWSWindowingLoadedPath =
-    @"/tmp/com.macwsguide.dense-grid.loaded";
 static CFStringRef const MacWSRequestFullscreenNotification =
     CFSTR("com.macwsguide.windowing.request-fullscreen");
 static CFStringRef const MacWSRequestResizeNotification =
@@ -110,7 +109,7 @@ static CFStringRef const MacWSRequestResizeNotification =
 static CFStringRef const MacWSRequestInitialSizeNotification =
     CFSTR("com.macwsguide.windowing.request-initial-size");
 static NSString *const MacWSResizeRequestDirectory =
-    @"/tmp";
+    @MACWS_WINDOWING_REQUEST_DIRECTORY;
 static NSString *const MacWSFullscreenRequestPrefix =
     @"com.macwsguide.windowing.fullscreen-request.";
 static NSString *const MacWSResizeRequestPrefix =
@@ -130,17 +129,8 @@ static NSString *MacWSLocalized(NSString *chinese, NSString *english) {
     return MacWSControlCenterUsesEnglish() ? english : chinese;
 }
 
-static BOOL MacWSWindowingBridgeIsLoadedWithCapability(NSString *capability);
-
 static BOOL MacWSWindowingInitialSizeBridgeIsLoaded(void) {
-    // Capability describes the wire contract, not the current hook's name.
-    // Runtime-confirmed: v47 renamed its diagnostic route and the old exact
-    // route-string check disabled all preactivation geometry publication.
-    return MacWSWindowingBridgeIsLoadedWithCapability(@"initial-size-protocol=1") ||
-        MacWSWindowingBridgeIsLoadedWithCapability(
-            @"initial=preactivation-lower-per-item-calculator") ||
-        MacWSWindowingBridgeIsLoadedWithCapability(
-            @"initial=preactivation-generic-app-layout-grid");
+    return MacWSWindowingLiveCapabilities(MacWSWindowingInitialSize, NULL);
 }
 
 static CGFloat MacWSSceneMaximumAxis(CGFloat logicalMaximum, CGFloat density,
@@ -722,39 +712,13 @@ static BOOL MacWSRequestWindowedReplacementScene(
     return YES;
 }
 
-static BOOL MacWSWindowingBridgeIsLoadedWithCapability(
-        NSString *capability) {
-    NSString *witness = [NSString stringWithContentsOfFile:
-        MacWSWindowingLoadedPath encoding:NSUTF8StringEncoding error:nil];
-    NSRange versionMarker = [witness rangeOfString:@"version="];
-    NSInteger version = versionMarker.location == NSNotFound ? 0 :
-        [[witness substringFromIndex:NSMaxRange(versionMarker)] integerValue];
-    NSRange pidMarker = [witness rangeOfString:@" pid="];
-    pid_t publisherPID = pidMarker.location == NSNotFound ? 0 :
-        (pid_t)[[witness substringFromIndex:NSMaxRange(pidMarker)] intValue];
-    // The witness is published by SpringBoard only after both Darwin request
-    // observers are installed.  A package update can leave that file behind
-    // while a later SpringBoard generation is running without the tweak.
-    // Runtime-confirmed on 2026-08-17: witness pid=342, live SpringBoard
-    // pid=10865, and two Host maximize notifications produced no SpringBoard
-    // log or geometry transaction. Treat publisher liveness as part of the
-    // readiness contract instead of accepting a stale capability string.
-    BOOL publisherAlive = publisherPID > 1 &&
-        (kill(publisherPID, 0) == 0 || errno == EPERM);
-    return version >= 29 && publisherAlive &&
-        [witness containsString:capability];
-}
-
 static BOOL MacWSWindowingFullscreenBridgeIsLoaded(void) {
-    return MacWSWindowingBridgeIsLoadedWithCapability(
-        @"fullscreen=exact-scene-activate-then-maximization-toggle-action-17");
+    return MacWSWindowingLiveCapabilities(MacWSWindowingFullscreen, NULL);
 }
 
 static BOOL MacWSWindowingResizeBridgeIsLoaded(void) {
-    return MacWSWindowingBridgeIsLoadedWithCapability(
-        @"resize=app-layout-transaction") ||
-        MacWSWindowingBridgeIsLoadedWithCapability(
-            @"resize=whole-current-stage-membership-animation-disabled");
+    return MacWSWindowingLiveCapabilities(
+        MacWSWindowingResize | MacWSWindowingSceneConstraints, NULL);
 }
 
 static BOOL MacWSRequestNativeSceneSizeWithRole(UIWindowScene *scene,
@@ -1475,8 +1439,6 @@ typedef void (^MacWSCompactMenuSelection)(MacWSMenuItem *item);
     UILabel *_zoomSectionLabel;
     UILabel *_languageSectionLabel;
     UILabel *_startupLogSectionLabel;
-    UILabel *_experimentalTitleLabel;
-    UILabel *_experimentalDetailLabel;
     UILabel *_systemHUDTitleLabel;
     UILabel *_systemHUDDetailLabel;
     UIButton *_primaryButton;
@@ -1519,7 +1481,6 @@ typedef void (^MacWSCompactMenuSelection)(MacWSMenuItem *item);
     NSArray<UIButton *> *_softModifierButtons;
     uint32_t _softModifiers;
     UITextView *_logsView;
-    UISwitch *_experimentalSwitch;
     UISegmentedControl *_inputModeControl;
     UISegmentedControl *_densityControl;
     UISegmentedControl *_presentationResolutionControl;
@@ -1535,7 +1496,6 @@ typedef void (^MacWSCompactMenuSelection)(MacWSMenuItem *item);
     MacWSMetalView *_metalView;
     NSTimer *_statusTimer;
     NSDictionary<NSString *, id> *_latestStatus;
-    BOOL _experimentalTouched;
     uint64_t _inputLogSequence;
     NSString *_lastLoggedControlSummary;
     NSString *_lastStartupLog;
@@ -1756,9 +1716,10 @@ typedef void (^MacWSCompactMenuSelection)(MacWSMenuItem *item);
         _interopClient.delegate = self;
         _menuClient = [MacWSMenuClient new];
         NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
-        if ([defaults objectForKey:@"MacWSExperimentalMode"] == nil)
-            [defaults setBool:YES forKey:@"MacWSExperimentalMode"];
-        _experimentalTouched = YES;
+        // Retired compatibility/debug preferences must not survive upgrades
+        // as invisible production feature selectors.
+        [defaults removeObjectForKey:@"MacWSExperimentalMode"];
+        [defaults removeObjectForKey:@"MacWSLegacyFramebufferFallback"];
     }
     return self;
 }
@@ -2771,28 +2732,6 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
                                     action:@selector(primaryAction) prominent:YES];
     [_primaryButton.heightAnchor constraintGreaterThanOrEqualToConstant:48].active = YES;
 
-    _experimentalTitleLabel = MacWSMakeLabel(@"实验兼容模式",
-        [UIFont preferredFontForTextStyle:UIFontTextStyleSubheadline], UIColor.labelColor);
-    _experimentalDetailLabel = MacWSMakeLabel(
-        @"启用命令 ABI / completion 诊断脚手架；受 5 分钟与高 CPU 热保护，不是根因修复。",
-        [UIFont preferredFontForTextStyle:UIFontTextStyleCaption1],
-        UIColor.systemOrangeColor);
-    UIStackView *experimentalLabels = [[UIStackView alloc]
-        initWithArrangedSubviews:@[_experimentalTitleLabel,
-                                   _experimentalDetailLabel]];
-    experimentalLabels.axis = UILayoutConstraintAxisVertical;
-    experimentalLabels.spacing = 2;
-    _experimentalSwitch = [UISwitch new];
-    _experimentalSwitch.on = [NSUserDefaults.standardUserDefaults
-        boolForKey:@"MacWSExperimentalMode"];
-    [_experimentalSwitch addTarget:self action:@selector(experimentalChanged:)
-                  forControlEvents:UIControlEventValueChanged];
-    UIStackView *experimentalRow = [[UIStackView alloc]
-        initWithArrangedSubviews:@[experimentalLabels, _experimentalSwitch]];
-    experimentalRow.axis = UILayoutConstraintAxisHorizontal;
-    experimentalRow.alignment = UIStackViewAlignmentCenter;
-    experimentalRow.spacing = 10;
-
     UIButton *glassDemo = [self buttonWithTitle:@"GlassDemo" image:@"sparkles.rectangle.stack"
                                          action:@selector(launchApplication:) prominent:NO];
     glassDemo.accessibilityIdentifier = @"glassdemo";
@@ -3206,10 +3145,6 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
     _zoomSectionLabel.text = (english ? @"ZOOM VIEW" : @"放大视角");
     _startupLogSectionLabel.text = english
         ? @"STARTUP LOG (LIVE)" : @"启动日志（实时）";
-    _experimentalTitleLabel.text = english ? @"Experimental Compatibility" : @"实验兼容模式";
-    _experimentalDetailLabel.text = english
-        ? @"Enables bounded command ABI/completion diagnostics; this is diagnostic scaffolding, not a root-cause fix."
-        : @"启用命令 ABI / completion 诊断脚手架；受 5 分钟与高 CPU 热保护，不是根因修复。";
     _systemHUDTitleLabel.text = english ? @"Apple System Rendering HUD" : @"Apple 系统渲染 HUD";
     _systemHUDDetailLabel.text = english
         ? @"QuartzCore RenderServer system FPS / GPU / hitch view"
@@ -3873,7 +3808,6 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
     _menuBarButton.enabled = enabled;
     _crossAppDragButton.enabled = enabled && _windowID != 0 &&
         !_crossAppDragTransferPending;
-    _experimentalSwitch.enabled = enabled;
     _inputModeControl.enabled = enabled;
     _performanceHUDControl.enabled = YES;
     _performanceResetButton.enabled = YES;
@@ -5555,9 +5489,6 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
                                           @"Waiting for first DisplayStream IOSurface frame");
         _frameLabel.textColor = UIColor.systemOrangeColor;
     }
-    if (!_experimentalTouched || ws) {
-        _experimentalSwitch.on = [status[@"experimental_mode"] boolValue];
-    }
     NSString *lastError = status[@"last_error"];
     if (lastError.length) [self setNotice:lastError success:NO];
 
@@ -5759,10 +5690,8 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
         _logsView.hidden = NO;
         _lastStartupLog = MacWSLocalized(@"正在请求启动…", @"Requesting startup…");
         _logsView.text = _lastStartupLog;
-        [self setNotice:_experimentalSwitch.isOn
-            ? @"正在用实验兼容模式启动；已启用 5 分钟与高 CPU 自动热保护。"
-            : @"正在检查环境；重启后丢失的信任缓存会自动恢复。" success:YES];
-        [_controlClient startWithExperimentalMode:_experimentalSwitch.isOn
+        [self setNotice:@"正在检查环境；重启后丢失的信任缓存会自动恢复。" success:YES];
+        [_controlClient startWithExperimentalMode:NO
             completion:^(NSDictionary<NSString *,id> *reply) {
                 BOOL ok = [reply[@"ok"] boolValue];
                 [self setNotice:reply[@"message"] ?: @"启动完成" success:ok];
@@ -5778,15 +5707,6 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
         @"Retrying startup checks; the live log will update below.")
              success:YES];
     [self primaryAction];
-}
-
-- (void)experimentalChanged:(UISwitch *)sender {
-    _experimentalTouched = YES;
-    [NSUserDefaults.standardUserDefaults setBool:sender.isOn
-                                          forKey:@"MacWSExperimentalMode"];
-    NSString *state = sender.isOn ? @"已选择实验兼容模式，将在下次启动时生效。" :
-        @"已选择标准模式，将在下次启动时移除诊断脚手架。";
-    [self setNotice:state success:!sender.isOn];
 }
 
 - (void)launchApplication:(UIButton *)sender {
@@ -5978,8 +5898,6 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
     } else if ([action isEqualToString:@"start"] ||
                [action isEqualToString:@"start-experimental"]) {
         if (![_latestStatus[@"windowserver_running"] boolValue]) {
-            _experimentalSwitch.on = [action isEqualToString:@"start-experimental"];
-            [self experimentalChanged:_experimentalSwitch];
             [self primaryAction];
         } else {
             [self setNotice:@"macOS 工作区已经在运行" success:YES];

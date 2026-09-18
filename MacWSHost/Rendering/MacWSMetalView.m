@@ -251,6 +251,16 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
     NSTimeInterval _pencilTouchBeganAt;
     UITouch *_directTouch;
     UITouch *_secondaryPointerTouch;
+    UITouch *_primaryPointerTouch;
+    UITouch *_pendingPointerDoubleTouch;
+    CGPoint _primaryPointerStartPoint;
+    CGFloat _primaryPointerTravel;
+    NSTimeInterval _primaryPointerStartTimestamp;
+    NSTimeInterval _lastPointerTapTimestamp;
+    CGPoint _lastPointerTapPoint;
+    int32_t _lastPointerTapPID;
+    uint32_t _lastPointerTapWindowID;
+    BOOL _primaryPointerDownEmitted;
     BOOL _directGestureBlocked;
     BOOL _crossAppDragModeEnabled;
     MacWSDirectTouchState _directTouchState;
@@ -4588,6 +4598,14 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
         [self emitKind:kind touch:touch point:[touch locationInView:self]];
 }
 
+- (void)flushPendingPointerDownForTouch:(UITouch *)touch {
+    if (!touch || touch != _pendingPointerDoubleTouch) return;
+    _pendingPointerDoubleTouch = nil;
+    [self emitKind:MacWSInputKindTouchDown touch:touch
+           point:_primaryPointerStartPoint];
+    _primaryPointerDownEmitted = YES;
+}
+
 - (void)emitPencilHoverForTouch:(UITouch *)touch point:(CGPoint)viewPoint {
     if (!touch) return;
     viewPoint = [touch preciseLocationInView:self];
@@ -4716,12 +4734,51 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
                 (event.buttonMask & UIEventButtonMaskSecondary) != 0;
             if (secondaryButton && !primaryButton) {
                 _secondaryPointerTouch = touch;
+                _lastPointerTapTimestamp = 0.0;
                 [self emitKind:MacWSInputKindSecondaryTap touch:touch
                          point:[touch locationInView:self]];
             } else {
-                [self emitTouches:touches kind:MacWSInputKindTouchDown];
+                CGPoint point = [touch locationInView:self];
+                _primaryPointerTouch = touch;
+                _primaryPointerStartPoint = point;
+                _primaryPointerStartTimestamp = touch.timestamp;
+                _primaryPointerTravel = 0.0;
+                _primaryPointerDownEmitted = NO;
+                BOOL secondClick =
+                    _lastPointerTapPID == self.targetPID &&
+                    _lastPointerTapWindowID == self.targetWindowID &&
+                    MacWSIsPointerDoubleClick(
+                        _lastPointerTapTimestamp, touch.timestamp,
+                        point.x - _lastPointerTapPoint.x,
+                        point.y - _lastPointerTapPoint.y);
+                if (MacWSHostTouchDiagnosticsEnabled())
+                    MacWSLog(@"pointer-click began pid=%d window=%u contact=%u second=%d tapCount=%lu point=(%.1f,%.1f)",
+                        self.targetPID, self.targetWindowID,
+                        (uint32_t)touch.hash, secondClick,
+                        (unsigned long)touch.tapCount, point.x, point.y);
+                _lastPointerTapTimestamp = 0.0;
+                if (secondClick) {
+                    // The first click has already reached AppKit. Hold only
+                    // this stationary second press until its release so the
+                    // proven native double-click route receives one Tap with
+                    // clickCount=2, not an extra ordinary down/up pair.
+                    // Movement flushes the original down, keeping pointer
+                    // dragging intact. Do not use a wall-clock timer here:
+                    // it can overtake an already-recorded touch-up when the
+                    // UIKit main queue is busy presenting a surface.
+                    _pendingPointerDoubleTouch = touch;
+                } else {
+                    [self emitKind:MacWSInputKindTouchDown touch:touch
+                           point:point];
+                    _primaryPointerDownEmitted = YES;
+                }
             }
         } else {
+            _primaryPointerTouch = touch;
+            _primaryPointerStartPoint = [touch locationInView:self];
+            _primaryPointerStartTimestamp = touch.timestamp;
+            _primaryPointerTravel = 0.0;
+            _primaryPointerDownEmitted = YES;
             [self emitTouches:touches kind:MacWSInputKindTouchDown];
         }
     } else if (_crossAppDragModeEnabled) {
@@ -4804,8 +4861,24 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
         _pencilCursorView.hidden = NO;
         [self bringSubviewToFront:_pencilCursorView];
     } else if (pointerTouch) {
-        if (touch != _secondaryPointerTouch)
-            [self emitTouches:touches kind:MacWSInputKindTouchMove];
+        if (touch != _secondaryPointerTouch) {
+            BOOL suppressStationarySecondClickMove = NO;
+            if (touch == _primaryPointerTouch) {
+                CGPoint point = [touch locationInView:self];
+                _primaryPointerTravel = MAX(_primaryPointerTravel,
+                    hypot(point.x - _primaryPointerStartPoint.x,
+                          point.y - _primaryPointerStartPoint.y));
+                if (_pendingPointerDoubleTouch == touch) {
+                    if (_primaryPointerTravel <
+                        MACWS_POINTER_CLICK_TRAVEL_POINTS)
+                        suppressStationarySecondClickMove = YES;
+                    else
+                        [self flushPendingPointerDownForTouch:touch];
+                }
+            }
+            if (!suppressStationarySecondClickMove)
+                [self emitTouches:touches kind:MacWSInputKindTouchMove];
+        }
     } else if (self.inputMode == MacWSHostInputModeDirect) {
         if (_directTouch && [touches containsObject:_directTouch]) {
             CGPoint point = [_directTouch locationInView:self];
@@ -4990,7 +5063,45 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
     } else if (pointerTouch) {
         if (touch == _secondaryPointerTouch)
             _secondaryPointerTouch = nil;
-        else {
+        else if (touch == _primaryPointerTouch) {
+            CGPoint point = [touch locationInView:self];
+            _primaryPointerTravel = MAX(_primaryPointerTravel,
+                hypot(point.x - _primaryPointerStartPoint.x,
+                      point.y - _primaryPointerStartPoint.y));
+            BOOL shortClick = MacWSIsPointerClick(
+                touch.timestamp - _primaryPointerStartTimestamp,
+                _primaryPointerTravel);
+            BOOL doubleClick = _pendingPointerDoubleTouch == touch &&
+                shortClick && self.targetPID == _lastPointerTapPID &&
+                self.targetWindowID == _lastPointerTapWindowID;
+            if (MacWSHostTouchDiagnosticsEnabled())
+                MacWSLog(@"pointer-click ended pid=%d window=%u contact=%u short=%d double=%d down=%d elapsed=%.3f travel=%.1f",
+                    self.targetPID, self.targetWindowID,
+                    (uint32_t)touch.hash, shortClick, doubleClick,
+                    _primaryPointerDownEmitted,
+                    touch.timestamp - _primaryPointerStartTimestamp,
+                    _primaryPointerTravel);
+            if (doubleClick) {
+                _pendingPointerDoubleTouch = nil;
+                [self emitKind:MacWSInputKindTap touch:touch point:point
+                    extraFlags:MacWSInputFlagDoubleClick];
+            } else {
+                [self flushPendingPointerDownForTouch:touch];
+                if (_primaryPointerDownEmitted)
+                    [self emitKind:MacWSInputKindTouchUp touch:touch
+                           point:point];
+                if (shortClick) {
+                    _lastPointerTapTimestamp = touch.timestamp;
+                    _lastPointerTapPoint = point;
+                    _lastPointerTapPID = self.targetPID;
+                    _lastPointerTapWindowID = self.targetWindowID;
+                } else {
+                    _lastPointerTapTimestamp = 0.0;
+                }
+            }
+            _primaryPointerTouch = nil;
+            _primaryPointerDownEmitted = NO;
+        } else {
             [self emitTouches:touches kind:MacWSInputKindTouchUp];
         }
     } else if (self.inputMode == MacWSHostInputModeDirect) {
@@ -5196,8 +5307,19 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
     } else if (pointerTouch) {
         if (touch == _secondaryPointerTouch)
             _secondaryPointerTouch = nil;
-        else
+        else if (touch == _primaryPointerTouch) {
+            if (_pendingPointerDoubleTouch == touch) {
+                _pendingPointerDoubleTouch = nil;
+            } else if (_primaryPointerDownEmitted) {
+                [self emitKind:MacWSInputKindTouchCancel touch:touch
+                       point:[touch locationInView:self]];
+            }
+            _primaryPointerTouch = nil;
+            _primaryPointerDownEmitted = NO;
+            _lastPointerTapTimestamp = 0.0;
+        } else {
             [self emitTouches:touches kind:MacWSInputKindTouchCancel];
+        }
     } else if (self.inputMode == MacWSHostInputModeDirect) {
         if (_directTouch && [touches containsObject:_directTouch]) {
             if (MacWSHostDiagnosticsEnabled() ||

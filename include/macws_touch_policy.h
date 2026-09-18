@@ -17,6 +17,12 @@
 #define MACWS_DIRECT_LONG_PRESS_SECONDS 0.45
 #define MACWS_DIRECT_DOUBLE_TAP_SECONDS 0.42
 #define MACWS_DIRECT_DOUBLE_TAP_DISTANCE_POINTS 44.0
+// A physical pointer is much more precise than a fingertip.  Restrict the
+// second-click transaction to a stationary, short press so a double-click
+// does not consume the beginning of a Finder file drag.
+#define MACWS_POINTER_CLICK_MAX_SECONDS 0.35
+#define MACWS_POINTER_CLICK_TRAVEL_POINTS 6.0
+#define MACWS_POINTER_DOUBLE_CLICK_DISTANCE_POINTS 8.0
 #define MACWS_SCROLL_MOMENTUM_MINIMUM_POINTS_PER_SECOND 80.0
 // Physical trackpads report much smaller point velocities for short scrolls
 // than direct UIKit pans.  Runtime capture on the M1 Magic Keyboard measured
@@ -71,6 +77,26 @@ static inline bool MacWSIsDirectDoubleTap(double previousTimestamp,
             MACWS_DIRECT_DOUBLE_TAP_SECONDS) return false;
     double maximum = MACWS_DIRECT_DOUBLE_TAP_DISTANCE_POINTS;
     return deltaX * deltaX + deltaY * deltaY <= maximum * maximum;
+}
+
+static inline bool MacWSIsPointerClick(double elapsedSeconds,
+                                       double travelPoints) {
+    return isfinite(elapsedSeconds) && isfinite(travelPoints) &&
+        elapsedSeconds >= 0.0 &&
+        elapsedSeconds <= MACWS_POINTER_CLICK_MAX_SECONDS &&
+        travelPoints <= MACWS_POINTER_CLICK_TRAVEL_POINTS;
+}
+
+static inline bool MacWSIsPointerDoubleClick(double previousTimestamp,
+                                             double currentTimestamp,
+                                             double deltaX,
+                                             double deltaY) {
+    if (previousTimestamp <= 0.0 || currentTimestamp <= previousTimestamp ||
+        currentTimestamp - previousTimestamp >
+            MACWS_DIRECT_DOUBLE_TAP_SECONDS) return false;
+    double maximum = MACWS_POINTER_DOUBLE_CLICK_DISTANCE_POINTS;
+    return isfinite(deltaX) && isfinite(deltaY) &&
+        deltaX * deltaX + deltaY * deltaY <= maximum * maximum;
 }
 
 static inline bool MacWSShouldStartScrollMomentum(double velocityX,

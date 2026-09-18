@@ -53,8 +53,6 @@
     </array>
     <key>EnvironmentVariables</key>
     <dict>
-        <key>MACWS_AUDIO_RENDER_BRIDGE</key>
-        <string>1</string>
         <!-- Chromium 148's ScreenMac maps EDR>1 directly to HDR10/RGBA16F,
              but MacWS publishes an 8-bit BGRA desktop IOSurface. Advertise
              the real scanout boundary so streaming sites choose an SDR track
@@ -68,8 +66,6 @@
         <key>MACWS_AGX_NATIVE</key>
         <string>1</string>
         <key>MACWS_AGX_REGISTER_CLASSES</key>
-        <string>1</string>
-        <key>MACWS_PIN_FALLBACK</key>
         <string>1</string>
         <key>MACWS_JIT_MPROTECT_COMPAT</key>
         <string>1</string>

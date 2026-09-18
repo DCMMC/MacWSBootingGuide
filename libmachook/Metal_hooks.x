@@ -34,6 +34,7 @@
 #include "macws_control_protocol.h"
 #include "macws_host_protocol.h"
 #include "macws_settings_paths.h"
+#include "macws_production_policy.h"
 #import "MacWSFinalCompositePublisher.h"
 
 static BOOL macws_macho_has_uuid(const struct mach_header *header,
@@ -5286,15 +5287,10 @@ MACWS_DEFINE_STARTUP_FLAG(macws_pipeline_diag_enabled,
 
 #undef MACWS_DEFINE_STARTUP_FLAG
 
-static BOOL macws_owned_scanout_enabled(void) {
-    static _Atomic int cached = -1;
-    int value = atomic_load_explicit(&cached, memory_order_acquire);
-    if (value < 0) {
-        value = access("/tmp/macws_owned_scanout", F_OK) == 0;
-        atomic_store_explicit(&cached, value, memory_order_release);
-    }
-    return value != 0;
-}
+// Production uses the owned display target. This is a transport choice, not
+// a resource-validation result; the original IOSurface format, geometry,
+// initializer and producer-completion checks below still decide validity.
+static BOOL macws_owned_scanout_enabled(void) { return YES; }
 
 // Production readiness must not depend on a diagnostic stderr line. Publish
 // one tiny process-owned witness after the first actually completed display
@@ -5363,8 +5359,8 @@ static int macws_disp_mode(void) {
 }
 // Cross-process VNC share: WS mirrors the composite into a GLOBAL IOSurface that
 // OSXvnc (a separate process) looks up by ID and blits into its frameBufferData
-// (see mac_hooks.m macws_install_osxvnc_hooks / macws_vnc_fill). Gated by
-// sentinel /tmp/macws_vnc_share.
+// (see mac_hooks.m macws_install_osxvnc_hooks / macws_vnc_fill). The explicit
+// --no-vnc session mode omits this optional CPU publisher in the launch job.
 extern uint32_t IOSurfaceGetID(IOSurfaceRef);
 extern uint32_t macws_IOSurfaceGetCompressionTypeOfPlane(IOSurfaceRef,
                                                           size_t);
@@ -6576,17 +6572,14 @@ static BOOL macws_is_owned_scanout_texture(id<MTLTexture> texture) {
 static IOSurfaceRef g_vncSurf = NULL;
 static int macws_vnc_share_enabled(void) {
     static int c = -1;
-    if (c < 0) c = (getenv("MACWS_VNC_SHARE") || access("/tmp/macws_vnc_share", F_OK) == 0) ? 1 : 0;
+    if (c < 0) {
+        // Shared-frame capture is available without any marker. The explicit
+        // --no-vnc user mode alone omits its per-frame CPU copy; the native
+        // final-composite transport remains active in that mode.
+        const char *mode = getenv("MACWS_VNC_SHARE");
+        c = MacWSProductionDefaultEnabled(mode);
+    }
     return c;
-}
-static int macws_final_composite_enabled(void) {
-    static int c = -1;
-    if (c < 0) c = (getenv("MACWS_FINAL_COMPOSITE") ||
-                    access("/tmp/macws_final_composite", F_OK) == 0) ? 1 : 0;
-    return c;
-}
-static int macws_composite_capture_enabled(void) {
-    return macws_vnc_share_enabled() || macws_final_composite_enabled();
 }
 static void macws_vnc_share_ensure(size_t w, size_t h) {
     if (g_vncSurf || w < 1000 || h < 600) return;
@@ -8542,7 +8535,7 @@ static _Atomic uint64_t g_vnc_poll_drop_count = 0;
 static _Atomic uint64_t g_vnc_poll_clean_count = 0;
 static _Atomic uint64_t g_vnc_poll_error_count = 0;
 void macws_vnc_stage_composite(void *context, id<MTLTexture> texture) {
-    if (!macws_composite_capture_enabled() || !context || !texture) return;
+    if (!context || !texture) return;
     static dispatch_once_t once;
     dispatch_once(&once, ^{
         g_vnc_composite_stages = [NSMutableDictionary new];
@@ -8560,7 +8553,7 @@ void macws_vnc_stage_composite(void *context, id<MTLTexture> texture) {
 }
 
 void macws_vnc_complete_composite(void *context) {
-    if (!macws_composite_capture_enabled() || !context ||
+    if (!context ||
         !g_vnc_composite_stages)
         return;
     id<MTLTexture> texture = nil;
@@ -8899,7 +8892,7 @@ static void macws_vnc_enqueue_completion_observation(
 }
 
 void macws_vnc_finish_update(void *context) {
-    if (!macws_composite_capture_enabled() || !context ||
+    if (!context ||
         !g_vnc_composite_pending)
         return;
     BOOL diagnostics = macws_runtime_diagnostics_enabled();
@@ -9122,7 +9115,7 @@ void macws_vnc_finish_update(void *context) {
     // one-deep slot before the observer ran, even though the slower VNC worker
     // eventually sampled the owned target.  Filter at the ownership boundary
     // instead of teaching the consumer to guess which PF80 was intended.
-    if (macws_final_composite_enabled() && pixelFormat == 80 &&
+    if (pixelFormat == 80 &&
         macws_is_owned_scanout_texture(texture)) {
         IOSurfaceRef finalSurface = macws_vnc_bound_surface(texture);
         if (finalSurface) {
@@ -11163,7 +11156,7 @@ static const NSUInteger kMacwsTexFmt550Fallbacks[] = {
 // Coexistence does not present the macOS frame to DCP: SwapEnd is paired with
 // SwapCancel so iPadOS keeps ownership of the panel.  Rendering the virtual
 // desktop into DCP's compressed '&b38' page anyway leaves VNC with a resource
-// that cannot be read safely after the page is recycled.  The gated owned-
+// that cannot be read safely after the page is recycled.  The owned-
 // scanout path substitutes one canonical ordinary BGRA IOSurface for every
 // IOMFB page in the current display geometry. It preserves QuartzCore's real
 // page/swap state (the original IOSurface is still returned by currentSurface
@@ -11178,14 +11171,13 @@ static const NSUInteger kMacwsTexFmt550Fallbacks[] = {
 // function returning and Metal retaining the surface, then lease the same
 // render target concurrently.
 //
-// This is diagnostic until the full render/present lifecycle and memory bound
-// are runtime-proven.  It does not bypass a validation check: Apple's native
-// AGX initializer must successfully construct the replacement texture.
+// Apple's native AGX initializer must successfully construct the replacement
+// texture. Completed producer ownership and the bounded pool, rather than a
+// marker's existence, govern whether that texture can be published.
 static IOSurfaceRef macws_owned_scanout_for_original(IOSurfaceRef original,
                                                       size_t width,
                                                       size_t height) {
-    if (!original || width < 1000 || height < 600 ||
-        !macws_owned_scanout_enabled()) {
+    if (!original || width < 1000 || height < 600) {
         return NULL;
     }
     uint32_t format = IOSurfaceGetPixelFormat(original);
@@ -11553,7 +11545,7 @@ static void macws_sigabrt_trampoline(int sig) {
 // outer MTLDebugDevice continue to observe their original Managed contract.
 static MTLTextureDescriptor *macws_native_agx_texture_descriptor(
         MTLTextureDescriptor *descriptor, const char *site) {
-    if (!descriptor || !getenv("MACWS_AGX_NATIVE") ||
+    if (!descriptor || !macws_agx_native_enabled() ||
         descriptor.storageMode != (MTLStorageMode)1 /* Managed on macOS */) {
         return descriptor;
     }
@@ -12077,7 +12069,7 @@ static void macws_log_plain_texture_surface_layout(
     // aliasing.  MACWS_AGX_NATIVE_PLAIN remains a controlled A/B escape hatch,
     // not the production policy.
     BOOL use_lease_plain_texture_pool =
-        getenv("MACWS_AGX_NATIVE") != NULL &&
+        macws_agx_native_enabled() &&
         getenv("MACWS_AGX_NATIVE_PLAIN") == NULL;
     if (use_lease_plain_texture_pool) {
         // 2026-06-20 — Route plain newTextureWithDescriptor through the
@@ -12926,7 +12918,7 @@ static void macws_quartzcore_update_image(
         context, metalImage, image, flags, label);
 
     if (!textureBefore || !metalImage || !image ||
-        !getenv("MACWS_AGX_NATIVE")) return;
+        !macws_agx_native_enabled()) return;
     id<MTLTexture> texture =
         *(id const volatile *)((const char *)metalImage + 0x40);
     uint16_t metalFlags =
@@ -12980,7 +12972,7 @@ static void macws_quartzcore_update_image(
 static void macws_install_quartzcore_update_image(
         const struct mach_header *header, intptr_t slide) {
     (void)slide;
-    if (!getenv("MACWS_AGX_NATIVE") ||
+    if (!macws_agx_native_enabled() ||
         g_macws_quartzcore_update_image_original) return;
     const char *program = getprogname();
     if (!program || strcmp(program, "WindowServer") != 0) return;
@@ -13021,7 +13013,7 @@ static void install_agx_init_redirect(Class agx);
     // then look up AGXG13GFamilyDevice.
     static int agx_once = 0;
     static Class agx_cls = Nil;
-    if (getenv("MACWS_AGX_NATIVE")) {
+    if (macws_agx_native_enabled()) {
         if (!agx_once) {
             agx_once = 1;
             // Pre-load IOGPU so its symbols are in the address space when
@@ -13250,7 +13242,7 @@ static id macws_hook_cbri(id self, SEL _cmd) {
 }
 
 static void install_cbri_probe(void) {
-    if (!getenv("MACWS_AGX_NATIVE") ||
+    if (!macws_agx_native_enabled() ||
         !macws_runtime_diagnostics_enabled()) return;
     // The method lives on IOGPUMetalCommandBuffer (super class). Hook there
     // — AGXG13GFamilyCommandBuffer doesn't override.
@@ -15295,7 +15287,7 @@ static BOOL macws_half_float_function_name_valid(const char *name) {
 }
 
 static void macws_load_half_float_variant_index(void) {
-    if (!macws_is_stray_process() || !getenv("MACWS_AGX_NATIVE")) return;
+    if (!macws_is_stray_process() || !macws_agx_native_enabled()) return;
     struct stat status = {0};
     if (stat(kMacWSHalfFloatVariantIndex, &status) != 0 ||
         status.st_uid != 0 || !S_ISREG(status.st_mode) ||
@@ -15668,7 +15660,7 @@ static id macws_new_library_data_compat(id self, SEL selector,
     size_t length = data ? dispatch_data_get_size(data) : 0;
     dispatch_data_t mapped = NULL;
     if (data && (diagnostic ||
-                 (getenv("MACWS_AGX_NATIVE") &&
+                 (macws_agx_native_enabled() &&
                   (length == kMacWSANGLEDefaultMacOSBytes ||
                    length == kMacWSSteamANGLEDefaultMacOSBytes ||
                    macws_is_stray_metal_library_length(length) ||
@@ -15683,7 +15675,7 @@ static id macws_new_library_data_compat(id self, SEL selector,
     dispatch_data_t selected_data = data;
     dispatch_data_t transient_replacement = NULL;
     BOOL substituted = NO;
-    if (getenv("MACWS_AGX_NATIVE") &&
+    if (macws_agx_native_enabled() &&
         length == kMacWSANGLEDefaultMacOSBytes &&
         hash == kMacWSANGLEDefaultMacOSHash) {
         dispatch_data_t replacement = macws_angle_default_macabi_library();
@@ -15691,7 +15683,7 @@ static id macws_new_library_data_compat(id self, SEL selector,
             selected_data = replacement;
             substituted = YES;
         }
-    } else if (getenv("MACWS_AGX_NATIVE") &&
+    } else if (macws_agx_native_enabled() &&
                length == kMacWSSteamANGLEDefaultMacOSBytes &&
                hash == kMacWSSteamANGLEDefaultMacOSHash) {
         dispatch_data_t replacement =
@@ -15700,7 +15692,7 @@ static id macws_new_library_data_compat(id self, SEL selector,
             selected_data = replacement;
             substituted = YES;
         }
-    } else if (getenv("MACWS_AGX_NATIVE")) {
+    } else if (macws_agx_native_enabled()) {
         const size_t count = sizeof(kMacWSStrayMetalLibraries) /
                              sizeof(kMacWSStrayMetalLibraries[0]);
         for (size_t index = 0; index < count; index++) {
@@ -15756,7 +15748,7 @@ static id macws_new_library_data_compat(id self, SEL selector,
         : nil;
     if (transient_replacement) dispatch_release(transient_replacement);
     if (result && hash && macws_is_stray_process() &&
-        getenv("MACWS_AGX_NATIVE")) {
+        macws_agx_native_enabled()) {
         macws_create_half_float_library_variant(
             self, selector, result, length, hash);
     }
@@ -16674,7 +16666,7 @@ static void macws_render_pipeline_async_options_diag(
 static void macws_install_render_pipeline_diagnostic(Class agx) {
     BOOL full_diagnostic = macws_pipeline_diag_enabled();
     if (!full_diagnostic &&
-        (!macws_is_stray_process() || !getenv("MACWS_AGX_NATIVE"))) return;
+        (!macws_is_stray_process() || !macws_agx_native_enabled())) return;
     static dispatch_once_t once;
     dispatch_once(&once, ^{
         struct {
@@ -20539,7 +20531,7 @@ static id<MTLLibrary> macws_metal2metal_companion(
 
 static id<MTLLibrary> macws_metal2metal_library_for_request(
         id self, NSString *name) {
-    if (!getenv("MACWS_AGX_NATIVE")) return nil;
+    if (!macws_agx_native_enabled()) return nil;
     NSMutableDictionary *route =
         macws_metal2metal_route_for_library(self);
     if (!macws_metal2metal_function_contract(route, name)) return nil;
@@ -20569,7 +20561,7 @@ static id macws_new_library_url_metal2metal(
             returned_error ? returned_error.localizedDescription.UTF8String
                            : "(nil)");
     }
-    if (!library || !getenv("MACWS_AGX_NATIVE")) return library;
+    if (!library || !macws_agx_native_enabled()) return library;
 
     const MacWSMetal2MetalRuntimeObjects *keys =
         macws_metal2metal_runtime_objects();
@@ -20734,7 +20726,7 @@ static id macws_desktop_specialized_function_compat(
         self, kMacWSMetal2MetalFunctionRouteKey);
     NSDictionary *contract =
         macws_metal2metal_function_contract(route, name);
-    if (getenv("MACWS_AGX_NATIVE") && device &&
+    if (macws_agx_native_enabled() && device &&
         contract &&
         g_macws_desktop_function_specialize_orig) {
         id<MTLLibrary> library =
@@ -20803,7 +20795,7 @@ static void macws_desktop_specialized_function_async_compat(
         self, kMacWSMetal2MetalFunctionRouteKey);
     NSDictionary *contract =
         macws_metal2metal_function_contract(route, name);
-    if (getenv("MACWS_AGX_NATIVE") && device &&
+    if (macws_agx_native_enabled() && device &&
         contract &&
         g_macws_desktop_function_specialize_async_orig) {
         id<MTLLibrary> library =
@@ -20984,7 +20976,7 @@ static id macws_new_dag_library_compat(id self, SEL selector, NSString *dag,
 }
 
 static void macws_install_qc_desktop_function_compatibility(void) {
-    if (!getenv("MACWS_AGX_NATIVE")) return;
+    if (!macws_agx_native_enabled()) return;
     // Runtime-confirmed with Word pid 36291: the old process allowlist left
     // its QuartzCore fixed_* functions on macOS-target AIR.  Opening a blank
     // document then aborted in create_fragment_shader.  The same binary,
@@ -21163,7 +21155,7 @@ static id macws_new_event_compat(id self, SEL selector)
 static id macws_new_event_compat(id self, SEL selector) {
     id event = g_macws_new_event_orig
         ? g_macws_new_event_orig(self, selector) : nil;
-    if (event || !getenv("MACWS_AGX_NATIVE")) return event;
+    if (event || !macws_agx_native_enabled()) return event;
 
     id<MTLSharedEvent> shared_event = nil;
     if ([self respondsToSelector:@selector(newSharedEvent)])
@@ -22029,7 +22021,7 @@ static void install_agx_init_redirect(Class agx) {
                 // iOS rejects). The init-bytes variant always routes
                 // through that broken path. Redirect for any AGX-native
                 // invocation.
-                if (getenv("MACWS_AGX_NATIVE") &&
+                if (macws_agx_native_enabled() &&
                     !getenv("MACWS_AGX_KEEP_PINNED_ALLOC")) {
                     // 2026-06-20 — REDIRECT-iOS-NATIVE.
                     // Previously this returned nil because the macOS-pattern
@@ -22202,12 +22194,12 @@ static void install_agx_init_redirect(Class agx) {
 
 %hook NSScreen
 - (CGFloat)maximumPotentialExtendedDynamicRangeColorComponentValue {
-    if (getenv("MACWS_SDR_SCANOUT")) return 1.0;
+    if (MacWSProductionDefaultEnabled(getenv("MACWS_SDR_SCANOUT"))) return 1.0;
     return %orig;
 }
 
 - (CGFloat)maximumExtendedDynamicRangeColorComponentValue {
-    if (getenv("MACWS_SDR_SCANOUT")) return 1.0;
+    if (MacWSProductionDefaultEnabled(getenv("MACWS_SDR_SCANOUT"))) return 1.0;
     return %orig;
 }
 %end
@@ -22224,7 +22216,7 @@ static void install_agx_init_redirect(Class agx) {
             (unsigned long)self.usage);
     }
     if(mode == 1) { // MTLStorageModeManaged (macOS only) → Shared on iOS
-        if (getenv("MACWS_AGX_NATIVE")) {
+        if (macws_agx_native_enabled()) {
             // Keep the macOS-side descriptor truthful. The native AGX device
             // hooks clone and translate it at the final driver boundary.
             return mode;
@@ -22232,7 +22224,7 @@ static void install_agx_init_redirect(Class agx) {
         self.storageMode = MTLStorageModeShared;
         return MTLStorageModeShared;
     }
-    if(mode == 3 && getenv("MACWS_AGX_NATIVE")) {
+    if(mode == 3 && macws_agx_native_enabled()) {
         // Preserve the descriptor's real memoryless semantics for native AGX.
         //
         // Runtime-confirmed via device-side LLDB (2026-07-23): this getter

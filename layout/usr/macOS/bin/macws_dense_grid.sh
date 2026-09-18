@@ -1,7 +1,6 @@
 set -eu
 
 FLAG=/tmp/com.macwsguide.dense-grid.disabled
-LOADED=/tmp/com.macwsguide.dense-grid.loaded
 
 case "${1:-status}" in
     enable)
@@ -19,8 +18,7 @@ case "${1:-status}" in
         else
             echo "MacWS dense Stage Manager grid: enabled"
         fi
-        if [ -f "$LOADED" ]; then
-            echo "SpringBoard hook: $(head -n 1 "$LOADED")"
+        if /var/jb/usr/macOS/bin/macws_control_probe windowing-status; then
             for witness in /tmp/com.macwsguide.dense-grid.width \
                            /tmp/com.macwsguide.dense-grid.height \
                            /tmp/com.macwsguide.dense-grid.width-getter \

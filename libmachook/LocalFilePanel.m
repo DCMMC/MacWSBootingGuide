@@ -29,6 +29,71 @@ static id MacWSRuntimeString(const char *UTF8) {
         : nil;
 }
 
+// Ventura's remote NSSavePanel and in-process NSLocalSavePanel implement the
+// same format controls under different selector spellings.  Runtime inventory
+// on the target AppKit (2026-09-19) confirmed matching type encodings:
+//   NSSavePanel _setShowsFormats:      v20@0:8B16
+//   NSLocalSavePanel setShowsFormats:  v20@0:8B16
+//   NSSavePanel _setFormatFileTypes:   v24@0:8@16
+//   NSLocalSavePanel setFormatFileTypes: v24@0:8@16
+//   NSSavePanel _setFormatTitles:      v24@0:8@16
+//   NSLocalSavePanel setFormatTitles:  v24@0:8@16
+// Word's real Save action sent _setShowsFormats: to NSLocalSavePanel and
+// terminated with an unrecognized-selector exception.  Forward to AppKit's
+// actual local format implementation, rather than suppressing the call.
+static void MacWSLocalSetShowsFormats(id panel, SEL selector, BOOL shows) {
+    (void)selector;
+    ((void (*)(id, SEL, BOOL))objc_msgSend)(
+        panel, sel_registerName("setShowsFormats:"), shows);
+}
+
+static void MacWSLocalSetFormatFileTypes(id panel, SEL selector, id types) {
+    (void)selector;
+    ((void (*)(id, SEL, id))objc_msgSend)(
+        panel, sel_registerName("setFormatFileTypes:"), types);
+}
+
+static void MacWSLocalSetFormatTitles(id panel, SEL selector, id titles) {
+    (void)selector;
+    ((void (*)(id, SEL, id))objc_msgSend)(
+        panel, sel_registerName("setFormatTitles:"), titles);
+}
+
+static BOOL MacWSLocalShowsFormats(id panel, SEL selector) {
+    (void)selector;
+    return ((BOOL (*)(id, SEL))objc_msgSend)(
+        panel, sel_registerName("showsFormats"));
+}
+
+static void MacWSInstallLocalPanelFormatCompatibility(void) {
+    Class local = objc_getClass("NSLocalSavePanel");
+    if (!local) return;
+    struct {
+        const char *remoteName;
+        const char *localName;
+        IMP bridge;
+    } mappings[] = {
+        {"_setShowsFormats:", "setShowsFormats:",
+         (IMP)MacWSLocalSetShowsFormats},
+        {"_setFormatFileTypes:", "setFormatFileTypes:",
+         (IMP)MacWSLocalSetFormatFileTypes},
+        {"_setFormatTitles:", "setFormatTitles:",
+         (IMP)MacWSLocalSetFormatTitles},
+        {"_showsFormats", "showsFormats",
+         (IMP)MacWSLocalShowsFormats},
+    };
+    for (NSUInteger index = 0;
+         index < sizeof(mappings) / sizeof(mappings[0]); index++) {
+        SEL remote = sel_registerName(mappings[index].remoteName);
+        SEL localSelector = sel_registerName(mappings[index].localName);
+        if (class_getInstanceMethod(local, remote)) continue;
+        Method native = class_getInstanceMethod(local, localSelector);
+        if (!native) continue;
+        class_addMethod(local, remote, mappings[index].bridge,
+                        method_getTypeEncoding(native));
+    }
+}
+
 __attribute__((constructor))
 static void MacWSUseNativeInProcessFilePanels(void) {
     // This preference is meaningful only to AppKit clients.  The old global
@@ -46,6 +111,7 @@ static void MacWSUseNativeInProcessFilePanels(void) {
     // stock NSLocalOpenPanel selection without initializing CFPreferences in
     // unrelated daemons.
     if (!objc_getClass("NSApplication")) return;
+    MacWSInstallLocalPanelFormatCompatibility();
     dispatch_async(dispatch_get_main_queue(), ^{
         Class defaultsClass = objc_getClass("NSUserDefaults");
         id defaults = defaultsClass

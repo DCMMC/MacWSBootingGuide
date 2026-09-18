@@ -16,6 +16,7 @@
 #include "../include/macws_resize_gesture.h"
 #include "../include/macws_switcher_selection.h"
 #include "../include/macws_diagnostics_policy.h"
+#include "../include/macws_windowing_notify.h"
 
 // Source-confirmed against TrollPad 1.3 and RE-confirmed against the target
 // iPadOS 16.3.1 SpringBoard: SBSwitcherChamoisLayoutAttributes stores the
@@ -34,8 +35,6 @@
 
 static const char *const MacWSDenseGridDisabled =
     "/tmp/com.macwsguide.dense-grid.disabled";
-static const char *const MacWSDenseGridLoaded =
-    "/tmp/com.macwsguide.dense-grid.loaded";
 static CFStringRef const MacWSRequestFullscreenNotification =
     CFSTR("com.macwsguide.windowing.request-fullscreen");
 static CFStringRef const MacWSRequestResizeNotification =
@@ -45,7 +44,7 @@ static CFStringRef const MacWSRequestInitialSizeNotification =
 static const char *const MacWSWindowingLog =
     "/var/mobile/Library/Logs/MacWSWindowing.log";
 static NSString *const MacWSResizeRequestDirectory =
-    @"/tmp";
+    @MACWS_WINDOWING_REQUEST_DIRECTORY;
 static NSString *const MacWSFullscreenRequestPrefix =
     @"com.macwsguide.windowing.fullscreen-request.";
 static NSString *const MacWSResizeRequestPrefix =
@@ -2543,6 +2542,20 @@ overlappingModelBeforeDragging:(id)overlappingModelBeforeDragging
 }
 %end
 
+static uint8_t MacWSWindowingCapabilities;
+
+static void MacWSPublishWindowingCapabilities(
+        CFNotificationCenterRef center, void *observer, CFStringRef name,
+        const void *object, CFDictionaryRef userInfo) {
+    (void)center; (void)observer; (void)name; (void)object; (void)userInfo;
+    int token = MacWSWindowingStateToken();
+    if (token >= 0 && MacWSWindowingCapabilities != 0) {
+        notify_set_state(token, MacWSWindowingState(
+            (uint32_t)getpid(), MacWSWindowingCapabilities));
+        notify_post(MACWS_WINDOWING_STATE_NAME);
+    }
+}
+
 static void MacWSInstallRequestObservers(void *context) {
     (void)context;
     static dispatch_once_t once;
@@ -2606,36 +2619,24 @@ static void MacWSInstallRequestObservers(void *context) {
             MacWSMethodInventory(NSClassFromString(@"SBAppLayout"),
                 @[@"item", @"role", @"attribute", @"layout"])]);
 
-        // This file is a readiness witness, not merely an image-load witness:
-        // publish it only after all Darwin observers and the initial-layout
-        // hook's target method are present.
-        int fd = open(MacWSDenseGridLoaded,
-                      O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
-        if (fd >= 0) {
-            dprintf(fd, "version=59 pid=%d sizing=exact-live-proposal "
-                    "switcher-selection=scene-identity-rebind-at-model-publication "
-                    "presentation=workspace-detaches-appkit-sizing "
-                    "resize-gesture=exact-scene-native-end-notification "
-                        "fallback-step=10 minimum=150 "
-                        "observers=main-queue-after-dyld "
-                        "grid=exact-host-leaf-quantizer-and-programmatic-scope "
-                        "grid-storage=scoped-original-arrays-no-writeback "
-                        "constraints=exact-scene-response-appkit-springback "
-                        "fullscreen=exact-scene-activate-then-maximization-toggle-action-17 "
-                        "resize=whole-current-stage-membership-animation-disabled "
-                        "initial=preactivation-lower-per-item-calculator "
-                        "initial-size-protocol=1 "
-                        "group=stage-limit-without-item-policy "
-                        "diagnostics=per-item-frame-and-stage-limit "
-                        "exit=system-maximization-unzoom "
-                        "postcondition=current-stage-membership-and-model-size-not-visual\n",
-                        getpid());
-            close(fd);
-        }
+        // A shared, versioned IPC contract replaces the old .loaded file and
+        // implementation-description string matching. Publish only after
+        // request observers exist; real geometry remains the success witness.
+        MacWSWindowingCapabilities = MacWSWindowingFullscreen |
+            MacWSWindowingResize | MacWSWindowingSceneConstraints;
+        if (leafGridMethod)
+            MacWSWindowingCapabilities |= MacWSWindowingDenseGrid;
+        if (initialMethod && leafGridMethod)
+            MacWSWindowingCapabilities |= MacWSWindowingInitialSize;
+        CFNotificationCenterAddObserver(
+            center, NULL, MacWSPublishWindowingCapabilities,
+            CFSTR(MACWS_WINDOWING_REFRESH_NAME), NULL,
+            CFNotificationSuspensionBehaviorDeliverImmediately);
+        MacWSPublishWindowingCapabilities(NULL, NULL, NULL, NULL, NULL);
     });
 }
 
-__attribute__((constructor)) static void MacWSDenseGridLoadedWitness(void) {
+__attribute__((constructor)) static void MacWSWindowingInitialize(void) {
     // Keep the constructor side-effect minimal and publish readiness only
     // after the observers actually exist.  The original Safe Mode root cause
     // was NOT constructor timing: SpringBoard-2026-08-04-124439.ips reproduced
@@ -2645,7 +2646,6 @@ __attribute__((constructor)) static void MacWSDenseGridLoadedWitness(void) {
     // alone still emits plain, unauthenticated __cfstring binds. The packaging
     // invariant now replaces the on-device intermediate with an Apple-ld64
     // cross-build whose __cfstring class references are auth-bind/key=DA.
-    unlink(MacWSDenseGridLoaded);
     dispatch_async_f(dispatch_get_main_queue(), NULL,
                      MacWSInstallRequestObservers);
 }

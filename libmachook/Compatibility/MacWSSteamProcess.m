@@ -744,7 +744,7 @@ static NSMutableDictionary *MacWSMergedEnvironmentForWorkspaceConfiguration(
             [merged removeObjectForKey:@"MACWS_STEAM_CPU_RENDERING"];
             merged[@"MACWS_AGX_NATIVE"] = @"1";
             merged[@"MACWS_AGX_REGISTER_CLASSES"] = @"1";
-            merged[@"MACWS_PIN_FALLBACK"] = @"1";
+            [merged removeObjectForKey:@"MACWS_PIN_FALLBACK"];
             // Stray's macOS 13 AGX command records have producer-version ABI
             // fields that differ from iOS 16's native consumer.  Keep the
             // exact, anchor-validated adapters game-scoped; Steam itself and

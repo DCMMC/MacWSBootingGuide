@@ -236,6 +236,18 @@ static OSStatus MacWSAudioUnitSetProperty(
         return gMacWSOriginalAudioUnitSetProperty(
             unit, property, scope, element, data, dataSize);
     }
+    // Publish only the final output unit. Enabling the bridge for every
+    // application must not also publish an effect/generator's intermediate
+    // callback and race the real output stream for the shared ring.
+    AudioComponent component = AudioComponentInstanceGetComponent(unit);
+    AudioComponentDescription description = {0};
+    if (!component ||
+        AudioComponentGetDescription(component, &description) != noErr ||
+        description.componentType != kAudioUnitType_Output ||
+        description.componentSubType == kAudioUnitSubType_GenericOutput) {
+        return gMacWSOriginalAudioUnitSetProperty(
+            unit, property, scope, element, data, dataSize);
+    }
     MacWSAudioRenderContext *context = calloc(1, sizeof(*context));
     if (!context) {
         return gMacWSOriginalAudioUnitSetProperty(
@@ -282,8 +294,14 @@ void MacWSInstallAudioRenderBridge(void) {
 }
 
 __attribute__((constructor)) static void MacWSInitializeAudioRenderBridge(void) {
-    const char *enabled = getenv("MACWS_AUDIO_RENDER_BRIDGE");
-    if (!enabled || strcmp(enabled, "1") != 0) return;
+    // Audio output is a production capability, including applications
+    // launched from Finder/Terminal rather than the curated launcher. The
+    // native output daemon consumes this ring outside the chroot; the two
+    // macOS audio catalog/HAL servers are not playback clients themselves.
+    const char *program = getprogname();
+    if (program && (strcmp(program, "coreaudiod") == 0 ||
+                    strcmp(program, "AudioComponentRegistrar") == 0))
+        return;
     mach_timebase_info_data_t timebase = {0};
     if (mach_timebase_info(&timebase) == KERN_SUCCESS &&
         timebase.numer != 0) {

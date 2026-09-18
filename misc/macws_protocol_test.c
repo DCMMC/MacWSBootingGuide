@@ -11,12 +11,37 @@
 #include "macws_stream_protocol.h"
 #include "macws_touch_policy.h"
 #include "macws_viewport_math.h"
+#include "macws_windowing_protocol.h"
+#include "macws_settings_bridge_protocol.h"
 
 static int Near(float lhs, float rhs) {
     return fabsf(lhs - rhs) < 0.0001f;
 }
 
 int main(void) {
+    uint64_t settingsBridge = MacWSSettingsBridgeState(700);
+    assert(MacWSSettingsBridgeStateSupports(settingsBridge));
+    assert(MacWSSettingsBridgePublisher(settingsBridge) == 700);
+    assert(!MacWSSettingsBridgeStateSupports(0));
+    assert(!MacWSSettingsBridgeStateSupports(MacWSSettingsBridgeState(1)));
+    assert(!MacWSSettingsBridgeStateSupports(settingsBridge ^ (UINT64_C(1) << 40)));
+    assert(!MacWSSettingsBridgeStateSupports(settingsBridge & ~(UINT64_C(1) << 32)));
+    assert(!MacWSWindowingStateSupports(settingsBridge, MacWSWindowingRequired));
+    uint64_t windowing = MacWSWindowingState(381, MacWSWindowingRequired);
+    assert(!MacWSSettingsBridgeStateSupports(windowing));
+    assert(MacWSWindowingStateSupports(windowing, MacWSWindowingRequired));
+    assert(MacWSWindowingPublisher(windowing) == 381);
+    assert(!MacWSWindowingStateSupports(0, MacWSWindowingRequired));
+    assert(!MacWSWindowingStateSupports(
+        MacWSWindowingState(1, MacWSWindowingRequired), MacWSWindowingResize));
+    assert(!MacWSWindowingStateSupports(
+        windowing ^ (UINT64_C(1) << 40), MacWSWindowingRequired));
+    assert(!MacWSWindowingStateSupports(
+        windowing ^ (UINT64_C(1) << 48), MacWSWindowingRequired));
+    for (unsigned bit = 0; bit < 5; bit++) {
+        assert(!MacWSWindowingStateSupports(
+            windowing & ~(UINT64_C(1) << (32 + bit)), MacWSWindowingRequired));
+    }
     assert(MacWSCompositeCandidateShouldReplace(
         false, false, 0, false, 3983184));
     // A larger offscreen target must not poison a later owned desktop target.
@@ -123,6 +148,12 @@ int main(void) {
     assert(MacWSIsDirectDoubleTap(10.0, 10.40, 20.0, 20.0));
     assert(!MacWSIsDirectDoubleTap(10.0, 10.43, 0.0, 0.0));
     assert(!MacWSIsDirectDoubleTap(10.0, 10.20, 44.1, 0.0));
+    assert(MacWSIsPointerClick(0.10, 5.0));
+    assert(!MacWSIsPointerClick(0.36, 0.0));
+    assert(!MacWSIsPointerClick(0.10, 6.1));
+    assert(MacWSIsPointerDoubleClick(10.0, 10.40, 7.0, 0.0));
+    assert(!MacWSIsPointerDoubleClick(10.0, 10.43, 0.0, 0.0));
+    assert(!MacWSIsPointerDoubleClick(10.0, 10.20, 8.1, 0.0));
     assert(!MacWSShouldStartScrollMomentum(79.99, 0.0));
     assert(MacWSShouldStartScrollMomentum(80.0, 0.0));
     assert(MacWSShouldStartScrollMomentum(60.0, 60.0));
