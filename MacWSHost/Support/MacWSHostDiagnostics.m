@@ -32,7 +32,7 @@ BOOL MacWSHostTouchDiagnosticsEnabled(void) {
     // physical gesture can be traced without restarting MacWSHost or changing
     // the macOS GUI generation; callers log transaction edges only.
     return access(
-        "/var/mobile/Library/Preferences/com.macwsguide.host.touch-diagnostics",
+        "/tmp/com.macwsguide.host.touch-diagnostics",
         F_OK) == 0;
 }
 

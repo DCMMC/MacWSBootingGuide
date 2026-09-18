@@ -807,7 +807,7 @@ from host_key_probe import KEY_CODES, SPECIAL_SYMBOLS
 SOURCE_INDIRECT_POINTER = 3
 destination = "/var/mnt/rootfs/private/tmp/macws_host_input.sock"
 local = "/tmp/macws_host_input_agent.%d.sock" % os.getpid()
-gui_transaction_lock = "/var/jb/var/mobile/.macos_gui.transaction"
+gui_transaction_lock = "/tmp/.macos_gui.transaction"
 gui_transaction_pid = os.path.join(gui_transaction_lock, "pid")
 diagnostic_marker_directory = "/var/mnt/rootfs/private/tmp"
 gui_lease_held = False
@@ -3741,7 +3741,7 @@ def file_suffix(remote: Remote, path: str, offset: int):
 def active_gui_start_transaction(remote: Remote):
     """Return the exact live macos_gui start owner, never a stale PID file."""
     probe = remote.run(
-        "transaction=/var/jb/var/mobile/.macos_gui.transaction/pid; "
+        "transaction=/tmp/.macos_gui.transaction/pid; "
         "test -f \"$transaction\" || exit 0; "
         "owner=$(/var/jb/usr/bin/awk 'NR==1{print;exit}' \"$transaction\" "
         "2>/dev/null); "

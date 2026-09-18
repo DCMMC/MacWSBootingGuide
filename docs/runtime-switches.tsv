@@ -10,6 +10,7 @@ env	DRAW_DELAY	off	standalone probe	Delays the drawtest test window.
 env	ELECTRON_RUN_AS_NODE	transient	VS Code shell environment resolver	Official VS Code marker paired with VSCODE_RESOLVING_ENVIRONMENT; never set by a production plist.
 env	HOME	auto	chroot/iOS launchers	Launcher-owned home directory appropriate to the target execution namespace.
 env	LOGNAME	auto	Steam launchd job	Matches the uid-501 chroot user identity expected by Valve's bootstrap.
+env	NO_COLOR	off	macwsneofetch	Optional output-colour override; never set by a production launch job.
 env	IOSCLEAR_DRAW_MODE	off	standalone probe	Selects an iosclear reference draw experiment.
 env	IOSCLEAR_DUMP_AGX_METHODS	off	standalone probe	Dumps AGX methods from iosclear_ref.
 env	IOSCLEAR_EARLY_DELAY	off	standalone probe	Delays the early iosclear reference path.
@@ -46,10 +47,10 @@ env	MACWS_AGX_KEEP_PINNED_ALLOC	off	A/B control	Absent selects the production iO
 env	MACWS_AGX_KEEP_VALIDATE	off	A/B control	Retains an old validation branch when explicitly set.
 env	MACWS_AGX_LIFE_STACK_LARGE	off	diagnostic	Large lifecycle backtraces.
 env	MACWS_AGX_LIFE_VERBOSE	off	diagnostic	Per-resource lifecycle logging.
-env	MACWS_AGX_NATIVE	on	WindowServer,VS Code,Chrome,GlassDemo	Select the real iOS AGX driver path; mandatory production invariant.
+env	MACWS_AGX_NATIVE	on	WindowServer and Control Center GUI app-bundle launches except Steam CPU-download profile	Select the real iOS AGX driver path; macwshostd supplies it to user-launched app bundles.
 env	MACWS_AGX_NATIVE_NON2D	off	A/B control	Broad non-2D native texture allocation experiment.
 env	MACWS_AGX_NATIVE_PLAIN	off	inverse A/B control	Variable is absent in production; absence enables the validated native-plain policy.
-env	MACWS_AGX_REGISTER_CLASSES	on	WindowServer,VS Code,Chrome,GlassDemo	Realize cross-image AGX Objective-C classes.
+env	MACWS_AGX_REGISTER_CLASSES	on	WindowServer and native-AGX GUI app-bundle launches	Realize only the AGX driver images' cross-image Objective-C classes.
 env	MACWS_ANE_PROTOCOL_DIAGNOSTICS	off	AppleNeuralEngine compatibility diagnostic	Logs the real Ventura-to-iOS compile/load wire translation, replies and interface construction without changing their results.
 env	MACWS_ANE_PROTOCOL_PAUSE_SECONDS	off	standalone ANE protocol probe	Pauses the bounded probe after its runtime protocol inventory so a debugger can attach.
 env	MACWS_ANE_REPLY_PAUSE_SECONDS	off	AppleNeuralEngine compatibility diagnostic	Pauses a real translated compile/load reply by at most 30 seconds for debugger inspection; never enabled in production.
@@ -200,9 +201,8 @@ env	MACWS_METAL_PROBE_PIPELINE	off	standalone probe	Continues a precompiled-libr
 env	MACWS_METAL_PROBE_SOURCE_ONLY	off	standalone probe	Skips event creation and GPU submission so a captured MSL library can be replayed in isolation.
 env	MACWS_METAL_PROBE_SOURCE_PATH	off	standalone probe	Compiles Metal source read from the exact requested path.
 env	MACWS_METAL_PROBE_FUNCTION	off	standalone probe	Loads the named function after a source-path probe compile.
-env	MACWS_METAL2METAL_NON_WS_DIAGNOSTIC	off	standalone probe	Installs exact-manifest metal2metal function routing outside WindowServer for a bounded compatibility probe; never ship in an app launch environment.
 env	MACWS_METAL_SOURCE_FORCE_IOS	off	A/B control	Forces an iOS Metal source target.
-env	MACWS_PIN_FALLBACK	on	WindowServer,VS Code,Chrome,GlassDemo	Required native-AGX allocation compatibility path.
+env	MACWS_PIN_FALLBACK	on	WindowServer and native-AGX GUI app-bundle launches	Required native-AGX allocation compatibility path.
 env	MACWS_PIPELINE_FALLBACK	off	temporary scaffold	Unsupported pipeline survival fallback.
 env	MACWS_PING_HOLD_SECONDS	off	standalone probe	Keeps PingMTLCompilerService alive for bounded debugger attachment.
 env	MACWS_PROBE_DETACHED_ENUMERATOR	off	standalone ExtensionRecord probe	Exercises the detached application-extension record enumerator path.
@@ -322,11 +322,19 @@ flag	/tmp/macws_final_composite	on	WindowServer	Authoritative sentinel enabling 
 flag	/tmp/macws_probe_stop_before_graphic	off	standalone ExtensionRecord probe	File-form LLDB stop before the bounded graphic-render diagnostic.
 flag	/tmp/macws_asphalt_random_diag	off	Asphalt diagnostic	Enables one-launch read-only entropy/TLS source tracing; production startup removes it.
 flag	/tmp/macws_asphalt_identity_diag	off	Asphalt diagnostic	Enables one-launch Security/identifier status tracing; production startup removes it.
-flag	/var/mobile/Library/Preferences/com.macwsguide.dense-grid.disabled	off	SpringBoard windowing	Emergency opt-out for MacWS dense Stage Manager size candidates; absence means the production grid expansion remains enabled.
-flag	/var/jb/var/mobile/macws_catalyst_launch.trace	off	runningboardd diagnostic	Logs only the exact hidden Catalyst launcher job rewrite; production keeps this absent.
-flag	/var/jb/var/mobile/macws_mtlcompiler_diagnostics	off	iOS MTLCompilerService	Enables compiler reply patching/dumps and filesystem log witnesses; production keeps native iOS compiler paths unpatched and quiet.
-flag	/var/mobile/macws_mtlcompiler_diagnostics	off	iOS MTLCompilerService	Native iOS-seatbelt spelling of the compiler diagnostics sentinel; equivalent to the rootless alias and removed by production preflight.
-flag	/var/jb/var/mobile/macws_steam_angle_asset_build	off	Steam ANGLE asset builder	Byte-exact one-shot compiler adapter for rebuilding the packaged 5d4df51 macabi library; production cleanup removes it and preflight rejects it.
+flag	/tmp/com.macwsguide.dense-grid.disabled	off	SpringBoard windowing	Boot-local emergency opt-out for MacWS dense Stage Manager size candidates; absence leaves the production grid enabled.
+flag	/tmp/macws_catalyst_launch.trace	off	runningboardd diagnostic	Boot-local trace request for the hidden Catalyst launcher job rewrite; production keeps this absent.
+flag	/tmp/macws_mtlcompiler_diagnostics	off	iOS MTLCompilerService	Enables compiler reply diagnostics; production cleanup removes it and preflight rejects it.
+flag	/tmp/macws_mtlcompiler_hold	off	iOS MTLCompilerService	Boot-local compiler hold for debugger capture; production cleanup removes it and preflight rejects it.
+flag	/tmp/macws_steam_angle_asset_build	off	Steam ANGLE asset builder	Byte-exact one-shot compiler adapter for rebuilding the packaged 5d4df51 macabi library; production cleanup removes it and preflight rejects it.
+flag	/tmp/iosclear_run	off	iOS AGX reference	Boot-local opt-in to the diagnostic native AGX workload in MacWSHost.
+flag	/tmp/iosclear_pf550_mode	off	iOS AGX reference	Selects PF550 diagnostic input.
+flag	/tmp/iosclear_early_delay	off	iOS AGX reference	Delays the diagnostic early path.
+flag	/tmp/iosclear_early_hold	off	iOS AGX reference	Holds the diagnostic early path.
+flag	/tmp/iosclear_dump_agx_methods	off	iOS AGX reference	Dumps AGX methods for diagnostics.
+flag	/tmp/iosclear_hires	off	iOS AGX reference	Selects the high-resolution diagnostic workload.
+flag	/tmp/iosclear_terminal_size	off	iOS AGX reference	Selects the terminal-size diagnostic workload.
+flag	/tmp/iosclear_draw_mode	off	iOS AGX reference	Selects the diagnostic draw mode.
 flag	/tmp/macws_stop_after_clear	off	diagnostic	Stops capture after clear pass.
 flag	/tmp/macws_stray_render_trace	off	Stray diagnostic	Installs bounded encoder/pipeline witnesses and logs only the first present plus each 120-present cadence sample; misc/stray_first_run_pipeline.py owns creation and cleanup.
 flag	/tmp/macws_stray_rt_capture_now	transient	Stray diagnostic	Requests one bounded GPU-blit capture of dynamically discovered intermediate render targets and buffers after a verified scene; the pipeline removes it after acknowledgement or cleanup.
@@ -343,14 +351,16 @@ flag	/private/tmp/macws_xpc_proxy_trace	off	XPC proxy diagnostic	Logs the real p
 state	/tmp/macws_coexist_pace_us	on	WindowServer	Production base completion interval: 100000 us when neither real input nor real Stray presentation activity is current.
 state	/tmp/macws_capture_done	transient	VNC startup	PID and generation acknowledgement for the one-shot frame request.
 state	/tmp/macws_graphics_ready	transient	startup	PID witness written after first clean producer completion.
-state	/var/jb/var/mobile/.macos_gui.transaction	transient	GUI lifecycle transaction	Atomic mkdir lock with exact owner PID; overlapping start, restart, and stop operations return 75, while an ownerless stale lock is recoverable.
-state	/var/jb/var/mobile/macos_gui_start.state	transient	GUI lifecycle transaction	Atomically replaced schema, PID, operation, mode, phase, timestamps, and detail consumed by the Host UI without parsing logs.
-state	/var/jb/var/mobile/macws-settings-runtime.boot-ready	auto	System Settings cold start	Current-bootsession and dependency-hash witness; never sufficient without the unchanged deep verifier.
+state	/tmp/.macos_gui.transaction	transient	GUI lifecycle transaction	Boot-local atomic mkdir lock with exact owner PID; overlapping start, restart, and stop operations return 75, while an ownerless stale lock is recoverable.
+state	/tmp/.macws-autosignd-restart.lock	transient	autosignd lifecycle	Boot-local owner-PID lock serializing daemon replacement and endpoint verification; stale owners are recovered automatically.
+state	/tmp/macos_gui_start.state	transient	GUI lifecycle transaction	Boot-local schema, PID, operation, mode, phase, timestamps, and detail consumed by the Host UI without parsing logs.
+state	/tmp/macws-settings-runtime.boot-ready	auto	System Settings cold start	Current-bootsession and dependency-hash witness; never sufficient without the unchanged deep verifier.
+state	/tmp/macws_type82_test_start	off	standalone layout diagnostic	Timestamp written only by the manual type-82 layout test, never consumed by production startup.
 state	/var/jb/var/mobile/macws-settings-runtime.trust-hashes	auto	System Settings cold start	Persistent verified CDHash manifest used to restore only the reboot-volatile dynamic trustcache entries before 48-pane verification.
-state	/var/db/macws/launchservices-catalog.ready	auto	LaunchServices cold start	Schema and rootfs source fingerprint marker accepted only after live application and 48-pane record verification; inactive records are reactivated through stock registrars.
-state	/var/mobile/Library/Preferences/com.macwsguide.dense-grid.loaded	transient	SpringBoard windowing	Loaded-code witness. Production Host requires v6 with fullscreen=exact-scene-keyboard-action-11 and resize=app-layout-transaction before sending private layout requests.
-request	/var/mobile/Library/Preferences/com.macwsguide.windowing.fullscreen-request.<UUID>.plist	transient	MacWSHost to SpringBoard	15-second exact-FBS-scene fullscreen request; SpringBoard deletes it after performing or rejecting system keyboard action 11.
-request	/var/mobile/Library/Preferences/com.macwsguide.windowing.resize-request.<UUID>.plist	transient	MacWSHost to SpringBoard	15-second exact-FBS-scene preferred-size request; SpringBoard deletes it after the immutable app-layout transaction succeeds or fails.
+state	/tmp/macws-launchservices-catalog.ready	auto	LaunchServices cold start	Boot-local schema and rootfs source fingerprint marker accepted only after live application and 48-pane record verification.
+state	/tmp/com.macwsguide.dense-grid.loaded	transient	SpringBoard windowing	Boot-local loaded-code witness. Production Host checks its protocol version before sending private layout requests.
+request	/tmp/com.macwsguide.windowing.fullscreen-request.<UUID>.plist	transient	MacWSHost to SpringBoard	15-second exact-FBS-scene fullscreen request; SpringBoard deletes it after performing or rejecting system keyboard action 11.
+request	/tmp/com.macwsguide.windowing.resize-request.<UUID>.plist	transient	MacWSHost to SpringBoard	15-second exact-FBS-scene preferred-size request; SpringBoard deletes it after the immutable app-layout transaction succeeds or fails.
 notification	com.macwsguide.windowing.request-fullscreen	transient	MacWSHost to SpringBoard	Wakeup only; authority and exact target are read from the bounded fullscreen request plist.
 notification	com.macwsguide.windowing.request-resize	transient	MacWSHost to SpringBoard	Wakeup only; authority, dimensions and exact target are read from the bounded resize request plist.
 default	NSUseRemoteSavePanel	off	macOS GUI clients	Set in-process so Ventura AppKit uses its native NSLocalOpenPanel/NSLocalSavePanel instead of the unavailable remote ViewBridge service; this does not substitute an iOS picker.
@@ -366,7 +376,7 @@ preference	com.apple.dock:showAppExposeGestureEnabled	on	Dock native gestures	Pe
 state	SkyLight managed desktop count	auto	Dock native gestures	Cold one-Space sessions receive exactly one real adjacent Desktop before Dock starts; existing two-or-more-Space topology is preserved, enabling native horizontal fluid gestures without a Dock reload.
 state	/private/tmp/macws_location_provider_ready	transient	Maps location capability	Current macwsinteropd PID, published only after its unmodified Ventura CLLocationManager receives a real provider update; Maps accepts it only while that exact executable remains live, and GUI teardown removes it.
 state	com.macwsguide.catalyst-drawable	transient	MacWSHost/Catalyst display transport	Foreground Host-owned bootstrap Mach receive service; each typed complex message transfers one completed IOSurface send right and is rejected on envelope, geometry, stride, pixel-format, or owner mismatch.
-state	/var/jb/var/mobile/macws-maps-host-carrier.pid	transient	Maps Catalyst lifecycle	Current Maps carrier PID; every WindowServer teardown removes it after terminating Maps so a new GUI generation cannot reuse a live process with a dead CGS connection.
+state	/tmp/macws-maps-host-carrier.pid	transient	Maps Catalyst lifecycle	Current Maps carrier PID; every WindowServer teardown removes it after terminating Maps so a new GUI generation cannot reuse a live process with a dead CGS connection.
 state	/tmp/macws_vnc_surfid	transient	legacy transport	IOSurface ID compatibility state.
 state	/private/tmp/macws_audio_ring	transient	VS Code audio bridge	Versioned 48-kHz stereo PCM ring produced by the macOS AudioUnit callback and consumed by the iOS-native AudioQueue output helper; recreated and permission-clamped by the helper.
 state	/tmp/ws_headless	on	coexistence	Keeps the iPad panel owned by iOS.

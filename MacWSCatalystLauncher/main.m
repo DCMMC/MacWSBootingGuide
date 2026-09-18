@@ -16,7 +16,7 @@ static const char *const kMapsHostExecutable =
 static const char *const kChrootExec =
     "/var/jb/usr/macOS/bin/launchdchrootexec";
 static const char *const kHostCarrierMarker =
-    "/var/jb/var/mobile/macws-maps-host-carrier.pid";
+    "/tmp/macws-maps-host-carrier.pid";
 static const char *const kLocationProviderMarker =
     "/var/mnt/rootfs/private/tmp/macws_location_provider_ready";
 static const char *const kLocationProviderExecutable =
@@ -26,7 +26,7 @@ static const char *const kLocationProviderHostExecutable =
     "/private/var/mnt/rootfs/usr/local/libexec/"
     "MacWSInteropService.app/Contents/MacOS/macwsinteropd";
 static const char *const kCatalystRequestPath =
-    "/var/jb/var/mobile/macws-catalyst-launch-request.plist";
+    "/tmp/macws-catalyst-launch-request.plist";
 static const char *const kCatalystMarkerDirectory =
     "/var/mnt/rootfs/private/tmp";
 static const char *const kCatalystLoopbackProxyURL =

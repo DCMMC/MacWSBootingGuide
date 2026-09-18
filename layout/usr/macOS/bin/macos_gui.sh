@@ -65,10 +65,10 @@ METAL2METAL_COMPAT_PROVISIONER=/var/jb/usr/macOS/bin/ensure_metal2metal_compat.s
 THERMAL_HELPER=/var/jb/usr/macOS/bin/macwsthermal
 MOUNTDEVFS=/var/jb/usr/macOS/bin/mountdevfs
 LOGDIR=/var/jb/var/mobile
-TEST_LEASE="$LOGDIR/macws_test_lease"
-GUI_TRANSACTION_LOCK="$LOGDIR/.macos_gui.transaction"
+TEST_LEASE=/tmp/macws_test_lease
+GUI_TRANSACTION_LOCK=/tmp/.macos_gui.transaction
 GUI_TRANSACTION_PID="$GUI_TRANSACTION_LOCK/pid"
-GUI_START_STATE="$LOGDIR/macos_gui_start.state"
+GUI_START_STATE=/tmp/macos_gui_start.state
 GUI_TRANSACTION_HELD=0
 GUI_TRANSACTION_STARTED=0
 
@@ -191,11 +191,11 @@ EXPERIMENTAL_OBSERVE_PF550="$ROOTFS/private/tmp/macws_observe_pf550"
 EXPERIMENTAL_SUBMIT_RING="$ROOTFS/private/tmp/macws_submit_ring"
 EXPERIMENTAL_FAST_SUBMIT_RING="$ROOTFS/private/tmp/macws_submit_fast_ring"
 EXPERIMENTAL_RUNTIME_DIAGNOSTICS="$ROOTFS/private/tmp/macws_runtime_diagnostics"
-MTLCOMPILER_DIAGNOSTICS="$LOGDIR/macws_mtlcompiler_diagnostics"
-MTLCOMPILER_DIAGNOSTICS_NATIVE=/var/mobile/macws_mtlcompiler_diagnostics
-STEAM_ANGLE_ASSET_BUILD="$LOGDIR/macws_steam_angle_asset_build"
-CATALYST_LAUNCH_TRACE="$LOGDIR/macws_catalyst_launch.trace"
-MAPS_HOST_CARRIER_MARKER="$LOGDIR/macws-maps-host-carrier.pid"
+MTLCOMPILER_DIAGNOSTICS=/tmp/macws_mtlcompiler_diagnostics
+MTLCOMPILER_HOLD=/tmp/macws_mtlcompiler_hold
+STEAM_ANGLE_ASSET_BUILD=/tmp/macws_steam_angle_asset_build
+CATALYST_LAUNCH_TRACE=/tmp/macws_catalyst_launch.trace
+MAPS_HOST_CARRIER_MARKER=/tmp/macws-maps-host-carrier.pid
 EXPERIMENTAL_QUEUE_QOS="$ROOTFS/private/tmp/macws_queue_qos_diag"
 EXPERIMENTAL_OWNED_SCANOUT="$ROOTFS/private/tmp/macws_owned_scanout"
 EXPERIMENTAL_PACE="$ROOTFS/private/tmp/macws_coexist_pace_us"
@@ -253,7 +253,7 @@ DEFAULTS_BIN=/usr/bin/defaults
 LSREGISTER_BIN=/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister
 WORKSPACECTL_BIN=/usr/local/bin/macwsworkspacectl
 LAUNCHSERVICES_CATALOG_SCHEMA=macws-launchservices-catalog-v4
-LAUNCHSERVICES_CATALOG_MARKER="$ROOTFS/var/db/macws/launchservices-catalog.ready"
+LAUNCHSERVICES_CATALOG_MARKER=/tmp/macws-launchservices-catalog.ready
 LSD_SESSION_USER_DIR=/var/folders/zz/zyxvpxvq6csfxvn_n0000000000000/0/macws-lsd-session/
 LAUNCHSERVICES_VERIFY_LOG="$LOGDIR/launchservices-catalog-verify.log"
 SETTINGS_EXTENSION_REGISTER_LOG="$LOGDIR/settings-extension-register.log"
@@ -380,11 +380,11 @@ WD_POLL=5            # seconds between checks
 # opt back into a wall-clock limit with --runtime-cap=SECONDS.
 WD_MAX_RUNTIME=0
 WD_LOG="$LOGDIR/macos_gui_watchdog.log"
-WD_TRIP="$LOGDIR/macws_safety_trip"
-WD_PIDFILE="$LOGDIR/macos_gui_watchdog.pid"
-WD_READY="$LOGDIR/macos_gui_watchdog.ready"
+WD_TRIP=/tmp/macws_safety_trip
+WD_PIDFILE=/tmp/macos_gui_watchdog.pid
+WD_READY=/tmp/macos_gui_watchdog.ready
 WD_THERMAL_SNAPSHOT="$LOGDIR/macos_gui_thermal_snapshot"
-WD_WS_PIDFILE="$LOGDIR/macos_gui_watchdog.ws-pid"
+WD_WS_PIDFILE=/tmp/macos_gui_watchdog.ws-pid
 RECOVERED_WS_PID=""
 RECOVERY_EXTRA_RESTARTS=0
 
@@ -1380,7 +1380,14 @@ run_watchdog() {
             missing_samples=$((missing_samples + 1))
             if [ "$missing_samples" -eq 1 ] || [ "$missing_samples" -eq 3 ]; then
                 log "watchdog: WindowServer job is loaded but has no PID; requesting launchd start (sample=$missing_samples)"
-                launchctl start "$WINDOWSERVER_LABEL" 2>/dev/null
+                # EnableJIT needs a live autosignd RPC before the first
+                # WindowServer instruction reaches libmachook. A later
+                # dependent-recovery check cannot undo that abort.
+                if ensure_autosignd_ready; then
+                    launchctl start "$WINDOWSERVER_LABEL" 2>/dev/null
+                else
+                    log "watchdog: deferring WindowServer retry until autosignd is reachable"
+                fi
             fi
             if [ "$missing_samples" -ge 4 ]; then
                 # The foreground launcher owns the bounded 90-second initial
@@ -1443,10 +1450,10 @@ run_watchdog() {
 # the SkyLight session port, leaving Dock and every AppKit client hung in
 # get_session_port. This bounded restore changes no binary or signature.
 BOOT_TRUSTCACHE_INFO=""
-BASE_TRUST_BOOT_MARKER="$LOGDIR/macws-base-trust.boot-ready"
+BASE_TRUST_BOOT_MARKER=/tmp/macws-base-trust.boot-ready
 BASE_TRUST_CLOSURE_VERSION=7
 BASE_TRUST_READY=0
-WINDOWING_READY_WITNESS=/var/mobile/Library/Preferences/com.macwsguide.dense-grid.loaded
+WINDOWING_READY_WITNESS=/tmp/com.macwsguide.dense-grid.loaded
 WINDOWING_REQUIRED_VERSION=29
 WINDOWING_TWEAK=/var/jb/Library/MobileSubstrate/DynamicLibraries/MacWSWindowing.dylib
 WINDOWING_VALIDATED_CACHE=/var/jb/var/mobile/macws-cross-build/MacWSWindowing.dylib
@@ -3077,9 +3084,28 @@ clear_diagnostic_state() {
     diagnostic_flag_paths | while IFS= read -r path; do
         rm -f "$ROOTFS$path"
     done
-    rm -f "$MTLCOMPILER_DIAGNOSTICS" "$MTLCOMPILER_DIAGNOSTICS_NATIVE" \
+    rm -f "$MTLCOMPILER_DIAGNOSTICS" "$MTLCOMPILER_HOLD" \
         "$STEAM_ANGLE_ASSET_BUILD" \
-        "$CATALYST_LAUNCH_TRACE"
+        "$CATALYST_LAUNCH_TRACE" \
+        /tmp/iosclear_run /tmp/iosclear_pf550_mode \
+        /tmp/iosclear_early_delay /tmp/iosclear_early_hold \
+        /tmp/iosclear_dump_agx_methods /tmp/iosclear_hires \
+        /tmp/iosclear_terminal_size /tmp/iosclear_draw_mode
+    # Remove exact legacy sentinels once; the compiler tweak now reads only
+    # boot-local /tmp paths, so stale persistent switches cannot affect boot.
+    rm -f "$LOGDIR/macws_mtlcompiler_diagnostics" \
+        "$LOGDIR/macws_mtlcompiler_hold" \
+        "$LOGDIR/macws_steam_angle_asset_build" \
+        /var/mobile/macws_mtlcompiler_diagnostics \
+        /var/mobile/macws_mtlcompiler_hold \
+        /var/mobile/iosclear_run \
+        /var/mobile/iosclear_pf550_mode \
+        /var/mobile/iosclear_early_delay \
+        /var/mobile/iosclear_early_hold \
+        /var/mobile/iosclear_dump_agx_methods \
+        /var/mobile/iosclear_hires \
+        /var/mobile/iosclear_terminal_size \
+        /var/mobile/iosclear_draw_mode
     # Request/reply captures are created only by the compiler diagnostic
     # sentinel.  Remove these exact project-owned directories before an
     # ordinary session so neither stale evidence nor bounded binary dumps add
@@ -3270,8 +3296,12 @@ production_preflight() {
     fi
     rm -f "$ROOTFS/private/tmp/macws_production_preflight.bad"
     for path in "$MTLCOMPILER_DIAGNOSTICS" \
-                "$MTLCOMPILER_DIAGNOSTICS_NATIVE" \
-                "$STEAM_ANGLE_ASSET_BUILD"; do
+                "$MTLCOMPILER_HOLD" \
+                "$STEAM_ANGLE_ASSET_BUILD" \
+                /tmp/iosclear_run /tmp/iosclear_pf550_mode \
+                /tmp/iosclear_early_delay /tmp/iosclear_early_hold \
+                /tmp/iosclear_dump_agx_methods /tmp/iosclear_hires \
+                /tmp/iosclear_terminal_size /tmp/iosclear_draw_mode; do
         if [ -e "$path" ]; then
             log "ERROR: iOS MTLCompilerService diagnostic flag survived production cleanup: $path"
             bad=1
@@ -4285,6 +4315,11 @@ rebuild_desktop_session() {
     ensure_desktop_job "$INPUT_PLIST" "$INPUT_LABEL" \
         "macOS input bridge" || {
         rm -f "$composite_marker"; return 1;
+    }
+    ensure_autosignd_ready || {
+        rm -f "$composite_marker"
+        log "ERROR: autosignd was not ready before the WindowServer replacement."
+        return 1
     }
 
     # From this point the explicit transaction owns the generation change, so
@@ -5330,6 +5365,7 @@ case "$CMD" in
         log "TIMING gui-start stage=watchdog seconds=$((SECONDS - start_stage_started)) total=$((SECONDS - start_started))"
         start_stage_started=$SECONDS
         write_gui_start_state trust "restoring executable trust for this boot"
+        bash /var/jb/usr/macOS/bin/ensure_jb_usr_bind.sh || { stop_all; exit 1; }
         ensure_chroot_works || { stop_all; exit 1; }
         log "TIMING gui-start stage=trust seconds=$((SECONDS - start_stage_started)) total=$((SECONDS - start_started))"
         start_stage_started=$SECONDS
@@ -5407,6 +5443,7 @@ case "$CMD" in
         write_gui_start_state safety "arming the observe-only health watchdog"
         start_watchdog || { stop_all; exit 1; }
         write_gui_start_state trust "restoring executable trust for this boot"
+        bash /var/jb/usr/macOS/bin/ensure_jb_usr_bind.sh || { stop_all; exit 1; }
         ensure_chroot_works || { stop_all; exit 1; }
         write_gui_start_state services "starting catalogs, WindowServer, bridges, and applications"
         start_macos || { stop_all; exit 1; }

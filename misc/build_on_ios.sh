@@ -259,7 +259,11 @@ if [ -z "$DEB" ]; then
 fi
 
 echo "==> Installing $DEB..."
-sudo dpkg -i "$DEB"
+# sudo normally drops caller environment. Pass the explicit no-respring
+# request to the package maintainer script so an on-device verification build
+# never restarts SpringBoard behind the operator's back.
+sudo env MACWS_POSTINST_NO_RESPRING="${MACWS_POSTINST_NO_RESPRING:-0}" \
+    dpkg -i "$DEB"
 fi  # end !FAST
 
 if [ "$FAST" != "1" ]; then

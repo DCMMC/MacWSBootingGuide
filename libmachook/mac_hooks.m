@@ -89,6 +89,7 @@ enum {
 };
 
 static void macws_install_fsnode_root_volume_repair(void);
+extern void MacWSInstallOfficeMultiplyFilterCompatibility(void);
 static void macws_install_lsd_session_store_isolation(void);
 static const char *macws_private_bootstrap_service_name(const char *name);
 static BOOL macws_macho_uuid_matches(const struct mach_header_64 *header,
@@ -6055,25 +6056,27 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
             typedef Class (*readPair_t)(Class, const void *);
             readPair_t readPair = (readPair_t)dlsym(RTLD_DEFAULT, "objc_readClassPair");
             int realized = 0;
-            // Cross-image preregistration: previously this loop only walked
-            // AGXMetal13_3's own __objc_classlist, so a class whose superclass
-            // lives in another framework (e.g. AGXBuffer -> IOGPUMetalBuffer in
-            // IOGPU.framework) failed because readClassPair needs the super to
-            // already be in libobjc's name table. In chroot, the libobjc
-            // _dyld_objc_notify_register callback misses IOGPU's classlist for
-            // the same reason it misses AGXMetal's — so we have to register
-            // every loaded image's pending classes here, not just our own.
-            // Walks _dyld_image_count() and, for any image carrying a
-            // __objc_classlist + __objc_imageinfo, runs the same multi-pass
-            // readPair loop. IOGPU goes first because it's a parent of
-            // AGXBuffer/AGXG13GFamilyBuffer/AGXG13GFamilyCommandBuffer/…
-            // Per-image cap of 8 passes catches deep super chains.
+            // Cross-image preregistration is needed for the driver family:
+            // AGXBuffer inherits from IOGPU's classes, and GPURawCounter's
+            // classes are loaded alongside AGX. Do not walk unrelated app
+            // images here. Runtime-confirmed on Word pid 33458: while this
+            // dyld add-image callback ran for AGXMetal13_3, objc_getClass on
+            // OfficeArt's SimpleTextCoordinator entered Swift metadata
+            // initialization and jumped to PC=0. The installed binary's
+            // loadImageCallback+0x2818 is the pending-class scan's
+            // objc_getClass result check. Register only the driver images
+            // whose class graph this callback actually owns.
             if (readPair) {
                 uint32_t img_count = _dyld_image_count();
                 for (uint32_t img_i = 0; img_i < img_count; img_i++) {
                     const struct mach_header *imgh = _dyld_get_image_header(img_i);
                     if (!imgh) continue;
                     const char *imgname = _dyld_get_image_name(img_i);
+                    if (!imgname ||
+                        (!strstr(imgname, "/IOGPU.framework/") &&
+                         !strstr(imgname, "/AGXMetal13_3.bundle/") &&
+                         !strstr(imgname, "/GPURawCounter.framework/")))
+                        continue;
                     unsigned long cl_sz = 0;
                     uint64_t *cl = (uint64_t *)getsectiondata(
                         (const struct mach_header_64 *)imgh, "__DATA_CONST",
@@ -10540,6 +10543,7 @@ __attribute__((constructor)) void InitStuff() {
     }
     macws_schedule_preview_coreimage_renderer_adapter();
     macws_install_steam_volume_compatibility();
+    MacWSInstallOfficeMultiplyFilterCompatibility();
     // Settings extensions carry libmachook through a bundle-local load command.
     // Retry their ExtensionFoundation/LaunchServices boundary only after the
     // post-exec process has CS_DEBUGGED, so both Objective-C class availability
@@ -13366,6 +13370,39 @@ DYLD_INTERPOSE(objc_alloc_trace, objc_alloc);
     "com.apple.macosbooter.DesktopServicesHelper"
 #define DOCK_HELPER_SERVICE_ORIG "com.apple.dock.helper"
 #define DOCK_HELPER_SERVICE_NEW  "com.apple.macosbooter.dock.helper"
+
+static void macws_register_filecoordination_bundle_if_needed(
+        const char *name) {
+    static _Atomic bool fileCoordinationRegistered = false;
+    static _Atomic bool progressReportingRegistered = false;
+    _Atomic bool *registered = NULL;
+    const char *relativePath = NULL;
+    if (!strcmp(name, "com.apple.FileCoordination")) {
+        registered = &fileCoordinationRegistered;
+        relativePath = "/FileCoordinationProxy.xpc";
+    } else if (!strcmp(name, "com.apple.ProgressReporting")) {
+        registered = &progressReportingRegistered;
+        relativePath = "/ProgressReportingProxy.xpc";
+    }
+    if (!registered || atomic_exchange_explicit(registered, true,
+            memory_order_acq_rel)) return;
+    char path[PATH_MAX];
+    snprintf(path, sizeof(path), "%s/FileCoordination.framework/Versions/A/"
+             "XPCServices%s", "/var/jb/usr/macOS/Frameworks",
+             relativePath);
+    xpc_add_bundle(path, 2);
+}
+
+static void macws_register_dock_helper_bundle_if_needed(void) {
+    static _Atomic bool registered = false;
+    if (atomic_exchange_explicit(&registered, true, memory_order_acq_rel))
+        return;
+    char path[PATH_MAX];
+    snprintf(path, sizeof(path), "%s/Dock.framework/Versions/A/"
+             "XPCServices/DockHelperProxy.xpc",
+             "/var/jb/usr/macOS/Frameworks");
+    xpc_add_bundle(path, 2);
+}
 #define GEOD_XPC_SERVICE "com.apple.geod"
 #define GEOD_XPC_SERVICE_NEW "com.apple.macosbooter.geod"
 #define DISKARBITRATIOND_SERVICE_ORIG \
@@ -14338,6 +14375,19 @@ static bool macws_take_quicklook_satellite_connection(
 xpc_connection_t macws_xpc_connection_create_mach_service_early(
     const char *name, dispatch_queue_t targetq, uint64_t flags) {
     const char *originalName = name;
+    if (name && !(flags & XPC_CONNECTION_MACH_SERVICE_LISTENER) &&
+        (!strcmp(name, "com.apple.FileCoordination") ||
+         !strcmp(name, "com.apple.ProgressReporting"))) {
+        // Foundation's NSFileCoordinator enters through this static interpose
+        // before the later shared-cache hook can translate the lookup. The
+        // public Mach endpoint belongs to iPadOS; the per-client XPC bundle
+        // registered by InitMetalHooks relays the unchanged protocol to the
+        // private Ventura filecoordinationd in user/501. Preserve the
+        // original bundle-activation route at this earliest boundary.
+        macws_register_filecoordination_bundle_if_needed(name);
+        macws_trace_xpc_name("xpc_filecoord_bundle", name);
+        return xpc_connection_create(name, targetq);
+    }
     name = macws_private_bootstrap_service_name(name);
     macws_trace_xpc_name("xpc_mach_service", originalName);
     if (name != originalName)
@@ -14460,6 +14510,7 @@ xpc_connection_t macws_xpc_connection_create_early(
         // thread has exited. The registered DockHelperProxy performs only the
         // raw chroot+exec transition, so the stock service consumes the
         // launchd-provided XPC context in the original task.
+        macws_register_dock_helper_bundle_if_needed();
         return xpc_connection_create(DOCK_HELPER_SERVICE_NEW, targetq);
     }
     // Ventura's GeoServices client resolves geod as a per-user XPC service.

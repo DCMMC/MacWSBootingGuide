@@ -18,19 +18,14 @@
 // is the exact public C ABI needed by the UUID-locked reply observer.
 extern void *xpc_data_create(const void *bytes, size_t length);
 
-// The compiler service's iOS seatbelt can hide the rootless /var/jb alias
-// even though the same file is visible from an SSH shell.  Keep the legacy
-// path for existing tooling and accept the native /var/mobile spelling used
-// by the service itself.  Both are diagnostic-only and removed by production
-// preflight.
+// Diagnostics are explicitly opt-in for the current boot.  They must never
+// survive as configuration under a persistent mobile or rootless directory.
 static bool MacWSCompilerDiagnosticsEnabled(void) {
-    return access("/var/jb/var/mobile/macws_mtlcompiler_diagnostics", F_OK) == 0 ||
-        access("/var/mobile/macws_mtlcompiler_diagnostics", F_OK) == 0;
+    return access("/tmp/macws_mtlcompiler_diagnostics", F_OK) == 0;
 }
 
 static bool MacWSCompilerHoldEnabled(void) {
-    return access("/var/jb/var/mobile/macws_mtlcompiler_hold", F_OK) == 0 ||
-        access("/var/mobile/macws_mtlcompiler_hold", F_OK) == 0;
+    return access("/tmp/macws_mtlcompiler_hold", F_OK) == 0;
 }
 
 // NOTE: do NOT take an ObjC block here. Under -fobjc-arc the on-device lld
@@ -754,8 +749,7 @@ static uintptr_t MacWSMTLCodeGenServiceBuildRequest(
                 static const char assetBuildToken[] =
                     "-working-directory \"/private/tmp\"";
                 bool steamANGLEAssetBuild =
-                    access("/var/jb/var/mobile/"
-                           "macws_steam_angle_asset_build", F_OK) == 0 &&
+                    access("/tmp/macws_steam_angle_asset_build", F_OK) == 0 &&
                     tokenLength == sizeof(assetBuildToken) - 1 &&
                     memcmp(bytes + workingOffset, assetBuildToken,
                            sizeof(assetBuildToken) - 1) == 0 &&

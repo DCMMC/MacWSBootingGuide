@@ -28,7 +28,7 @@ echo === stopping GUI stack ===
 # of that exact script, so retire only a numeric lock owner whose current
 # command is still the project macos_gui.sh before asking stop to acquire the
 # transaction itself.
-cleanup_transaction_dir=/var/jb/var/mobile/.macos_gui.transaction
+cleanup_transaction_dir=/tmp/.macos_gui.transaction
 cleanup_transaction_pid_file="$cleanup_transaction_dir/pid"
 cleanup_transaction_pid=""
 if [ -f "$cleanup_transaction_pid_file" ]; then
@@ -55,7 +55,7 @@ if [ -n "$cleanup_transaction_pid" ]; then
       ;;
   esac
 fi
-cleanup_lease_file=/var/jb/var/mobile/macws_test_lease
+cleanup_lease_file=/tmp/macws_test_lease
 cleanup_lease_token=""
 if [ -f "$cleanup_lease_file" ]; then
   cleanup_lease_token=$(awk 'NR == 1 { print; exit }' "$cleanup_lease_file" 2>/dev/null)

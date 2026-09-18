@@ -3,9 +3,9 @@
 // Build this as arm64e/iOS and temporarily place it in a foreground UIKit app
 // bundle.  A foreground app has the real iOS Metal/AGX setup that a headless
 // ad-hoc tool does not.  The default path encodes one BGRA8 IOSurface clear.
-// When /var/mobile/iosclear_draw_mode exists, it instead performs one
+// When /tmp/iosclear_draw_mode exists, it instead performs one
 // IOSurface-to-IOSurface textured draw using QuartzCore's own read_surf_vert /
-// read_surf_frag functions.  /var/mobile/iosclear_pf550_mode replaces the
+// read_surf_frag functions.  /tmp/iosclear_pf550_mode replaces the
 // source with an exact reconstruction of WindowServer's two-plane compressed
 // pf=550 scanout surface.  The BGRA modes prove execution with an exact pixel;
 // pf550 mode treats command status/error as the witness because its compressed
@@ -432,7 +432,7 @@ static void macws_run_textured_draw(id<MTLDevice> device,
                                     id<MTLCommandQueue> queue,
                                     size_t width, size_t height) {
     BOOL pf550Mode = getenv("IOSCLEAR_PF550_MODE") ||
-        access("/var/mobile/iosclear_pf550_mode", F_OK) == 0;
+        access("/tmp/iosclear_pf550_mode", F_OK) == 0;
     macws_reference_log("DRAW enter mode=%s width=%zu height=%zu device=%p queue=%p",
         pf550Mode ? "pf550" : "BGRA8", width, height,
         (__bridge void *)device, (__bridge void *)queue);
@@ -612,7 +612,7 @@ void MacWSRunIOSClearReference(void) {
         // opt-in bounded delay leaves the task runnable until LLDB attaches.
         // It is diagnostic-only and does not alter the default execution path.
         if (getenv("IOSCLEAR_EARLY_DELAY") ||
-            access("/var/mobile/iosclear_early_delay", F_OK) == 0) {
+            access("/tmp/iosclear_early_delay", F_OK) == 0) {
             const char *configured = getenv("IOSCLEAR_EARLY_DELAY");
             unsigned long seconds = configured ? strtoul(configured, NULL, 10)
                                                : 8;
@@ -631,7 +631,7 @@ void MacWSRunIOSClearReference(void) {
         // explicitly armed and is intentionally confined to this reference
         // diagnostic.
         if (getenv("IOSCLEAR_EARLY_HOLD") ||
-            access("/var/mobile/iosclear_early_hold", F_OK) == 0) {
+            access("/tmp/iosclear_early_hold", F_OK) == 0) {
             fprintf(stderr,
                 "IOSCLEAR EARLY-HOLD before MTL device creation pid=%d "
                 "(attach project LLDB)\n",
@@ -660,7 +660,7 @@ void MacWSRunIOSClearReference(void) {
             return;
         }
         if (getenv("IOSCLEAR_DUMP_AGX_METHODS") ||
-            access("/var/mobile/iosclear_dump_agx_methods", F_OK) == 0) {
+            access("/tmp/iosclear_dump_agx_methods", F_OK) == 0) {
             macws_dump_agx_runtime();
         }
 
@@ -669,7 +669,7 @@ void MacWSRunIOSClearReference(void) {
         // FrontBoard launch does not offer a convenient per-run environment
         // override.  This diagnostic sentinel selects the iPad13,6 native
         // framebuffer dimensions used by the WindowServer/VNC comparison.
-        if (access("/var/mobile/iosclear_hires", F_OK) == 0) {
+        if (access("/tmp/iosclear_hires", F_OK) == 0) {
             width = 2388;
             height = 1668;
         }
@@ -678,14 +678,14 @@ void MacWSRunIOSClearReference(void) {
         // this as an explicit diagnostic sentinel just like iosclear_hires.
         // It allows the native iOS textured record to be compared against the
         // recurrent 1140x798 chroot PageFault without a geometry confounder.
-        if (access("/var/mobile/iosclear_terminal_size", F_OK) == 0) {
+        if (access("/tmp/iosclear_terminal_size", F_OK) == 0) {
             width = 1140;
             height = 798;
         }
         macws_reference_log("REFERENCE dimensions width=%zu height=%zu", width,
             height);
         if (getenv("IOSCLEAR_DRAW_MODE") ||
-            access("/var/mobile/iosclear_draw_mode", F_OK) == 0) {
+            access("/tmp/iosclear_draw_mode", F_OK) == 0) {
             fprintf(stderr,
                 "IOSCLEAR DRAW-MODE QuartzCore read_surf %zux%zu\n",
                 width, height);

@@ -2619,6 +2619,15 @@ static BOOL MacWSAppInputSupportedProcess(void) {
     // endpoint of its own.  The socket handler feeds CoreGraphics from this
     // already-CGS-connected process; it never enters the AppKit dispatcher.
     if (program && strcmp(program, "Dock") == 0) return YES;
+    // libmachook itself maps AppKit in some command-line tools. The presence
+    // of NSApplication in the process is therefore not evidence that the
+    // executable owns a GUI lifecycle (vim is a runtime-confirmed example).
+    // A regular AppKit app's executable lives inside its bundle; excluding
+    // loose CLI binaries also avoids the forty delayed install retries.
+    char executablePath[PATH_MAX] = {0};
+    uint32_t executableCapacity = (uint32_t)sizeof(executablePath);
+    if (_NSGetExecutablePath(executablePath, &executableCapacity) != 0 ||
+        !strstr(executablePath, ".app/Contents/MacOS/")) return NO;
     // A finite application-name allowlist cannot cover Finder panels, menu
     // extras, newly installed GUI applications, or future Electron shells.
     // Install in every real AppKit application.  Chromium helpers are kept
@@ -2664,6 +2673,71 @@ static id MacWSDockGesturesInitWitness(id self, SEL selector) {
         &MacWSDockGesturesInstance, (uintptr_t)result,
         memory_order_release);
     return result;
+}
+
+static BOOL (*MacWSDockFileActionOriginal)(id, SEL, uint32_t, BOOL);
+
+static BOOL MacWSSendDockActivation(pid_t targetPID) {
+    if (targetPID <= 1) return NO;
+    char path[sizeof(((struct sockaddr_un *)0)->sun_path)] = {0};
+    int length = snprintf(path, sizeof(path),
+                          "/private/tmp/macws_app_input.%d.sock", targetPID);
+    if (length <= 0 || (size_t)length >= sizeof(path)) return NO;
+    int socketFD = socket(AF_UNIX, SOCK_DGRAM, 0);
+    if (socketFD < 0) return NO;
+    struct sockaddr_un address = {0};
+    address.sun_family = AF_UNIX;
+    memcpy(address.sun_path, path, (size_t)length + 1);
+    MacWSInputRecord record = {
+        .magic = MACWS_INPUT_MAGIC,
+        .version = MacWSInputWireVersionForKind(MacWSInputKindActivateTarget),
+        .kind = MacWSInputKindActivateTarget,
+        .timestamp = CFAbsoluteTimeGetCurrent(),
+        .frameWidth = 1,
+        .frameHeight = 1,
+        .targetPID = targetPID,
+        .source = MacWSInputSourceUnknown,
+    };
+    ssize_t sent = sendto(socketFD, &record, sizeof(record), MSG_DONTWAIT,
+                          (const struct sockaddr *)&address,
+                          sizeof(address));
+    close(socketFD);
+    return sent == (ssize_t)sizeof(record);
+}
+
+static BOOL MacWSDockFileActionWitness(id self, SEL selector,
+                                       uint32_t action, BOOL keyboard) {
+    BOOL result = MacWSDockFileActionOriginal(
+        self, selector, action, keyboard);
+    // Runtime-confirmed on the iPad: tapping the Excel and Word running-app
+    // icons invokes DOCKFileTile doAction:fromKeyboard: with action 0x100100,
+    // and that method returns NO without bringing either app forward. Both
+    // tiles contain a live _psn that GetProcessPID resolves to the correct
+    // application. Let Dock try its normal route first; only complete this
+    // failed running-app activation through the existing AppKit input bridge.
+    if (result || action != 0x100100u) return result;
+    Ivar psnIvar = class_getInstanceVariable(object_getClass(self), "_psn");
+    if (!psnIvar || ivar_getOffset(psnIvar) < 0) return result;
+    uint32_t psn[2] = {0};
+    memcpy(psn, (const char *)self + ivar_getOffset(psnIvar), sizeof(psn));
+    pid_t targetPID = -1;
+    typedef OSStatus (*GetProcessPIDFunction)(const void *, pid_t *);
+    static GetProcessPIDFunction getProcessPID;
+    static dispatch_once_t resolveOnce;
+    dispatch_once(&resolveOnce, ^{
+        getProcessPID = (GetProcessPIDFunction)dlsym(
+            RTLD_DEFAULT, "GetProcessPID");
+    });
+    if (!getProcessPID || getProcessPID(psn, &targetPID) != noErr ||
+        targetPID <= 1) return result;
+    BOOL activated = MacWSSendDockActivation(targetPID);
+    if (MacWSRuntimeDiagnosticsEnabled()) {
+        fprintf(stderr, "#### APP-INPUT DOCK-ACTIVATE action=0x%x "
+                "target=%d sent=%s\n", action, targetPID,
+                activated ? "YES" : "NO");
+        fflush(stderr);
+    }
+    return activated ? YES : result;
 }
 
 static void MacWSClearDockModalContext(void) {
@@ -2853,6 +2927,26 @@ static BOOL MacWSInstallDockGesturesWitness(void) {
     if (current != (IMP)MacWSDockGesturesInitWitness) {
         MacWSOriginalDockGesturesInit = current;
         method_setImplementation(method, (IMP)MacWSDockGesturesInitWitness);
+    }
+    Class fileTile = objc_getClass("DOCKFileTile");
+    SEL actionSelector = sel_registerName("doAction:fromKeyboard:");
+    Method fileAction = fileTile
+        ? class_getInstanceMethod(fileTile, actionSelector) : NULL;
+    const char *fileTypes = fileAction
+        ? method_getTypeEncoding(fileAction) : NULL;
+    if (fileAction && fileTypes &&
+        strcmp(fileTypes, "B24@0:8I16B20") == 0 &&
+        !MacWSDockFileActionOriginal) {
+        IMP original = method_getImplementation(fileAction);
+        if (original != (IMP)MacWSDockFileActionWitness) {
+            MacWSDockFileActionOriginal =
+                (BOOL (*)(id, SEL, uint32_t, BOOL))original;
+            if (!class_addMethod(fileTile, actionSelector,
+                    (IMP)MacWSDockFileActionWitness, fileTypes)) {
+                method_setImplementation(fileAction,
+                    (IMP)MacWSDockFileActionWitness);
+            }
+        }
     }
     if (MacWSRuntimeDiagnosticsEnabled()) {
         fprintf(stderr,

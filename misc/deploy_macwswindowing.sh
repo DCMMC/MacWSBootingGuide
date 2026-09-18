@@ -40,6 +40,22 @@ echo "==> Verified arm64e __cfstring fixups: auth-bind/key=DA count=$cf_count, p
 ssh "$DEVICE_SSH" "mkdir -p '$REMOTE_DIR'"
 scp "$BUILT" "$DEVICE_SSH:$REMOTE_NEW"
 
+# A package-verification build only needs the validated Apple-ld64 artifact
+# in the on-device cache. Do not replace the live tweak or restart SpringBoard
+# until the user explicitly chooses to activate the new version.
+if [ "${MACWS_WINDOWING_STAGE_ONLY:-0}" = 1 ]; then
+    ssh -t "$DEVICE_SSH" "sudo sh -c '
+set -e
+ldid -h \"$REMOTE_NEW\" >/dev/null
+mv \"$REMOTE_NEW\" \"$REMOTE_BINARY\"
+chown root:wheel \"$REMOTE_BINARY\"
+chmod 0755 \"$REMOTE_BINARY\"
+sha256sum \"$REMOTE_BINARY\" > \"$REMOTE_SHA\"
+'"
+    echo "==> Staged validated MacWSWindowing for the next package build; SpringBoard unchanged"
+    exit 0
+fi
+
 # sudo is intentionally interactive unless the caller has configured a sudo
 # credential helper. No password is stored in this repository.
 ssh -t "$DEVICE_SSH" "sudo sh -c '
@@ -55,7 +71,7 @@ chown root:wheel \"\$tmp\"
 chmod 0755 \"\$tmp\"
 mv \"\$tmp\" \"$INSTALLED\"
 rm -f /var/mobile/.eksafemode
-rm -f /var/mobile/Library/Preferences/com.macwsguide.dense-grid.loaded
+rm -f /tmp/com.macwsguide.dense-grid.loaded
 killall SpringBoard
 '"
 

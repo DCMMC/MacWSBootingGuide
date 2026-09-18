@@ -46,6 +46,45 @@ class ProductionDefaults(unittest.TestCase):
             audit.load_manifest(), audit.production_plists()))
         self.assertIn(ROOT / 'misc/com.macwsguide.vscode.plist', audit.production_plists())
 
+    def test_boot_local_switches_do_not_use_persistent_preferences(self):
+        sources = {
+            'MacWSWindowing/Tweak.x': (
+                '/tmp/com.macwsguide.dense-grid.disabled',
+                '/tmp/com.macwsguide.dense-grid.loaded',
+            ),
+            'MacWSHost/main.m': (
+                '/tmp/com.macwsguide.dense-grid.loaded',
+                '/tmp/iosclear_run',
+            ),
+            'MTLCompilerBypassOSCheck/Tweak.x': (
+                '/tmp/macws_mtlcompiler_diagnostics',
+                '/tmp/macws_mtlcompiler_hold',
+            ),
+        }
+        persistent_prefixes = (
+            '/var/mobile/Library/Preferences/com.macwsguide.dense-grid.',
+            '/var/jb/var/mobile/macws_mtlcompiler_',
+            '/var/mobile/macws_mtlcompiler_',
+            '/var/mobile/iosclear_',
+        )
+        for relative, required in sources.items():
+            with self.subTest(source=relative):
+                text = (ROOT / relative).read_text()
+                for path in required:
+                    self.assertIn(path, text)
+                for prefix in persistent_prefixes:
+                    self.assertNotIn(prefix, text)
+
+    def test_no_persistent_autosignd_or_layout_test_flags(self):
+        for path in ('layout/usr/macOS/bin/restart_autosignd.sh',
+                     'misc/run_type82_layout_test.sh'):
+            source = (ROOT / path).read_text()
+            with self.subTest(path=path):
+                self.assertNotIn('/var/jb/var/mobile/.macws-autosignd-restart.lock',
+                                 source)
+                self.assertNotIn('/var/jb/var/mobile/macws_type82_test_start',
+                                 source)
+
     def test_off_switch_is_rejected_even_when_set_to_zero(self):
         manifest = {('env', 'MACWS_HOST_DIAGNOSTICS'): ('off', 'test', 'test')}
         with tempfile.TemporaryDirectory() as directory:

@@ -13,6 +13,7 @@
 #import <objc/message.h>
 #import <objc/runtime.h>
 #import <mach-o/dyld.h>
+#import <mach-o/getsect.h>
 #import <mach-o/loader.h>
 #import <mach/task_info.h>
 #import <ptrauth.h>
@@ -20984,34 +20985,14 @@ static id macws_new_dag_library_compat(id self, SEL selector, NSString *dag,
 
 static void macws_install_qc_desktop_function_compatibility(void) {
     if (!getenv("MACWS_AGX_NATIVE")) return;
-    const char *program = getprogname();
-    BOOL is_window_server =
-        program && strcmp(program, "WindowServer") == 0;
-    const char *stray_compat = getenv("MACWS_STRAY_AGX_COMPAT");
-    BOOL is_stray = program &&
-        strcmp(program, "Stray-Mac-Shipping") == 0 && stray_compat &&
-        stray_compat[0] != '\0' && strcmp(stray_compat, "0") != 0;
-    // Host launch admission selects native Metal for the verified Geekbench
-    // bundle. Keep this additional process gate exact; every shader still
-    // requires the manifest's complete source/hash/function identity.
-    BOOL is_geekbench = NO;
-    if (program && (strcmp(program, "Geekbench 6") == 0 ||
-                    strcmp(program, "geekbench_aarch64") == 0 ||
-                    strcmp(program, "geekbench6") == 0)) {
-        char executable[PATH_MAX] = {0};
-        is_geekbench = proc_pidpath(getpid(), executable, sizeof(executable)) > 0 &&
-            (strcmp(executable, "/Applications/Geekbench 6.app/Contents/MacOS/Geekbench 6") == 0 ||
-             strcmp(executable, "/Applications/Geekbench 6.app/Contents/Resources/geekbench_aarch64") == 0 ||
-             strcmp(executable, "/Applications/Geekbench 6.app/Contents/Resources/geekbench6") == 0);
-    }
-    // The Steam launcher injects MACWS_STRAY_AGX_COMPAT only into the exact
-    // Stray child.  Its MetalFX default.metallib now has a complete verified
-    // route and the paired native/chroot submission A/B completes status=4,
-    // error=nil.  Admit that production child here; every actual library and
-    // function replacement remains constrained by the route manifest's
-    // source path, byte length, hash and full function inventory below.
-    if (!is_window_server && !is_stray && !is_geekbench &&
-        !getenv("MACWS_METAL2METAL_NON_WS_DIAGNOSTIC")) return;
+    // Runtime-confirmed with Word pid 36291: the old process allowlist left
+    // its QuartzCore fixed_* functions on macOS-target AIR.  Opening a blank
+    // document then aborted in create_fragment_shader.  The same binary,
+    // AGX device and document remained live and rendered text when the
+    // complete-manifest router was installed via the diagnostic gate.  All
+    // native-AGX GUI clients need that shared compiler-target invariant; the
+    // actual substitution below remains constrained by source path, byte
+    // identity and the complete function/constant manifest.
     Class library_class = objc_getClass("_MTLLibrary");
     if (!library_class) return;
     struct {
@@ -21567,6 +21548,40 @@ static void macws_install_iogpu_primary_buffer_init_diag(void) {
         (void *)g_macws_iogpu_primary_buffer_init_orig);
 }
 
+// objc_copyClassList realizes every Swift-backed class in the process. Word's
+// OfficeArt SimpleTextCoordinator faults at PC=0 during that unrelated class
+// realization while Metal is loading AGXMetal13_3 (runtime crash pid 33835,
+// install_agx_init_redirect+0x1a4c). All three users below only inspect AGX
+// driver classes, so read the driver's own classlist without asking libobjc
+// to realize the application's entire class graph.
+static Class *macws_copy_agx_driver_classes(unsigned int *count) {
+    if (count) *count = 0;
+    for (uint32_t image = 0, images = _dyld_image_count(); image < images;
+         image++) {
+        const char *name = _dyld_get_image_name(image);
+        if (!name || !strstr(name, "/AGXMetal13_3.bundle/")) continue;
+        const struct mach_header *header = _dyld_get_image_header(image);
+        if (!header) continue;
+        unsigned long bytes = 0;
+        uint64_t *entries = (uint64_t *)getsectiondata(
+            (const struct mach_header_64 *)header,
+            "__DATA_CONST", "__objc_classlist", &bytes);
+        if (!entries) entries = (uint64_t *)getsectiondata(
+            (const struct mach_header_64 *)header,
+            "__DATA", "__objc_classlist", &bytes);
+        if (!entries || bytes == 0 || bytes % sizeof(uint64_t) != 0 ||
+            bytes > 4096 * sizeof(uint64_t)) return NULL;
+        unsigned int size = (unsigned int)(bytes / sizeof(uint64_t));
+        Class *classes = calloc(size, sizeof(*classes));
+        if (!classes) return NULL;
+        for (unsigned int i = 0; i < size; i++)
+            classes[i] = (Class)entries[i];
+        if (count) *count = size;
+        return classes;
+    }
+    return NULL;
+}
+
 static void install_agx_init_redirect(Class agx) {
     install_agx_initimpl_hook();  // install diag hook on texture class
     install_iogpu_init_hook();    // install diag hook on IOGPUMetalTexture super-init
@@ -21629,7 +21644,7 @@ static void install_agx_init_redirect(Class agx) {
             return supported;
         });
         unsigned int n = 0;
-        Class *all = objc_copyClassList(&n);
+        Class *all = macws_copy_agx_driver_classes(&n);
         int wrapped = 0;
         for (unsigned int i = 0; i < n; i++) {
             Class c = all[i];
@@ -21737,7 +21752,7 @@ static void install_agx_init_redirect(Class agx) {
         });
         // Walk subclasses + agx; for each that has the method, save orig + replace
         unsigned int nc = 0;
-        Class *all = objc_copyClassList(&nc);
+        Class *all = macws_copy_agx_driver_classes(&nc);
         int wrapped = 0;
         for (unsigned int i = 0; i < nc; i++) {
             Class c = all[i];
@@ -21784,7 +21799,7 @@ static void install_agx_init_redirect(Class agx) {
     // placeholder — there's no real environment map to sample).
     {
         unsigned int nc = 0;
-        Class *all = objc_copyClassList(&nc);
+        Class *all = macws_copy_agx_driver_classes(&nc);
         for (unsigned int side = 0; side < 2; side++) {
             const char *sel_name = side == 0
                 ? "setFragmentTexture:atIndex:"

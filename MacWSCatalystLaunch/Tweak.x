@@ -174,7 +174,7 @@ static BOOL MacWSPrepareSettingsExtensionOverlay(
 
 static void MacWSPublishRunningBoardBridgeReadiness(void) {
     static const char marker[] =
-        "/var/jb/var/mobile/macws-runningboard-settings-bridge.ready";
+        "/tmp/macws-runningboard-settings-bridge.ready";
     char temporary[PATH_MAX];
     int length = snprintf(temporary, sizeof(temporary), "%s.new-%d", marker,
                           getpid());

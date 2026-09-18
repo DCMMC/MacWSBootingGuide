@@ -63,8 +63,8 @@ install_sublime_software_renderer_default() {
 
 # A package install may replace libmachook or an ExtensionKit carrier.  Force
 # the next launch through the deep verifier before allowing the boot cache.
-rm -f /var/jb/var/mobile/macws-settings-runtime.boot-ready \
-      /var/jb/var/mobile/macws-base-trust.boot-ready
+rm -f /tmp/macws-settings-runtime.boot-ready \
+      /tmp/macws-base-trust.boot-ready
 # Third-party /Applications CodeDirectories are not package payloads. Keep the
 # same-boot trust marker: postinst already registers every signature it does
 # mutate, while deleting this unrelated marker forced the next routine service
@@ -794,7 +794,7 @@ fi
 # (not backboardd/full userspace) when the published PID/version/capability is
 # stale, then require the new observer witness. This is the package-time half
 # of the same self-healing contract enforced by macos_gui.sh at user startup.
-windowing_witness=/var/mobile/Library/Preferences/com.macwsguide.dense-grid.loaded
+windowing_witness=/tmp/com.macwsguide.dense-grid.loaded
 springboard_pid() {
     ps ax -o pid=,command= 2>/dev/null | awk \
         '$2 == "/System/Library/CoreServices/SpringBoard.app/SpringBoard" { print $1; exit }'
@@ -811,8 +811,8 @@ windowing_ready() {
     esac
     [ "$witness_version" -ge 29 ] && grep -Fq \
         'fullscreen=exact-scene-activate-then-maximization-toggle-action-17' \
-        "$windowing_witness" 2>/dev/null && grep -Fq \
-        'initial=preactivation-generic-app-layout-grid' \
+        "$windowing_witness" 2>/dev/null && grep -Eq \
+        '(^|[[:space:]])initial-size-protocol=1([[:space:]]|$)' \
         "$windowing_witness" 2>/dev/null
 }
 if ! windowing_ready; then

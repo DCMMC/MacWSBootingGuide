@@ -33,9 +33,9 @@
 // transform or validation bypass is involved.
 
 static const char *const MacWSDenseGridDisabled =
-    "/var/mobile/Library/Preferences/com.macwsguide.dense-grid.disabled";
+    "/tmp/com.macwsguide.dense-grid.disabled";
 static const char *const MacWSDenseGridLoaded =
-    "/var/mobile/Library/Preferences/com.macwsguide.dense-grid.loaded";
+    "/tmp/com.macwsguide.dense-grid.loaded";
 static CFStringRef const MacWSRequestFullscreenNotification =
     CFSTR("com.macwsguide.windowing.request-fullscreen");
 static CFStringRef const MacWSRequestResizeNotification =
@@ -45,7 +45,7 @@ static CFStringRef const MacWSRequestInitialSizeNotification =
 static const char *const MacWSWindowingLog =
     "/var/mobile/Library/Logs/MacWSWindowing.log";
 static NSString *const MacWSResizeRequestDirectory =
-    @"/var/mobile/Library/Preferences";
+    @"/tmp";
 static NSString *const MacWSFullscreenRequestPrefix =
     @"com.macwsguide.windowing.fullscreen-request.";
 static NSString *const MacWSResizeRequestPrefix =
@@ -1796,7 +1796,7 @@ static void MacWSWriteDenseGridWitness(const char *axis, NSUInteger original,
     if (!MacWSWindowingDiagnosticsEnabled()) return;
     char path[PATH_MAX] = {0};
     snprintf(path, sizeof(path),
-             "/var/mobile/Library/Preferences/com.macwsguide.dense-grid.%s",
+             "/tmp/com.macwsguide.dense-grid.%s",
              axis);
     int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
     if (fd < 0) return;

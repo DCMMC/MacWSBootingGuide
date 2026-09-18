@@ -102,7 +102,7 @@ static NSMutableDictionary<NSString *, NSNumber *> *MacWSClosingWindowIdentities
 static NSString *const MacWSSceneBindingsDefaultsKey =
     @"MacWSPersistedSceneWindowBindings";
 static NSString *const MacWSWindowingLoadedPath =
-    @"/var/mobile/Library/Preferences/com.macwsguide.dense-grid.loaded";
+    @"/tmp/com.macwsguide.dense-grid.loaded";
 static CFStringRef const MacWSRequestFullscreenNotification =
     CFSTR("com.macwsguide.windowing.request-fullscreen");
 static CFStringRef const MacWSRequestResizeNotification =
@@ -110,7 +110,7 @@ static CFStringRef const MacWSRequestResizeNotification =
 static CFStringRef const MacWSRequestInitialSizeNotification =
     CFSTR("com.macwsguide.windowing.request-initial-size");
 static NSString *const MacWSResizeRequestDirectory =
-    @"/var/mobile/Library/Preferences";
+    @"/tmp";
 static NSString *const MacWSFullscreenRequestPrefix =
     @"com.macwsguide.windowing.fullscreen-request.";
 static NSString *const MacWSResizeRequestPrefix =
@@ -8476,7 +8476,7 @@ extern void MacWSRunIOSClearReference(void);
     // lets the established, FrontBoard-launched host provide the foreground
     // GPU context needed for a trustworthy iOS command-ABI capture without
     // changing normal host startup or its scene lifecycle.
-    if (access("/var/mobile/iosclear_run", F_OK) == 0) {
+    if (access("/tmp/iosclear_run", F_OK) == 0) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC),
                        dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
             MacWSLog(@"IOSCLEAR reference requested by sentinel");

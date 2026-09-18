@@ -68,7 +68,7 @@ static const char *const kStartupLogPath =
 static const char *const kDesktopRepairLogPath =
     "/var/mobile/Library/Logs/MacWSDesktopRepair.log";
 static const char *const kGUIStartState =
-    "/var/jb/var/mobile/macos_gui_start.state";
+    "/tmp/macos_gui_start.state";
 static const char *const kPostinstLog = "/var/jb/var/mobile/postinst.log";
 static const char *const kRootFS = "/var/mnt/rootfs";
 static const char *const kMacWSHostExecutable =
@@ -87,7 +87,7 @@ static const char *const kSettingsExtensionsRuntime =
 static const char *const kSettingsExtensionsRuntimeLog =
     "/var/jb/var/mobile/settings-extensions-runtime.log";
 static const char *const kRunningBoardSettingsBridgeMarker =
-    "/var/jb/var/mobile/macws-runningboard-settings-bridge.ready";
+    "/tmp/macws-runningboard-settings-bridge.ready";
 static const char *const kFrame = "/var/mnt/rootfs/private/tmp/macws_vnc_fb";
 static const char *const kInputSocket = "/var/mnt/rootfs/private/tmp/macws_host_input.sock";
 static const char *const kVNCPointerProxySocket =
@@ -98,7 +98,7 @@ static const char *const kCaptureAck = "/var/mnt/rootfs/tmp/macws_capture_done";
 static const char *const kExperimentalKCmd = "/var/mnt/rootfs/private/tmp/macws_kcmd_fix";
 static const char *const kExperimentalCompletion = "/var/mnt/rootfs/private/tmp/macws_cancel_completion";
 static const char *const kWindowServerLog = "/var/jb/var/mobile/WindowServer.err";
-static const char *const kSafetyTrip = "/var/jb/var/mobile/macws_safety_trip";
+static const char *const kSafetyTrip = "/tmp/macws_safety_trip";
 static const char *const kWindowServerLabel =
     "UIKitApplication:com.macwsguide.windowserver";
 static const char *const kInputLabel =
@@ -112,7 +112,7 @@ static const char *const kVSCodePlist =
     "/var/jb/usr/macOS/gui-launchd/com.macwsguide.vscode.plist";
 static const char *const kVSCodeLog = "/var/jb/var/mobile/vscode.log";
 static const char *const kVSCodeHealthMarker =
-    "/var/jb/var/mobile/vscode-health-marker";
+    "/tmp/vscode-health-marker";
 static const char *const kCoreAudioLabel = "com.apple.audio.coreaudiod";
 static const char *const kCoreAudioPlist =
     "/var/jb/usr/macOS/gui-launchd/com.macwsguide.coreaudiod.plist";
@@ -143,7 +143,7 @@ static const char *const kUIKitSystemExecutable =
 static const char *const kMapsExecutable =
     "/System/Applications/Maps.app/Contents/MacOS/Maps";
 static const char *const kMapsHostCarrierMarker =
-    "/var/jb/var/mobile/macws-maps-host-carrier.pid";
+    "/tmp/macws-maps-host-carrier.pid";
 static const char *const kWeatherExecutable =
     "/System/Applications/Weather.app/Contents/MacOS/Weather";
 static const char *const kWeatherBundleIdentifier = "com.apple.weather";
@@ -174,7 +174,7 @@ static const char *const kAsphaltBundleIdentifier =
 static const char *const kAsphaltContainerHome =
     "/Users/mobile/Library/Containers/com.gameloft.asphalt9mac/Data";
 static const char *const kCatalystRequestPath =
-    "/var/jb/var/mobile/macws-catalyst-launch-request.plist";
+    "/tmp/macws-catalyst-launch-request.plist";
 static const char *const kSteamLabel =
     "UIKitApplication:com.macwsguide.steam";
 static const char *const kSteamPlist =
@@ -3493,16 +3493,11 @@ static BOOL RootApplicationRequiresNativeMetal(NSString *rootPath) {
     NSString *plistPath = [[@(kRootFS) stringByAppendingString:contents]
         stringByAppendingPathComponent:@"Info.plist"];
     NSDictionary *info = [NSDictionary dictionaryWithContentsOfFile:plistPath];
-    // Runtime-confirmed 2026-09-13: official Geekbench 6.7.1's GPU-name
-    // query throws fmt::format_error without an actual Metal device. The
-    // existing native AGX launch contract completes sysinfo and the full CPU
-    // benchmark. Supply that contract, not a fake device/name or a patched
-    // benchmark. Other applications keep their validated rendering profiles.
-    BOOL native = [info[@"CFBundleIdentifier"] isEqual:@"com.primatelabs.Geekbench6"];
-    if (native)
-        HostLog(@"launch-metal-profile executable=%@ bundle=%@ native=YES",
-                rootPath, info[@"CFBundleIdentifier"]);
-    return native;
+    // The native device is a GUI-app launch contract, not a Geekbench-only
+    // workaround. Word's mso40ui calls MTLCreateSystemDefaultDevice too; the
+    // CPU profile returns nil there. Keep this boundary to real app bundles
+    // with their own Info.plist, excluding arbitrary CLI tools and services.
+    return [info isKindOfClass:[NSDictionary class]] && info.count != 0;
 }
 
 static BOOL LaunchRootExecutable(const char *identifier,
@@ -3637,6 +3632,16 @@ static BOOL LaunchRootExecutable(const char *identifier,
     pid_t pid = 0;
     char **childEnvironment = environ;
     char **ownedEnvironment = NULL;
+    const char *additions[8];
+    size_t additionCount = 0;
+    BOOL nativeAGX = strcmp(identifier, "glassdemo") == 0 ||
+        RootApplicationRequiresNativeMetal(rootPath);
+    if (nativeAGX) {
+        additions[additionCount++] = "MACWS_AGX_NATIVE=1";
+        additions[additionCount++] = "MACWS_AGX_REGISTER_CLASSES=1";
+        additions[additionCount++] = "MACWS_PIN_FALLBACK=1";
+        HostLog(@"launch-metal-profile executable=%@ native=YES", rootPath);
+    }
     if (strcmp(identifier, "terminal") == 0) {
         // Keep the Control Center/Dock launch transaction equivalent to the
         // production Terminal launchd job emitted by macos_gui.sh. Runtime on
@@ -3647,42 +3652,12 @@ static BOOL LaunchRootExecutable(const char *identifier,
         // settle remains explicitly scoped/labeled as a Terminal usability
         // scaffold in AppInputBridge; this branch fixes launch-environment
         // drift rather than introducing another redraw mechanism.
-        static const char *const terminalDisplayEnvironment[] = {
-            "CA_VSYNC_OFF=1",
-            "MACWS_APP_DISPLAY_SETTLE_MS=750",
-        };
-        ownedEnvironment = CopyEnvironmentAdding(
-            terminalDisplayEnvironment,
-            sizeof(terminalDisplayEnvironment) /
-                sizeof(terminalDisplayEnvironment[0]));
-        if (!ownedEnvironment) {
-            posix_spawn_file_actions_destroy(&actions);
-            if (logFD >= 0) close(logFD);
-            *message = @"无法为 Terminal 构造显示提交环境";
-            return NO;
-        }
-        childEnvironment = ownedEnvironment;
-    } else if (strcmp(identifier, "glassdemo") == 0 ||
-               RootApplicationRequiresNativeMetal(rootPath)) {
-        static const char *const nativeAGXEnvironment[] = {
-            "MACWS_AGX_NATIVE=1",
-            "MACWS_AGX_REGISTER_CLASSES=1",
-            "MACWS_PIN_FALLBACK=1",
-            "MACWS_APP_MOUNT_COMPAT=1",
-        };
-        ownedEnvironment = CopyEnvironmentAdding(
-            nativeAGXEnvironment,
-            sizeof(nativeAGXEnvironment) /
-                sizeof(nativeAGXEnvironment[0]));
-        if (!ownedEnvironment) {
-            posix_spawn_file_actions_destroy(&actions);
-            if (logFD >= 0) close(logFD);
-            *message = [NSString stringWithFormat:
-                @"无法为 %s 构造 native AGX 启动环境", identifier];
-            return NO;
-        }
-        childEnvironment = ownedEnvironment;
-    } else if (strcmp(identifier, "activity-monitor") == 0 ||
+        additions[additionCount++] = "CA_VSYNC_OFF=1";
+        additions[additionCount++] = "MACWS_APP_DISPLAY_SETTLE_MS=750";
+    }
+    if (strcmp(identifier, "glassdemo") == 0 ||
+        [rootPath isEqualToString:@(kGeekbenchExecutable)] ||
+        strcmp(identifier, "activity-monitor") == 0 ||
                strcmp(identifier, "finder") == 0 ||
                strcmp(identifier, "custom-path") == 0 ||
                IsThirdPartyAppIdentifier(identifier)) {
@@ -3703,17 +3678,14 @@ static BOOL LaunchRootExecutable(const char *identifier,
         // real RunningBoard launch boundary with it. Finder keeps its own
         // clean-state and browser-window policy; this only supplies the
         // logical-root filesystem contract.
-        static const char *const thirdPartyEnvironment[] = {
-            "MACWS_APP_MOUNT_COMPAT=1",
-        };
-        ownedEnvironment = CopyEnvironmentAdding(
-            thirdPartyEnvironment,
-            sizeof(thirdPartyEnvironment) /
-                sizeof(thirdPartyEnvironment[0]));
+        additions[additionCount++] = "MACWS_APP_MOUNT_COMPAT=1";
+    }
+    if (additionCount) {
+        ownedEnvironment = CopyEnvironmentAdding(additions, additionCount);
         if (!ownedEnvironment) {
             posix_spawn_file_actions_destroy(&actions);
             if (logFD >= 0) close(logFD);
-            *message = @"无法为应用构造 chroot 根卷环境";
+            *message = @"无法为应用构造启动环境";
             return NO;
         }
         childEnvironment = ownedEnvironment;

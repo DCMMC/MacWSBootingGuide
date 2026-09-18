@@ -15,7 +15,7 @@ LLVM_AS=/var/jb/usr/lib/llvm-16/bin/llvm-as
 APPLE_LLVM_DIS=/var/jb/usr/macOS/bin/macws-llvm-dis
 APPLE_LLVM_AS=/var/jb/usr/macOS/bin/macws-llvm-as
 ROUTE_DIR="$ROOTFS/usr/local/share/macws/metal2metal/routes"
-BOOT_READY_MARKER=/var/jb/var/mobile/macws-metal2metal.boot-ready
+BOOT_READY_MARKER=/tmp/macws-metal2metal.boot-ready
 
 # Full manifest verification reads and hashes six source/output metallib
 # pairs and starts Python once per route. That remains the authoritative

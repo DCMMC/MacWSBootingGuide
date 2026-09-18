@@ -4,7 +4,7 @@
 AUTOSIGND=/var/jb/usr/macOS/bin/autosignd
 AUTOSIGND_SOCKET=/var/mnt/rootfs/tmp/autosignd.sock
 AUTOSIGND_LOG=/var/mnt/rootfs/tmp/autosignd.log
-RESTART_LOCK=/var/jb/var/mobile/.macws-autosignd-restart.lock
+RESTART_LOCK=/tmp/.macws-autosignd-restart.lock
 KILLALL=/var/jb/usr/bin/killall
 LDID=/var/jb/usr/bin/ldid
 JBCTL=/var/jb/usr/bin/jbctl

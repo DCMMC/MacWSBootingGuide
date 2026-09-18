@@ -10,8 +10,8 @@ ROOTFS=/var/mnt/rootfs
 
 # Invalidate the same-bootsession Settings ExtensionKit verification cache
 # before an installation can replace any of its signed runtime dependencies.
-rm -f /var/jb/var/mobile/macws-settings-runtime.boot-ready \
-      /var/jb/var/mobile/macws-base-trust.boot-ready
+rm -f /tmp/macws-settings-runtime.boot-ready \
+      /tmp/macws-base-trust.boot-ready
 # The repair mutates project and system-app runtime, not the signed
 # third-party bundles under /Applications. It registers every CodeDirectory it
 # does change below, so invalidating the independent application-trust marker
@@ -1380,9 +1380,7 @@ add_all_trustcache /var/mnt/rootfs/System/Library/CoreServices/SystemUIServer.ap
 add_all_trustcache /var/mnt/rootfs/usr/local/bin/OSXvnc-server
 sign_and_trustcache /var/mnt/rootfs/usr/libexec/pboard
 sign_and_trustcache /var/mnt/rootfs/System/Library/CoreServices/pbs
-if [ -d /var/mnt/rootfs/var/jb ] && [ ! "$(ls -A /var/mnt/rootfs/var/jb)" ]; then
-	/var/jb/usr/local/bin/mount_bindfs /var/jb /var/mnt/rootfs/var/jb
-fi
+bash /var/jb/usr/macOS/bin/ensure_jb_usr_bind.sh || exit 1
 
 # Mount a writable devfs into the chroot /dev. Without it the rootfs /dev has no
 # /dev/ptmx, so pty programs fail: Terminal.app -> forkpty -> open("/dev/ptmx")

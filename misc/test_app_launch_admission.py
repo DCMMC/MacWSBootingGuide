@@ -13,7 +13,7 @@ FUNCTION = SOURCE[START:SOURCE.index('\n}', START) + 2]
 
 
 class AppLaunchAdmission(unittest.TestCase):
-    def test_native_metal_bundle_profile_uses_actual_metadata(self):
+    def test_native_metal_profile_covers_real_app_bundles(self):
         start = SOURCE.index('static BOOL RootApplicationRequiresNativeMetal(')
         function = SOURCE[start:SOURCE.index('\n}', start) + 2]
         with tempfile.TemporaryDirectory() as folder:
@@ -33,7 +33,7 @@ static const char *kRootFS;
 int main(int argc, char **argv) { @autoreleasepool {
     kRootFS = argv[1];
     assert(RootApplicationRequiresNativeMetal(@"/Bench.app/Contents/MacOS/Bench"));
-    assert(!RootApplicationRequiresNativeMetal(@"/Other.app/Contents/MacOS/Other"));
+    assert(RootApplicationRequiresNativeMetal(@"/Other.app/Contents/MacOS/Other"));
     assert(!RootApplicationRequiresNativeMetal(@"/Missing.app/Contents/MacOS/App"));
     assert(!RootApplicationRequiresNativeMetal(@"/Bench.app/Contents/Resources/worker"));
     return 0;

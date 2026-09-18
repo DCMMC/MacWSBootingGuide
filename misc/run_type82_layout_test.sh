@@ -23,7 +23,7 @@ touch "$ROOTFS/private/tmp/macws_vnc_share"
 if [ "${STOP_AFTER_CLEAR:-0}" = 1 ]; then
     touch "$ROOTFS/private/tmp/macws_stop_after_clear"
 fi
-date +%Y-%m-%dT%H:%M:%S%z > /var/jb/var/mobile/macws_type82_test_start
+date +%Y-%m-%dT%H:%M:%S%z > /tmp/macws_type82_test_start
 
 bash /var/jb/usr/macOS/bin/macos_gui.sh \
     start coexist --no-terminal --no-vnc

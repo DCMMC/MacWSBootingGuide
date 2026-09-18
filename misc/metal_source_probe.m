@@ -619,8 +619,65 @@ int main(void) {
                         ? [fragmentLibrary
                             newFunctionWithName:fragmentFunctionName]
                         : nil;
+                // Diagnostic-only specialization: Office's Metal2D shaders
+                // declare a hasStencil function constant. A direct pipeline
+                // build from their unspecialized functions is invalid even
+                // when the library itself loads correctly. Replay the real
+                // public specialization API with zero-valued constants so
+                // this probe can distinguish that contract from an AGX
+                // compiler or render-pipeline failure.
+                if (getenv("MACWS_METAL_PROBE_SPECIALIZE_FUNCTIONS")) {
+                    id<MTLFunction> functions[] = {
+                        replayVertex, replayFragment
+                    };
+                    id<MTLLibrary> libraries[] = {
+                        library, fragmentLibrary
+                    };
+                    NSString *names[] = {
+                        vertexFunctionName, fragmentFunctionName
+                    };
+                    for (NSUInteger index = 0; index < 2; index++) {
+                        if (!functions[index] || !names[index]) continue;
+                        NSDictionary<NSString *, MTLFunctionConstant *>
+                            *constants =
+                                functions[index].functionConstantsDictionary;
+                        if (!constants.count) continue;
+                        MTLFunctionConstantValues *values =
+                            [MTLFunctionConstantValues new];
+                        uint8_t zeroValue[256] = {0};
+                        for (NSString *constantName in constants) {
+                            MTLFunctionConstant *constant =
+                                constants[constantName];
+                            [values setConstantValue:zeroValue
+                                               type:constant.type
+                                           withName:constantName];
+                        }
+                        NSError *specializationError = nil;
+                        functions[index] = [libraries[index]
+                            newFunctionWithName:names[index]
+                                   constantValues:values
+                                            error:&specializationError];
+                        fprintf(stderr,
+                            "METAL_SOURCE_PROBE replaySpecialization "
+                            "name=%s constants=%lu function=%p "
+                            "errorDomain=%s errorCode=%ld description=%s\n",
+                            names[index].UTF8String,
+                            (unsigned long)constants.count,
+                            functions[index],
+                            specializationError
+                                ? specializationError.domain.UTF8String
+                                : "(nil)",
+                            (long)(specializationError
+                                ? specializationError.code : 0),
+                            specializationError
+                                ? specializationError.localizedDescription
+                                    .UTF8String : "(nil)");
+                    }
+                    replayVertex = functions[0];
+                    replayFragment = functions[1];
+                }
                 fprintf(stderr,
-                        "METAL_SOURCE_PROBE replayFunctions vertexLibrary=%p "
+                    "METAL_SOURCE_PROBE replayFunctions vertexLibrary=%p "
                         "fragmentPath=%s fragmentLibrary=%p vertex=%s/%p "
                         "fragment=%s/%p fragmentLibraryErrorDomain=%s "
                         "fragmentLibraryErrorCode=%ld description=%s\n",
