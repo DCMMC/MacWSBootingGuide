@@ -1,6 +1,7 @@
 """Exercise stale cross-build and stale/missing Debian payload rejection."""
 import json
 from pathlib import Path
+import plistlib
 import shutil
 import subprocess
 import tempfile
@@ -61,7 +62,10 @@ class ArtifactContract(unittest.TestCase):
         for name in contract.PACKAGE_PATHS:
             path = staging / name
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_bytes(self.binary.read_bytes() if name == contract.WINDOWING_PATH
+            path.write_bytes(plistlib.dumps({'EnvironmentVariables': {'MACWS_TEST': '1'}},
+                                            fmt=plistlib.FMT_BINARY)
+                             if name.endswith('.plist') else
+                             self.binary.read_bytes() if name == contract.WINDOWING_PATH
                              else name.encode())
         (staging / 'DEBIAN').mkdir()
         (staging / 'DEBIAN/postinst').write_text('true\n')
@@ -114,6 +118,31 @@ class ArtifactContract(unittest.TestCase):
         (staging / 'DEBIAN/postinst').write_text('new-installation-logic\n')
         with self.assertRaisesRegex(ValueError, 'package postinst differs'):
             contract.verify_package(package, staging, self.binary)
+
+    @unittest.skipUnless(shutil.which('dpkg-deb'), 'dpkg-deb required')
+    def test_xml_source_and_binary_staged_plist_are_equivalent(self):
+        package, staging = self.package()
+        for name, source in contract.SOURCE_PAYLOADS.items():
+            path = self.root / source
+            path.parent.mkdir(parents=True, exist_ok=True)
+            data = (staging / name).read_bytes()
+            path.write_bytes(plistlib.dumps(plistlib.loads(data), fmt=plistlib.FMT_XML)
+                             if name.endswith('.plist') else data)
+        contract.verify_package(package, staging, self.binary, self.root)
+
+    @unittest.skipUnless(shutil.which('dpkg-deb'), 'dpkg-deb required')
+    def test_changed_plist_environment_is_rejected(self):
+        package, staging = self.package()
+        for name, source in contract.SOURCE_PAYLOADS.items():
+            path = self.root / source
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes((staging / name).read_bytes())
+        job = self.root / 'misc/com.macwsguide.coreaudiod.plist'
+        value = plistlib.loads(job.read_bytes())
+        value['EnvironmentVariables']['MACWS_TEST'] = '0'
+        job.write_bytes(plistlib.dumps(value))
+        with self.assertRaisesRegex(ValueError, 'staged runtime differs from current source'):
+            contract.verify_package(package, staging, self.binary, self.root)
 
 
 if __name__ == '__main__':

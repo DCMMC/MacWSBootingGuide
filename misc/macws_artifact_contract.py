@@ -10,6 +10,7 @@ import argparse
 import hashlib
 import json
 from pathlib import Path
+import plistlib
 import re
 import subprocess
 import sys
@@ -120,7 +121,15 @@ def verify_package(package: Path, staging: Path, binary: Path,
     expected = {name: sha256(staging / name) for name in PACKAGE_PATHS}
     if root is not None:
         for name, source in SOURCE_PAYLOADS.items():
-            if sha256(staging / name) != sha256(root / source):
+            # Theos converts XML plists to binary during normal staging.
+            # Compare their decoded configuration here; archive-to-staging
+            # below still requires every installed byte to match exactly.
+            if name.endswith('.plist'):
+                same = plistlib.loads((staging / name).read_bytes()) == \
+                    plistlib.loads((root / source).read_bytes())
+            else:
+                same = sha256(staging / name) == sha256(root / source)
+            if not same:
                 raise ValueError(f'staged runtime differs from current source: {source}')
     if expected[WINDOWING_PATH] != sha256(binary):
         raise ValueError('staged MacWSWindowing differs from validated cross-build')
