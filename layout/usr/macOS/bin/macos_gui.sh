@@ -3287,8 +3287,7 @@ production_preflight() {
         for key in MACWS_JIT_MPROTECT_COMPAT \
                    MACWS_JIT_FAULT_WRITE_COMPAT \
                    MACWS_AMFI_IMMOVABLE_TASK_PORT_COMPAT \
-                   MACWS_MACOS_SYSTEM_POLICY_COMPAT \
-                   MACWS_APP_MOUNT_COMPAT; do
+                   MACWS_MACOS_SYSTEM_POLICY_COMPAT; do
             if ! plutil "$VSCODE_PLIST" 2>/dev/null |
                  grep -Eq "\"?$key\"?[[:space:]]*=[[:space:]]*1;"; then
                 log "ERROR: required VS Code production environment $key=1 missing from $VSCODE_PLIST"

@@ -229,3 +229,9 @@ existing Terminal PID 13515 and its three shells were left untouched. These
 checks establish the actual metadata→AppKit/Metal→fork/exec consumer path;
 they do not claim that already running, untouched processes remapped the new
 library, or that unrelated outstanding rendering issues are solved.
+
+The VS Code startup preflight no longer requires the retired
+`MACWS_APP_MOUNT_COMPAT=1` value either. An executable test runs the actual
+shell check block with the remaining required settings but without that
+obsolete opt-in. Namespace identity comes from the launcher/root filesystem,
+not from retaining an ignored compatibility switch to satisfy admission.

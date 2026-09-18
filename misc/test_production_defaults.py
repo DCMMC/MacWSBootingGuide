@@ -2,6 +2,7 @@
 from pathlib import Path
 import os
 import plistlib
+import re
 import shutil
 import subprocess
 import sys
@@ -93,6 +94,25 @@ class ProductionDefaults(unittest.TestCase):
         for source in (route, extension):
             self.assertNotIn('9222', source)
             self.assertNotIn('/json/list', source)
+
+    def test_vscode_preflight_does_not_require_retired_namespace_optin(self):
+        source = (ROOT / 'layout/usr/macOS/bin/macos_gui.sh').read_text()
+        preflight = source.split('production_preflight() {', 1)[1]
+        block = re.search(r'        for key in MACWS_JIT_MPROTECT_COMPAT.*?\n        done',
+                          preflight, re.S).group(0)
+        fixture = '''bad=0
+VSCODE_PLIST=fixture
+log() { printf '%s\\n' "$*"; }
+plutil() {
+    printf '%s\\n' 'MACWS_JIT_MPROTECT_COMPAT = 1;' \\
+        'MACWS_JIT_FAULT_WRITE_COMPAT = 1;' \\
+        'MACWS_AMFI_IMMOVABLE_TASK_PORT_COMPAT = 1;' \\
+        'MACWS_MACOS_SYSTEM_POLICY_COMPAT = 1;'
+}
+'''
+        result = subprocess.run(['bash'], input=fixture + block + '\nexit "$bad"\n',
+                                text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_boot_local_switches_do_not_use_persistent_preferences(self):
         sources = {
