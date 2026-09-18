@@ -13,6 +13,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include "../include/macws_metal_dag_request.h"
+#include "../include/macws_code_pointer.h"
 
 // The rootless iOS 16 Theos SDK used by this project omits xpc/xpc.h.  This
 // is the exact public C ABI needed by the UUID-locked reply observer.
@@ -414,22 +415,28 @@ static uintptr_t StripPAC(const void *p);
 // produced 01 80 / 86 and macOS loaded it without changing its validation.
 // Both the stitcher and its archive writer use this same target constructor.
 // Preserve the 48-byte indirect return ABI and Apple's construction/ownership.
+// Runtime-confirmed 2026-09-19 for native CoreImage AIR13.4 too: an actual
+// 16x16 graph emitted an iOS archive that the macOS loader rejected. A genuine
+// LLVM setTriple to macOS fixed archive admission but iOS AGX then rejected
+// the pipeline with "Target OS is incompatible." The real Catalyst factory
+// satisfies BOTH consumers. Translate only a wholly consistent, validated
+// MacWS DAG request; never patch archive bytes or suppress either validation.
 typedef struct { uint64_t storage[6]; } MacWSTripleABI;
 typedef MacWSTripleABI (*MacWSDefaultTripleFn)(uint64_t);
 static MacWSDefaultTripleFn gOriginalDefaultTriple = NULL;
-static _Thread_local bool gMacWSCatalystDAGRequest = false;
+static _Thread_local MacWSMetalDAGInputTarget gMacWSDAGInputTarget = MacWSMetalDAGInputUnknown;
 static bool gCatalystDAGTargetAttempted = false;
 static bool gCatalystDAGTargetReady = false;
 
 static MacWSTripleABI MacWSDefaultTripleForRequest(uint64_t optionalPlatform) {
-    if (gMacWSCatalystDAGRequest && optionalPlatform == 0)
+    if (gMacWSDAGInputTarget != MacWSMetalDAGInputUnknown && optionalPlatform == 0)
         optionalPlatform = (UINT64_C(1) << 32) | 6;
     return gOriginalDefaultTriple(optionalPlatform);
 }
 
 // Called lazily under the existing compiler-request write lock, exclusively
-// after a well-formed Catalyst DAG. No stock iOS service installs this hook
-// merely by starting up; non-Catalyst requests retain the original arguments.
+// after a well-formed supported MacWS DAG. No stock iOS service installs this
+// hook merely by starting up; ordinary iOS requests retain original arguments.
 static bool InstallCatalystDAGTargetContext(void) {
     if (gCatalystDAGTargetAttempted) return gCatalystDAGTargetReady;
     gCatalystDAGTargetAttempted = true;
@@ -797,8 +804,9 @@ static uintptr_t MacWSMTLCodeGenServiceBuildRequest(
 
     if (!OrigMTLCodeGenServiceBuildRequest) return (uintptr_t)-1;
 
-    bool catalystDAG = a2 == 14 && MacWSMetalDAGHasCatalystInputs(request, requestSize);
-    if (adapted || catalystDAG)
+    MacWSMetalDAGInputTarget dagInputTarget = a2 == 14
+        ? MacWSMetalDAGGetInputTarget(request, requestSize) : MacWSMetalDAGInputUnknown;
+    if (adapted || dagInputTarget != MacWSMetalDAGInputUnknown)
         pthread_rwlock_wrlock(&gMetalBuildRequestLock);
     else
         pthread_rwlock_rdlock(&gMetalBuildRequestLock);
@@ -813,13 +821,15 @@ static uintptr_t MacWSMTLCodeGenServiceBuildRequest(
     }
     atomic_store_explicit(&gMacWSMetalBuildRequestActive, needsCacheAdapter,
                           memory_order_release);
-    bool previousDAGContext = gMacWSCatalystDAGRequest;
-    gMacWSCatalystDAGRequest = catalystDAG && InstallCatalystDAGTargetContext();
-    if (diagnostics && catalystDAG)
-        MTLPatchLog("Catalyst DAG request target-context=%d size=%zu", gMacWSCatalystDAGRequest, requestSize);
+    MacWSMetalDAGInputTarget previousDAGContext = gMacWSDAGInputTarget;
+    gMacWSDAGInputTarget = dagInputTarget && InstallCatalystDAGTargetContext()
+        ? dagInputTarget : MacWSMetalDAGInputUnknown;
+    if (diagnostics && dagInputTarget)
+        MTLPatchLog("MacWS DAG request input-target=%u catalyst-context=%d size=%zu",
+            dagInputTarget, gMacWSDAGInputTarget != MacWSMetalDAGInputUnknown, requestSize);
     uintptr_t result = OrigMTLCodeGenServiceBuildRequest(
         a0, a1, a2, request, requestSize, a5);
-    gMacWSCatalystDAGRequest = previousDAGContext;
+    gMacWSDAGInputTarget = previousDAGContext;
     atomic_store_explicit(&gMacWSMetalBuildRequestActive, false,
                           memory_order_release);
     pthread_rwlock_unlock(&gMetalBuildRequestLock);
@@ -881,6 +891,13 @@ static void InstallMacOSMetalTargetAdapter(void) {
     }
 
     uintptr_t target = StripPAC((const void *)MacWSMTLCodeGenServiceBuildRequest);
+    // Validate the exact entry, not merely an address within BL range.
+    if (*(const uint32_t *)target != 0xd503237fu) {
+        MTLPatchLog("target adapter: wrapper entry validation failed target=%#lx insn=%#x",
+                    (unsigned long)target, *(const uint32_t *)target);
+        OrigMTLCodeGenServiceBuildRequest = NULL;
+        return;
+    }
     uint32_t branches[sizeof(callSites) / sizeof(callSites[0])] = {0};
     for (size_t i = 0; i < sizeof(callSites) / sizeof(callSites[0]); i++) {
         uint32_t *callSite =
@@ -920,24 +937,9 @@ static void InstallMacOSMetalTargetAdapter(void) {
         uint32_t *replyDataSite = (uint32_t *)((uintptr_t)mh + 0x2770);
         const uint32_t expectedReplyCall = 0x9400047c; // bl _xpc_data_create stub
         uintptr_t replyTarget = StripPAC((const void *)MacWSCompilerReplyDataCreate);
-        // The actual arm64e image produced by the on-device linker on
-        // 2026-08-01 encoded this one local function reference four bytes
-        // before its real entry: the pointer resolved to the preceding
-        // PatchInstruction tail branch while the next instruction was the
-        // reply wrapper's PACIBSP prologue.  Runtime crash report
-        // MTLCompilerService-2026-08-01-125558.ips then showed the patched
-        // call returning vm_protect's integer 0x10000003 as an XPC object and
-        // faulting in xpc_release.  Resolve only this diagnostic target by
-        // validating the exact function-entry instruction; never branch to a
-        // guessed address.
+        // Architectural stripping preserves the exact four-byte-aligned
+        // entry; never compensate by searching neighboring instructions.
         const uint32_t kPacibsp = 0xd503237fu;
-        if (*(const uint32_t *)replyTarget != kPacibsp &&
-            *(const uint32_t *)(replyTarget + 4) == kPacibsp) {
-            MTLPatchLog("compiler reply observer corrected arm64e local entry %#lx -> %#lx",
-                        (unsigned long)replyTarget,
-                        (unsigned long)(replyTarget + 4));
-            replyTarget += 4;
-        }
         intptr_t replyDelta = (intptr_t)replyTarget - (intptr_t)replyDataSite;
         if (*(const uint32_t *)replyTarget != kPacibsp ||
             *replyDataSite != expectedReplyCall || (replyDelta & 3) != 0 ||
@@ -958,28 +960,14 @@ static void InstallMacOSMetalTargetAdapter(void) {
     }
 }
 
-// Strip arm64e PAC bits from a pointer. dlsym/MSFindSymbol on arm64e
-// returns PAC-signed pointers for code symbols; doing pointer arithmetic
-// on them carries the PAC bits into the result and the dereference faults.
-//
-// iOS arm64e user space is a 47-bit VA (T0SZ=17), so the PAC tag begins at
-// bit 47 — the low 47 bits (0..46) are the real address, bits 47..63 hold
-// the tag. The PREVIOUS mask 0x0000FFFFFFFFFFFF kept the low *48* bits,
-// which leaves bit 47 in place. PAC tags are per-process random, so bit 47
-// is set ~50% of the time; when set, the "stripped" anchor lands at a bogus
-// out-of-__TEXT address (e.g. 0x8001d1669514 instead of 0x1d1669514) and
-// the bounds-checked BL scan in FindRenamerBLSite skips every probe →
-// "no ADD+BL pair found" → renamer patch never applies → the
-// agx.air.fract.v3f16.fast abort fires.
-//
-// RE-confirmed via /var/jb/var/mobile/mtl_compiler_patch.log (2026-06-20):
-// EVERY anchor with bit47 set ("stripped=0x8001d1669514") FAILED the scan;
-// EVERY bit47-clear anchor ("stripped=0x1ed3dd514") found the BL and NOPed
-// OK — a 61/63 OK/FAIL coin-flip that exactly tracks bit 47. Masking the
-// low 47 bits removes the tag for both cases (real user addresses never set
-// bit 47, so this can't clobber a legitimate address).
+// All callers pass code symbols, including dlsym/MSFindSymbol results.
+// Runtime MTLCompilerService-2026-09-19-052757.ips and arm64e disassembly
+// prove the former integer mask became `and ..., #0x7ffffffffff8`, rounding
+// wrapper entry 0x4724 down to the preceding __stack_chk_fail at 0x4720.
+// XPACI preserves every address bit; it also removes PAC bit47 without
+// depending on an assumed virtual-address width.
 static uintptr_t StripPAC(const void *p) {
-    return (uintptr_t)p & 0x00007FFFFFFFFFFFull;
+    return MacWSCodeAddress(p);
 }
 
 // Scan a window around (anchor + delta_hint) for the BL site preceded by
