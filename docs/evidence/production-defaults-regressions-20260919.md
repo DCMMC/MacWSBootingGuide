@@ -72,3 +72,84 @@ The isolated notifyd tests on the iPad confirmed both cross-UID directions,
 live process identity lookup, refresh delivery and registration lifetime.
 Final installed-package and visual/audio results are recorded below only after
 they have actually run. A respring is not a full iPad cold-boot test.
+
+## Installed candidate and upgrade migration
+
+The complete on-device package build and archive/source contract passed. The
+user-authorized single respring changed SpringBoard from PID 381 to 78270;
+there was no Safe Mode marker. RunningBoard was separately reloaded from
+PID 382 to 78311 to load its new bridge, with SpringBoard remaining 78270.
+Both actual capability readers returned:
+
+```text
+windowing ready=yes abi=1 pid=78270 capabilities=0x1f
+settings-bridge ready=yes abi=1 pid=78311 capabilities=0x01
+```
+
+Strict startup preflight caught an optional old Chrome job outside the current
+package payload that still forced `MACWS_PIN_FALLBACK=1`. The upgrade migration
+now validates the six exact managed job identities and removes only this
+retired shipped setting, atomically preserving other settings and file
+metadata. Other real diagnostic settings still fail preflight. After the
+script-only correction was rebuilt, package-verified and installed:
+
+```text
+[macos_gui] Migrated retired production environment: /var/jb/Library/LaunchDaemons/com.macwsguide.chrome150.plist (MACWS_PIN_FALLBACK)
+[macos_gui] PRODUCTION-PREFLIGHT: native AGX required; diagnostics/env traces/dump sentinels OFF.
+```
+
+That build/install did not perform another respring. The subsequent application
+trust walk paused at the existing thermal admission check (`fair`, raw 1,
+38.69 C), before WindowServer started. No thermal guard was bypassed; this
+intermediate attempt is not counted as a completed GUI startup.
+
+## Native test-harness admission on iPad
+
+The first broad device run (`/tmp/macws-device-regressions-20260919.log`)
+reported 189 tests, 7 failures, 7 errors and 1 skip. That run is **not a device
+suite pass**. Its host-oriented fixtures compile temporary Mach-O programs and
+libraries, then immediately execute or `dlopen` them without the native
+signing/trustcache step used by the project's device probes.
+
+Three library fixture groups were rejected by the loader, for example:
+
+```text
+OSError: dlopen(/tmp/macws-compute-abi-2vy6q_3u/translator.dylib, 0x0006): tried: '/tmp/macws-compute-abi-2vy6q_3u/translator.dylib' (file system sandbox blocked mmap() of '/private/var/tmp/macws-compute-abi-2vy6q_3u/translator.dylib')
+```
+
+Ten executable fixture invocations ended with SIGKILL 9 rather than an
+assertion failure. Separately, `test_live_service_response_is_accepted`
+assumed `/usr/bin/true`; read-only inspection found no such iOS file, while
+`/var/jb/usr/bin/true` was present. No historical kernel signature log was
+available for those individual failed invocations, so SIGKILL alone was not
+treated as proof of their cause.
+
+A bounded admission A/B then compiled the existing, unchanged
+`misc/macws_protocol_test.c` directly on the iPad:
+
+```text
+source SHA-256: 5e3ef559ab3911fda4a3327f5112353f6fdede81f848269cad78a69951b6b732
+artifact: /tmp/macws-native-test-ab.irD2DA/protocol-test
+initial CodeDirectory flags=0x20002(adhoc,linker-signed)
+initial CDHash=3df6d12be915de515766f53ceb54e1ce00228035
+/var/jb/usr/bin/bash: line 1: 84227 Killed: 9               /tmp/macws-native-test-ab.irD2DA/protocol-test
+unadmitted_exit=137
+```
+
+That exact artifact was signed with the installed project entitlements and its
+new CDHash admitted through `jbctl trustcache add`. No source, assertion or
+compiled instruction was changed. The SHA-256 of its `otool -s __TEXT __text`
+dump was identical before and after signing:
+
+```text
+fbdf32ca9cebb2f180ad48e4c012e0846d7489556d4b0f8016d489b9709021f4
+admitted CDHash=f9d28068ed5a042f35f4cf9cc62738de551c27fe
+macws protocol validators: PASS
+admitted_exit=0
+```
+
+This runtime A/B confirms the missing admission step can produce the observed
+SIGKILL in a pure protocol harness and that the admitted protocol tests pass on
+the actual iPad. It does not retroactively pass every failed executable or
+library fixture. Those remaining host harnesses were not rerun on the device;
+native application, geometry and audio acceptance remain separate checks.

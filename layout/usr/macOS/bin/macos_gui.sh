@@ -3166,11 +3166,85 @@ except (OSError, ValueError, plistlib.InvalidFileException) as error:
 MACWS_JOB_MIGRATION
 }
 
+retire_legacy_vscode_job() {
+    # Before gui-launchd was introduced, this exact optional job lived in the
+    # jailbreak's boot-autoload directory. Keep its bytes recoverable, but do
+    # not let it race the current generated production profile after reboot.
+    /var/jb/usr/bin/python3 - \
+        /var/jb/Library/LaunchDaemons/com.macwsguide.vscode.plist \
+        "$VSCODE_PLIST" /var/jb/usr/macOS/retired-launch-jobs \
+        "$CHROOTEXEC" "$ROOTFS" <<'MACWS_LEGACY_JOB_RETIREMENT'
+import hashlib
+import os
+import plistlib
+import re
+import stat
+import sys
+
+legacy, active, quarantine, chrootexec, rootfs = sys.argv[1:]
+try:
+    if not os.path.lexists(legacy):
+        sys.exit(0)
+    metadata = os.lstat(legacy)
+    if (os.path.basename(legacy) != 'com.macwsguide.vscode.plist' or
+            os.path.realpath(legacy) == os.path.realpath(active) or
+            not stat.S_ISREG(metadata.st_mode) or metadata.st_size > 65536):
+        raise ValueError('legacy job is not the bounded regular old VS Code file')
+    with open(legacy, 'rb') as stream:
+        original = stream.read(65537)
+    if len(original) > 65536:
+        raise ValueError('legacy job exceeds the identity-parser bound')
+    # An old source comment contained "--no-concurrent-*", which is illegal
+    # XML. Strip comments only for identity verification; NEVER install the
+    # parsed/repaired document or change the quarantined original bytes.
+    identity_document = re.sub(br'<!--[\s\S]*?-->', b'', original)
+    job = plistlib.loads(identity_document)
+    arguments = job.get('ProgramArguments') if isinstance(job, dict) else None
+    if (not isinstance(job, dict) or
+            job.get('Label') not in ('com.macwsguide.vscode',
+                                     'UIKitApplication:com.macwsguide.vscode') or
+            not isinstance(arguments, list) or len(arguments) < 5 or
+            not all(isinstance(value, str) for value in arguments) or
+            arguments[:5] != [chrootexec, '0', '0', rootfs,
+                '/Applications/Visual Studio Code.app/Contents/MacOS/Electron']):
+        raise ValueError('unrecognized legacy VS Code launch identity; keeping original')
+    # Refuse a symlink quarantine or an unexpected concurrent replacement.
+    if os.path.lexists(quarantine):
+        if not stat.S_ISDIR(os.lstat(quarantine).st_mode):
+            raise ValueError('quarantine must be a real directory')
+    else:
+        os.mkdir(quarantine, 0o700)
+    latest = os.lstat(legacy)
+    if (latest.st_dev, latest.st_ino, latest.st_size, latest.st_mtime_ns) != (
+            metadata.st_dev, metadata.st_ino, metadata.st_size, metadata.st_mtime_ns):
+        raise ValueError('legacy job changed during identity verification')
+    destination = os.path.join(quarantine, 'com.macwsguide.vscode.' +
+                               hashlib.sha256(original).hexdigest() + '.plist.disabled')
+    if os.path.lexists(destination):
+        if not stat.S_ISREG(os.lstat(destination).st_mode):
+            raise ValueError('existing quarantine copy is not a regular file')
+        with open(destination, 'rb') as stream:
+            if stream.read(65537) != original:
+                raise ValueError('existing quarantine copy differs; keeping original')
+    else:
+        # Both paths live on the same jailbreak volume. link+unlink is
+        # no-clobber and preserves owner/mode/xattrs with an original inode
+        # always present; a failed link leaves the autoload file untouched.
+        os.link(legacy, destination)
+    os.unlink(legacy)
+    print('[macos_gui] Retired legacy VS Code autoload job; recoverable at ' + destination)
+except Exception as error:
+    print('[macos_gui] ERROR: legacy VS Code retirement: ' + str(error), file=sys.stderr)
+    sys.exit(1)
+MACWS_LEGACY_JOB_RETIREMENT
+}
+
 production_preflight() {
     local path plist key bad=0
     local expected_vscode_profile_dir="$ROOTFS/private/tmp/macws-vscode-profile-agx-native-production1"
     clear_diagnostic_state
     normalize_managed_production_jobs || return 1
+    retire_legacy_vscode_job || return 1
 
     # No production launch job may enable allocator/debug flight recorders via
     # environment.  Functional compatibility variables are documented and
@@ -4524,8 +4598,16 @@ start_macos() {
     done
     # The Adaptive registrar is otherwise dormant until the first renderer;
     # prime its real catalog before Electron performs AudioComponentFindNext.
-    launchctl kickstart "$AUDIO_COMPONENT_REGISTRAR_LABEL" >/dev/null 2>&1 ||
+    # Runtime-confirmed: Dopamine's launchctl load publishes these jobs in
+    # user/501, exposed as user/foreground. A bare label is not a kickstart
+    # service-target and exits 64 before the registrar can serve any client.
+    if ! launchctl kickstart \
+            "user/foreground/$AUDIO_COMPONENT_REGISTRAR_LABEL" \
+            >> "$LOGDIR/macws-audio-component-registrar.log" 2>&1; then
+        log "ERROR: private macOS audio catalog could not be started."
+        tail -n 10 "$LOGDIR/macws-audio-component-registrar.log" 2>/dev/null || true
         return 1
+    fi
     log "TIMING start-macos stage=status-preferences seconds=$((SECONDS - macos_stage_started)) total=$((SECONDS - macos_started))"
     macos_stage_started=$SECONDS
 

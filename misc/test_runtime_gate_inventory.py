@@ -225,6 +225,66 @@ int main(void) {
             self.assertEqual(manifest['env', name][0], 'auto')
             self.assertNotIn(name, forbidden)
 
+    @staticmethod
+    def retire_legacy_vscode(legacy, active, quarantine):
+        script = (ROOT / 'layout/usr/macOS/bin/macos_gui.sh').read_text()
+        body = script.split("<<'MACWS_LEGACY_JOB_RETIREMENT'\n", 1)[1]
+        body = body.split('\nMACWS_LEGACY_JOB_RETIREMENT\n', 1)[0]
+        return subprocess.run([sys.executable, '-', str(legacy), str(active),
+            str(quarantine), '/var/jb/usr/macOS/bin/launchdchrootexec',
+            '/var/mnt/rootfs'], input=body, text=True, capture_output=True)
+
+    def test_legacy_vscode_quarantine_preserves_bad_comment_original_and_active_job(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            legacy = base / 'com.macwsguide.vscode.plist'
+            active = base / 'active.plist'
+            quarantine = base / 'retired-launch-jobs'
+            active.write_bytes((ROOT / 'misc/com.macwsguide.vscode.plist').read_bytes())
+            active_bytes = active.read_bytes()
+            original = active_bytes.replace(b'<dict>',
+                b'<!-- old --no-concurrent-* comment -->\n<dict>', 1)
+            legacy.write_bytes(original)
+            legacy.chmod(0o640)
+            result = self.retire_legacy_vscode(legacy, active, quarantine)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertFalse(legacy.exists())
+            self.assertEqual(active.read_bytes(), active_bytes)
+            retired, = quarantine.iterdir()
+            self.assertTrue(retired.name.endswith('.plist.disabled'))
+            self.assertEqual(retired.read_bytes(), original)
+            self.assertEqual(retired.stat().st_mode & 0o777, 0o640)
+            # Missing legacy file and a reintroduced identical copy are both
+            # idempotent without touching the active job or losing evidence.
+            self.assertEqual(self.retire_legacy_vscode(legacy, active, quarantine).returncode, 0)
+            legacy.write_bytes(original)
+            self.assertEqual(self.retire_legacy_vscode(legacy, active, quarantine).returncode, 0)
+            self.assertEqual(list(quarantine.iterdir()), [retired])
+            self.assertEqual(retired.read_bytes(), original)
+            self.assertEqual(active.read_bytes(), active_bytes)
+
+    def test_legacy_vscode_unknown_malformed_oversized_or_active_identity_is_kept(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            legacy = base / 'com.macwsguide.vscode.plist'
+            active = base / 'active.plist'
+            quarantine = base / 'retired-launch-jobs'
+            job = plistlib.loads((ROOT / 'misc/com.macwsguide.vscode.plist').read_bytes())
+            bad_jobs = [b'not a plist', b'x' * 65537,
+                plistlib.dumps(dict(job, Label='com.apple.finder')),
+                plistlib.dumps(dict(job, ProgramArguments=['/bin/sh', '-c', 'anything']))]
+            for original in bad_jobs:
+                legacy.write_bytes(original)
+                result = self.retire_legacy_vscode(legacy, active, quarantine)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(legacy.read_bytes(), original)
+                self.assertFalse(quarantine.exists())
+            legacy.write_bytes(plistlib.dumps(job))
+            result = self.retire_legacy_vscode(legacy, legacy, quarantine)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertTrue(legacy.exists())
+            self.assertFalse(quarantine.exists())
+
 
 if __name__ == '__main__':
     unittest.main()
