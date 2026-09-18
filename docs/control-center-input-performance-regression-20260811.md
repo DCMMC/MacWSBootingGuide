@@ -158,9 +158,14 @@ python3 misc/macws_release_regression.py \
 
 It checks production native-AGX switches and the main runtime-diagnostics
 sentinel (the production launcher remains the exhaustive debug-state
-preflight), reads the five-minute thermal watchdog, aborts dynamic work only at
-`critical`, runs the 12-app matrix, then executes semantic and 60/120 Hz
-InputLab probes. A
+preflight), parses the installed WindowServer plist and obtains fresh native
+`macwsthermal` telemetry before and after the automated work. An unreadable
+plist is not treated as a default configuration; valid omitted native-AGX keys
+remain enabled. Missing/unknown telemetry fails the evidence gate without
+controlling any application. An observed `critical` state aborts the test;
+the harness never kills, suspends or restarts production processes. Once its
+preflight is valid, it runs the 12-app matrix, then executes semantic and
+60/120 Hz InputLab probes. A
 subset rerun no longer overwrites the full matrix; merge retained per-app
 results with:
 
@@ -170,6 +175,15 @@ python3 misc/control_center_app_regression.py \
   --output /tmp/macws-control-center-regression \
   --summary-only
 ```
+
+The report separates `automated_result` from release acceptance. Successful
+automation produces `automated_result=PASS`, top-level
+`result=RELEASE_ACCEPTANCE_REQUIRED`, `release_accepted=false`, and exit code
+3. Failed or incomplete automation and Critical aborts use exit code 2. The
+existing command-line arguments and output path remain unchanged, but callers
+must not interpret this automated phase as a completed release gate. This tool
+does not emit a top-level release `PASS`; the independent visible-output phase
+and current deployment evidence must still be accepted.
 
 The final physical phase remains necessary because synthetic transport cannot
 measure touch sampling or photon output. On the iPad, perform one 10-second

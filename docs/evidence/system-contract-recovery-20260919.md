@@ -28,7 +28,7 @@ mapped image identity. An installed hash is never a witness for mapped code.
 | Production policy | Missing debug files cannot disable production adapters | Clean-environment tests and real no-env clients | Inventory passes; newly exposed CoreImage path under repair |
 | Input geometry | Activation and mouse-down resolve the same display point | Native drag focus through down/move/up plus iPadOS pixels | Corrected and deployed; two native-path drags pass |
 | Process runtime | Loading Metal must not corrupt later fork/exec | Actual GPU pixels then fork; fresh Terminal tabs | Both slices and canonical production Terminal pass |
-| Shader compilation | Output library platform matches the request's AIR inputs | Real captured request/reply, loader acceptance, nonzero pixels | Native CoreImage request/output mismatch captured; not yet fixed |
+| Shader compilation | Preserve the request semantics while satisfying both macOS library admission and native iOS AGX execution | Real captured request/reply, both consumer checks, expected GPU pixels | Native CoreImage request/output mismatch captured; scoped dual-platform repair under test |
 | Window presentation | App content reaches the authoritative window backing before system transforms | Normal window, occlusion and Mission Control screenshots | Weather thumbnail black report remains open |
 | Document rendering | Annotation/icon pixels exist at their producer and reach the viewer | PDF zoom/paint matrix; affected Finder file types | Open; no blanket GPU disable or placeholder icons |
 | Power | Compare equivalent workload and thermal state | Bounded cumulative CPU/temperature observations | No controlled before/after baseline yet; not declared fixed |
@@ -126,3 +126,30 @@ Control, or disable GPU rendering to make a screenshot superficially pass.
 
 Final release remains pending the open rows above; the earlier audio/window
 acceptance alone must not be labeled whole-system production readiness.
+
+## Acceptance tooling is part of the repair
+
+The previous `macws_release_regression.py` could emit top-level `PASS` while
+its own visible-output gate said `MANUAL_REQUIRED`. A failed installed-plist
+read also looked like omitted, default-on AGX keys. Neither is valid release
+evidence. The harness now separates automated success from release acceptance,
+rejects unreadable/invalid installed policy, and samples current native thermal
+telemetry instead of accepting the last historical watchdog line. Unknown
+telemetry blocks acceptance, not the user's applications. No new process kill,
+suspend, restart or throttle behavior was added.
+
+Eleven executable harness tests cover the failing evidence cases. A successful
+automated run now returns `RELEASE_ACCEPTANCE_REQUIRED` (exit 3), never release
+`PASS`; actual installed/mapped identities and visible behavior remain separate
+required witnesses.
+
+The installed-profile audit also found four historical, unloaded experiment
+jobs in `/var/jb/usr/macOS/gui-launchd`: `glassdemo`, `iconservicesagent.diag`,
+`inputlab`, and `maps`. Their exact labels, chroot executable/arguments and
+diagnostic keys were validated, and both system and user/501 launchd domains
+reported no such service (113). Their original bytes and metadata were retained
+by no-clobber hard-link archival under
+`/var/jb/usr/macOS/retired-launch-jobs/*.plist.<sha256>.disabled` before removing
+only the old launch-directory names. Current generated production jobs and
+application data were not changed. These files were not evidence of active
+tracing or the cause of the user's heat report.
