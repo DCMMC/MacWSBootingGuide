@@ -34,6 +34,15 @@ EXPLICIT_DISABLED_ENVIRONMENT = {
     "SDL_JOYSTICK_IOKIT": "0",
     "SDL_JOYSTICK_MFI": "0",
 }
+# Chromium command-line diagnostics are not environment/file gates, but must
+# obey the same production-off policy. Match exact options before '=' so both
+# '--option=value' and '--option value' forms are checked without guessing at
+# ordinary URLs or filenames. Standalone diagnostic jobs are not shipped here.
+FORBIDDEN_PRODUCTION_ARGUMENTS = {
+    "--remote-debugging-port",
+    "--remote-debugging-pipe",
+    "--remote-allow-origins",
+}
 
 
 def load_manifest() -> dict[tuple[str, str], tuple[str, str, str]]:
@@ -140,6 +149,10 @@ def production_plists() -> list[pathlib.Path]:
     # Also cover optional jobs explicitly copied by after-stage; misc contains
     # diagnostic probes too, so treating every misc plist as shipped is wrong.
     paths = set((ROOT / "layout").rglob("*.plist"))
+    # Chrome is an ordinary optional browser template, even when the package
+    # does not install it automatically. Keep diagnostics out of that profile
+    # as well; standalone benchmark/probe jobs remain outside this set.
+    paths.add(ROOT / "misc/com.macwsguide.chrome150.plist")
     for relative in re.findall(r'misc/[^\s\\]+\.plist',
                                (ROOT / "Makefile").read_text()):
         paths.add(ROOT / relative)
@@ -166,6 +179,25 @@ def production_environment_errors(manifest, paths) -> list[str]:
                 # Reject presence even with value '0': some legacy consumers
                 # still test getenv(name) rather than parsing its value.
                 errors.append(f"production=off environment {name} in {path}")
+    return errors
+
+
+def production_argument_errors(paths) -> list[str]:
+    errors = []
+    for path in paths:
+        try:
+            with path.open("rb") as stream:
+                value = plistlib.load(stream)
+            arguments = value.get("ProgramArguments", [])
+            if (not isinstance(arguments, list) or
+                    any(not isinstance(argument, str) for argument in arguments)):
+                raise ValueError("ProgramArguments must be an array of strings")
+        except (OSError, ValueError, AttributeError) as error:
+            errors.append(f"invalid shipped plist {path}: {error}")
+            continue
+        for argument in arguments:
+            if argument.partition("=")[0] in FORBIDDEN_PRODUCTION_ARGUMENTS:
+                errors.append(f"production=off argument {argument} in {path}")
     return errors
 
 
@@ -198,7 +230,9 @@ def main() -> int:
                    for kind in ('flag', 'state', 'artifact')
                    for alias in (name, name.replace('/private/tmp/', '/tmp/', 1)))
     )
-    errors = production_environment_errors(manifest, production_plists())
+    shipped = production_plists()
+    errors = production_environment_errors(manifest, shipped)
+    errors += production_argument_errors(shipped)
     for (kind, name), (state, _, _) in manifest.items():
         if kind == 'flag' and state not in {'off', 'transient'}:
             errors.append(f'production function depends on a flag: {name} ({state})')

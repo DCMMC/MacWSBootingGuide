@@ -24,8 +24,8 @@
         <string>--disable-updates</string>
         <string>--no-sandbox</string>
         <string>--disable-gpu-sandbox</string>
-        <string>--remote-debugging-port=9223</string>
-        <string>--remote-allow-origins=*</string>
+        <!-- Remote debugging belongs to explicit diagnostic launches, never
+             this ordinary browser profile. -->
         <string>--use-angle=metal</string>
         <string>--ignore-gpu-blocklist</string>
         <string>--disable-features=SkiaGraphite</string>

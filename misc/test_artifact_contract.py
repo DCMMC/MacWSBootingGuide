@@ -6,6 +6,7 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 
 import macws_artifact_contract as contract
 
@@ -57,6 +58,36 @@ class ArtifactContract(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'unresolved local include'):
             contract.verify(self.root, self.binary, self.manifest)
 
+    def test_policy_audit_success_required_not_just_matching_archive(self):
+        script = self.root / 'misc/audit_runtime_switches.py'
+        script.parent.mkdir()
+        script.write_text('raise SystemExit(1)\n')
+        with self.assertRaisesRegex(ValueError, 'production policy audit failed'):
+            contract.verify_production_policy(self.root)
+        script.write_text('raise SystemExit(0)\n')
+        contract.verify_production_policy(self.root)
+
+    def test_missing_or_timed_out_policy_audit_fails_closed(self):
+        with self.assertRaisesRegex(ValueError, 'production policy audit failed'):
+            contract.verify_production_policy(self.root)
+        with mock.patch.object(contract.subprocess, 'run',
+                side_effect=subprocess.TimeoutExpired('audit', 30)):
+            with self.assertRaisesRegex(ValueError, 'production policy audit timed out'):
+                contract.verify_production_policy(self.root)
+
+    def test_package_command_calls_policy_gate_before_archive_acceptance(self):
+        with mock.patch.object(contract.sys, 'argv', [
+                'contract', 'verify-package', '--root', str(self.root),
+                '--binary', str(self.binary), '--manifest', str(self.manifest),
+                '--package', str(self.root / 'candidate.deb'),
+                '--staging', str(self.root / 'staging')]), \
+                mock.patch.object(contract, 'verify_production_policy',
+                    side_effect=ValueError('fixture diagnostic present')) as audit, \
+                mock.patch.object(contract, 'verify_package') as archive:
+            self.assertEqual(contract.main(), 1)
+            audit.assert_called_once_with(self.root)
+            archive.assert_not_called()
+
     def package(self, omitted=None):
         staging = self.root / 'staging'
         for name in contract.PACKAGE_PATHS:
@@ -91,6 +122,16 @@ class ArtifactContract(unittest.TestCase):
     def test_new_staging_does_not_validate_old_archive(self):
         package, staging = self.package()
         (staging / contract.PACKAGE_PATHS[0]).write_bytes(b'new-host')
+        with self.assertRaisesRegex(ValueError, 'package differs from staged runtime'):
+            contract.verify_package(package, staging, self.binary)
+
+    @unittest.skipUnless(shutil.which('dpkg-deb'), 'dpkg-deb required')
+    def test_compiler_target_fix_must_reach_actual_archive(self):
+        package, staging = self.package()
+        name = ('var/jb/Library/MobileSubstrate/DynamicLibraries/'
+                'MTLCompilerBypassOSCheck.dylib')
+        self.assertIn(name, contract.PACKAGE_PATHS)
+        (staging / name).write_bytes(b'new-compiler-target-adapter')
         with self.assertRaisesRegex(ValueError, 'package differs from staged runtime'):
             contract.verify_package(package, staging, self.binary)
 
@@ -140,6 +181,20 @@ class ArtifactContract(unittest.TestCase):
         job = self.root / 'misc/com.macwsguide.coreaudiod.plist'
         value = plistlib.loads(job.read_bytes())
         value['EnvironmentVariables']['MACWS_TEST'] = '0'
+        job.write_bytes(plistlib.dumps(value))
+        with self.assertRaisesRegex(ValueError, 'staged runtime differs from current source'):
+            contract.verify_package(package, staging, self.binary, self.root)
+
+    @unittest.skipUnless(shutil.which('dpkg-deb'), 'dpkg-deb required')
+    def test_retired_browser_debug_argv_cannot_survive_in_staging(self):
+        package, staging = self.package()
+        for name, source in contract.SOURCE_PAYLOADS.items():
+            path = self.root / source
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes((staging / name).read_bytes())
+        job = self.root / 'misc/com.macwsguide.vscode.plist'
+        value = plistlib.loads(job.read_bytes())
+        value['ProgramArguments'] = ['Electron', '--use-angle=metal']
         job.write_bytes(plistlib.dumps(value))
         with self.assertRaisesRegex(ValueError, 'staged runtime differs from current source'):
             contract.verify_package(package, staging, self.binary, self.root)

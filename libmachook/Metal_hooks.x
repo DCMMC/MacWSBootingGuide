@@ -2011,10 +2011,6 @@ static BOOL macws_chroot_root_mount_needs_rebase = NO;
 static fsid_t macws_chroot_root_fsid = {};
 static char macws_chroot_root_host_mount[MAXPATHLEN] = {};
 static char macws_chroot_host_root[MAXPATHLEN] = {};
-typedef Boolean (*macws_cfurl_copy_resource_property_fn)(
-    CFURLRef, CFStringRef, void *, CFErrorRef *);
-static macws_cfurl_copy_resource_property_fn
-    macws_cfurl_copy_resource_property_orig = NULL;
 
 // A chroot does not create a separate CF distributed-notification namespace.
 // Runtime-confirmed on iPadOS 16.3 (2026-08-21): Ventura lsd posts
@@ -2116,62 +2112,6 @@ DYLD_INTERPOSE(macws_cf_notification_add_observer_compat,
 DYLD_INTERPOSE(macws_cf_notification_remove_observer_compat,
                CFNotificationCenterRemoveObserver)
 
-static BOOL macws_needs_application_mount_namespace_compatibility(void) {
-    // Third-party AppKit executables launched through macwshostd's validated
-    // custom-path transaction may become LaunchServices/CoreServices catalog
-    // consumers while decoding a document NIB or resolving an icon.  The
-    // launcher opts those processes into the same complete logical-root mount
-    // contract as the catalog owners below.  Do not infer this from "GUI":
-    // Terminal's fork path must continue to avoid the fsgetpath trampoline.
-    const char *production = getenv("MACWS_APP_MOUNT_COMPAT");
-    if (production && strcmp(production, "1") == 0) return YES;
-    // Diagnostic escape hatch for one isolated consumer. It is never set by a
-    // shipped launch plist or the production launcher.
-    if (getenv("MACWS_APP_MOUNT_COMPAT_DIAGNOSTIC")) return YES;
-    const char *program = getprogname();
-    // The stock application scan is executed by lsregister itself, while the
-    // standalone System Settings extensions are registered by the narrowly
-    // scoped macwsworkspacectl transaction below.  Both are catalog owners,
-    // but macwsworkspacectl's other commands (notably show-launchpad) can
-    // spawn children and must not inherit the fsgetpath trampoline.  Admit
-    // only the explicit one-shot registration environment.
-    if (program && strcmp(program, "macwsworkspacectl") == 0 &&
-        getenv("MACWS_CATALOG_REGISTRATION") &&
-        strcmp(getenv("MACWS_CATALOG_REGISTRATION"), "1") == 0)
-        return YES;
-    return program &&
-        (strcmp(program, "Dock") == 0 ||
-         strcmp(program, "Finder") == 0 ||
-         strcmp(program, "iconservicesagent") == 0 ||
-         strcmp(program, "iconservicesd") == 0 ||
-         // Runtime-confirmed in quicklookd-2026-09-09-142033.ips: the
-         // Ventura preview daemon overflowed its stack in the identical
-         // CoreServicesInternal FileCache/CFURL finalization cycle after its
-         // file URLs inherited the host `/private/var` mount identity.  The
-         // thumbnail agent and satellite are the other two stock Ventura
-         // members of that same Quick Look file-metadata pipeline, so keep
-         // all three on one logical-root volume contract.
-         strcmp(program, "quicklookd") == 0 ||
-         strcmp(program, "com.apple.quicklook.ThumbnailsAgent") == 0 ||
-         strcmp(program, "QuickLookSatellite") == 0 ||
-         // Runtime-confirmed in sharedfilelistd-2026-08-13-073755.ips:
-         // Ventura's SharedFileList worker hit the same four-node
-         // CoreServicesInternal FileCache/CFURL finalization recursion as
-         // Finder when the host mount namespace escaped the chroot.  Steam's
-         // startup synchronously queries this service, so it is a filesystem
-         // catalog consumer and needs the identical root-volume contract.
-         strcmp(program, "sharedfilelistd") == 0 ||
-         // Runtime-confirmed in locationd-2026-08-05-115330.ips: the
-         // Ventura daemon's CLInternalServiceSilo recursively finalized 511
-         // CoreServicesInternal FileCache/CFURL frames after the host mount
-         // escaped its chroot. It consumes the same logical-root filesystem
-         // contract as Finder, while iPadOS locationd never loads libmachook.
-         strcmp(program, "locationd") == 0 ||
-         strcmp(program, "lsregister") == 0 ||
-         strcmp(program, "launchservicesd") == 0 ||
-         strcmp(program, "lsd") == 0);
-}
-
 // Darwin's statfs/fstatfs expose the host mount namespace even after chroot(2).
 // On this iPad, every path backed by the chroot root filesystem reports that it
 // is mounted at `/private/var`, although the process-visible mount point is `/`.
@@ -2194,8 +2134,7 @@ static BOOL macws_needs_application_mount_namespace_compatibility(void) {
 // LaunchServices records nor bypasses its validation.
 static void macws_rebase_application_mount_namespace(
     const char *path, struct statfs *buffer) {
-    if (!buffer || !macws_needs_application_mount_namespace_compatibility() ||
-        !macws_chroot_root_mount_needs_rebase ||
+    if (!buffer || !macws_chroot_root_mount_needs_rebase ||
         buffer->f_fsid.val[0] != macws_chroot_root_fsid.val[0] ||
         buffer->f_fsid.val[1] != macws_chroot_root_fsid.val[1]) return;
 
@@ -2218,10 +2157,19 @@ static int macws_lp_fstatfs_namespace_compat(int descriptor,
                                             struct statfs *buffer) {
     int result = fstatfs(descriptor, buffer);
     if (result != 0 || !buffer) return result;
-
-    char path[MAXPATHLEN] = {};
-    if (fcntl(descriptor, F_GETPATH, path) == 0)
-        macws_rebase_application_mount_namespace(path, buffer);
+    if (!macws_chroot_root_mount_needs_rebase ||
+        buffer->f_fsid.val[0] != macws_chroot_root_fsid.val[0] ||
+        buffer->f_fsid.val[1] != macws_chroot_root_fsid.val[1]) return result;
+    // The descriptor's fsid is authoritative even when F_GETPATH fails. Its
+    // pathname is only diagnostic data, never a prerequisite or a hot-path
+    // syscall for the namespace repair.
+    char path[MAXPATHLEN] = "<descriptor>";
+    if (getenv("MACWS_LAUNCHPAD_TRACE") || getenv("MACWS_APP_MOUNT_TRACE")) {
+        char resolved[MAXPATHLEN] = {};
+        if (fcntl(descriptor, F_GETPATH, resolved) == 0)
+            strlcpy(path, resolved, sizeof(path));
+    }
+    macws_rebase_application_mount_namespace(path, buffer);
     return result;
 }
 
@@ -2258,18 +2206,30 @@ DYLD_INTERPOSE(macws_lp_statfs_namespace_compat, statfs)
 //
 // Restore the standard filesystem invariants at the public provider boundary:
 // the process-visible root URL has no parent, and the volume URL for any node
-// on the chroot root filesystem is `/`. This is deliberately limited to
-// lsd/Dock/launchservicesd instances whose real root statfs reports the exact
-// chroot filesystem mounted elsewhere in the host namespace. Every separate
-// filesystem, unrelated resource key, and normal process uses CoreFoundation
-// unchanged.
+// on the chroot root filesystem is `/`. This is limited to verified chroot
+// instances whose real root statfs reports their exact root filesystem
+// mounted elsewhere in the host namespace. Every separate filesystem,
+// unrelated resource key, and normal process uses CoreFoundation
+// unchanged. This applies to every real chroot consumer, not an application
+// name or a launch flag: Preview PID 17356 overflowed its NSPersistentUI
+// Encoding stack in FileCache/CFURL finalization on 2026-09-19 when the old
+// catalog-owner allowlist omitted Preview. A process-local namespace A/B
+// confirmed its test PDF inherited the host volume `/private/var`.
 static Boolean macws_cfurl_copy_resource_property_compat(
     CFURLRef url, CFStringRef key, void *value, CFErrorRef *error) {
+    if (!macws_chroot_root_mount_needs_rebase)
+        return CFURLCopyResourcePropertyForKey(url, key, value, error);
     char keyName[64] = {};
     char visiblePath[MAXPATHLEN] = {};
     BOOL hasKeyName = key && CFGetTypeID(key) == CFStringGetTypeID() &&
         CFStringGetCString(key, keyName, sizeof(keyName),
                            kCFStringEncodingUTF8);
+    // Most CFURL property requests are unrelated to volume parentage. Do not
+    // resolve their URL paths merely because this is a chroot process.
+    if (!hasKeyName ||
+        (strcmp(keyName, "NSURLParentDirectoryURLKey") != 0 &&
+         strcmp(keyName, "NSURLVolumeURLKey") != 0))
+        return CFURLCopyResourcePropertyForKey(url, key, value, error);
     BOOL hasVisiblePath = url && CFURLGetFileSystemRepresentation(
         url, true, (UInt8 *)visiblePath, sizeof(visiblePath));
     if (url && key && macws_chroot_root_mount_needs_rebase &&
@@ -2290,9 +2250,10 @@ static Boolean macws_cfurl_copy_resource_property_compat(
             return true;
         }
     }
-    Boolean result = macws_cfurl_copy_resource_property_orig
-        ? macws_cfurl_copy_resource_property_orig(url, key, value, error)
-        : false;
+    // Calls from this replacement image resolve to the stock provider. A
+    // static interpose preserves CoreFoundation's executable pages across
+    // fork, just like the statfs/fsgetpath adapters above and below.
+    Boolean result = CFURLCopyResourcePropertyForKey(url, key, value, error);
     BOOL isVolumeQuery = hasKeyName && hasVisiblePath &&
         strcmp(keyName, "NSURLVolumeURLKey") == 0;
     if (result && isVolumeQuery && value &&
@@ -2346,18 +2307,165 @@ static Boolean macws_cfurl_copy_resource_property_compat(
     return result;
 }
 
-static void macws_install_root_parent_namespace_compatibility(void) {
-    void *target = dlsym(RTLD_DEFAULT,
-                         "CFURLCopyResourcePropertyForKey");
-    if (!target) return;
-    MSHookFunction(target,
-                   (void *)macws_cfurl_copy_resource_property_compat,
-                   (void **)&macws_cfurl_copy_resource_property_orig);
-    if (getenv("MACWS_APP_MOUNT_TRACE")) {
-        fprintf(stderr,
-                "#### APP-MOUNT root parent provider installed "
-                "target=%p original=%p\n",
-                target, macws_cfurl_copy_resource_property_orig);
+DYLD_INTERPOSE(macws_cfurl_copy_resource_property_compat,
+               CFURLCopyResourcePropertyForKey)
+
+// Ventura's NSURL methods live inside CoreFoundation and call the CF provider
+// with a same-image BL, not a dyld binding. Runtime RE (2026-09-19) found
+// getResourceValue:+0x64 -> CFURLCopyResourcePropertyForKey and
+// resourceValuesForKeys:+0x5c -> CFURLCopyResourcePropertiesForKeys. Preserve
+// the original methods' cache/error/ownership protocol while adapting only
+// the logical-root properties. Replacing runtime IMP data does not modify a
+// shared executable page and does not require JIT or a thread-stop hook.
+typedef BOOL (*MacWSURLGetResourceFn)(id, SEL, id *, id, id *);
+typedef id (*MacWSURLGetResourcesFn)(id, SEL, id, id *);
+static MacWSURLGetResourceFn macws_url_get_resource_original = NULL;
+static MacWSURLGetResourceFn macws_url_get_promised_resource_original = NULL;
+static MacWSURLGetResourcesFn macws_url_get_resources_original = NULL;
+static MacWSURLGetResourcesFn macws_url_get_promised_resources_original = NULL;
+
+// When changed, replacement is a retained CF value (possibly NULL for the
+// root's nonexistent parent). The caller preserves its own API's ownership.
+static BOOL macws_copy_url_namespace_property(id url, id key, id property,
+                                             CFTypeRef *replacement) {
+    if (!macws_chroot_root_mount_needs_rebase || !url || !key || !replacement)
+        return NO;
+    char keyName[64] = {}, path[MAXPATHLEN] = {};
+    if (CFGetTypeID((CFTypeRef)key) != CFStringGetTypeID() ||
+        !CFStringGetCString((CFStringRef)key, keyName, sizeof(keyName),
+                            kCFStringEncodingUTF8)) return NO;
+    BOOL parent = strcmp(keyName, "NSURLParentDirectoryURLKey") == 0;
+    BOOL volume = strcmp(keyName, "NSURLVolumeURLKey") == 0;
+    if ((!parent && !volume) || (volume && !property) ||
+        !CFURLGetFileSystemRepresentation((CFURLRef)url, true,
+                                          (UInt8 *)path, sizeof(path))) return NO;
+    if (parent) {
+        if (strcmp(path, "/") != 0) return NO;
+        *replacement = NULL;
+        return YES;
+    }
+    if (!property || CFGetTypeID((CFTypeRef)property) != CFURLGetTypeID()) return NO;
+    char returnedPath[MAXPATHLEN] = {};
+    struct statfs filesystem = {};
+    if (!CFURLGetFileSystemRepresentation((CFURLRef)property, true,
+            (UInt8 *)returnedPath, sizeof(returnedPath)) ||
+        strcmp(returnedPath, macws_chroot_root_host_mount) != 0 ||
+        statfs(path, &filesystem) != 0 ||
+        filesystem.f_fsid.val[0] != macws_chroot_root_fsid.val[0] ||
+        filesystem.f_fsid.val[1] != macws_chroot_root_fsid.val[1]) return NO;
+    static const UInt8 root[] = "/";
+    *replacement = CFURLCreateFromFileSystemRepresentation(
+        kCFAllocatorDefault, root, 1, true);
+    return *replacement != NULL;
+}
+
+static BOOL macws_nsurl_get_resource(id self, SEL selector, id *value,
+                                    id key, id *error) {
+    MacWSURLGetResourceFn original =
+        selector == sel_registerName("getPromisedItemResourceValue:forKey:error:")
+            ? macws_url_get_promised_resource_original : macws_url_get_resource_original;
+    // Root has no parent. Do not let the host provider first cache a parent
+    // outside the process root: that is the original FileCache-cycle input.
+    CFTypeRef replacement = NULL;
+    if (macws_copy_url_namespace_property(self, key, nil, &replacement)) {
+        if (value) *value = nil;
+        if (error) *error = nil;
+        return YES;
+    }
+    BOOL result = original(self, selector, value, key, error);
+    if (result && value &&
+        macws_copy_url_namespace_property(self, key, *value, &replacement))
+        *value = [(id)replacement autorelease];
+    return result;
+}
+
+static CFArrayRef macws_copy_root_resource_keys(CFURLRef url, CFArrayRef keys) {
+    if (!macws_chroot_root_mount_needs_rebase || !keys ||
+        CFGetTypeID(keys) != CFArrayGetTypeID()) return NULL;
+    CFMutableArrayRef filtered = NULL;
+    CFIndex count = CFArrayGetCount(keys);
+    for (CFIndex index = count; index > 0; index--) {
+        CFTypeRef replacement = NULL;
+        id key = (id)CFArrayGetValueAtIndex(keys, index - 1);
+        if (!macws_copy_url_namespace_property((id)url, key, nil, &replacement))
+            continue;
+        if (!filtered) filtered = CFArrayCreateMutableCopy(NULL, 0, keys);
+        if (!filtered) return NULL;
+        CFArrayRemoveValueAtIndex(filtered, index - 1);
+    }
+    return filtered;
+}
+
+static CFDictionaryRef macws_copy_namespace_resource_dictionary(
+    CFURLRef url, CFDictionaryRef result) {
+    if (!macws_chroot_root_mount_needs_rebase || !result ||
+        CFGetTypeID(result) != CFDictionaryGetTypeID()) return NULL;
+    CFTypeRef replacement = NULL;
+    id property = (id)CFDictionaryGetValue(result, kCFURLVolumeURLKey);
+    if (!macws_copy_url_namespace_property((id)url, (id)kCFURLVolumeURLKey,
+                                          property, &replacement)) return NULL;
+    CFMutableDictionaryRef adjusted = CFDictionaryCreateMutableCopy(NULL, 0, result);
+    if (adjusted) CFDictionarySetValue(adjusted, kCFURLVolumeURLKey, replacement);
+    CFRelease(replacement);
+    return adjusted;
+}
+
+static id macws_nsurl_get_resources(id self, SEL selector, id keys, id *error) {
+    MacWSURLGetResourcesFn original =
+        selector == sel_registerName("promisedItemResourceValuesForKeys:error:")
+            ? macws_url_get_promised_resources_original : macws_url_get_resources_original;
+    if (!macws_chroot_root_mount_needs_rebase)
+        return original(self, selector, keys, error);
+    // Native macOS omits NSURLParentDirectoryURLKey from a root URL's result
+    // dictionary. Query all other requested keys through the original method,
+    // preserving real provider errors rather than manufacturing a dictionary.
+    CFArrayRef filtered = macws_copy_root_resource_keys((CFURLRef)self, (CFArrayRef)keys);
+    id result = original(self, selector, filtered ? (id)filtered : keys, error);
+    if (filtered) CFRelease(filtered);
+    CFDictionaryRef adjusted = macws_copy_namespace_resource_dictionary(
+        (CFURLRef)self, (CFDictionaryRef)result);
+    return adjusted ? [(id)adjusted autorelease] : result;
+}
+
+static CFDictionaryRef macws_cfurl_copy_resource_properties_compat(
+    CFURLRef url, CFArrayRef keys, CFErrorRef *error) {
+    if (!macws_chroot_root_mount_needs_rebase)
+        return CFURLCopyResourcePropertiesForKeys(url, keys, error);
+    CFArrayRef filtered = macws_copy_root_resource_keys(url, keys);
+    CFDictionaryRef result = CFURLCopyResourcePropertiesForKeys(
+        url, filtered ?: keys, error);
+    if (filtered) CFRelease(filtered);
+    CFDictionaryRef adjusted = macws_copy_namespace_resource_dictionary(url, result);
+    if (!adjusted) return result;
+    CFRelease(result);
+    return adjusted;
+}
+
+DYLD_INTERPOSE(macws_cfurl_copy_resource_properties_compat,
+               CFURLCopyResourcePropertiesForKeys)
+
+static void macws_install_nsurl_namespace_protocol(void) {
+    Class urlClass = objc_getClass("NSURL");
+    if (!urlClass) return;
+    struct { const char *selector; IMP replacement; IMP *original; unsigned count; } methods[] = {
+        {"getResourceValue:forKey:error:", (IMP)macws_nsurl_get_resource,
+            (IMP *)&macws_url_get_resource_original, 5},
+        {"getPromisedItemResourceValue:forKey:error:", (IMP)macws_nsurl_get_resource,
+            (IMP *)&macws_url_get_promised_resource_original, 5},
+        {"resourceValuesForKeys:error:", (IMP)macws_nsurl_get_resources,
+            (IMP *)&macws_url_get_resources_original, 4},
+        {"promisedItemResourceValuesForKeys:error:", (IMP)macws_nsurl_get_resources,
+            (IMP *)&macws_url_get_promised_resources_original, 4},
+    };
+    for (unsigned index = 0; index < sizeof(methods) / sizeof(methods[0]); index++) {
+        Method method = class_getInstanceMethod(urlClass,
+            sel_registerName(methods[index].selector));
+        if (!method || method_getNumberOfArguments(method) != methods[index].count)
+            continue;
+        IMP original = method_getImplementation(method);
+        if (!original || original == methods[index].replacement) continue;
+        *methods[index].original = original;
+        method_setImplementation(method, methods[index].replacement);
     }
 }
 
@@ -2421,35 +2529,34 @@ static ssize_t macws_fsgetpath_namespace_compat(char *buffer, size_t capacity,
 // children retain the kernel's post-fork entry points byte-for-byte.
 DYLD_INTERPOSE(macws_fsgetpath_namespace_compat, fsgetpath)
 
-static void macws_install_launchpad_mount_namespace_compatibility(void) {
-    // This compatibility belongs to application-catalog owners and to the
-    // validated third-party AppKit launch transaction only.
-    // Installing the fsgetpath trampoline in every AppKit process dirties the
-    // libsystem_kernel __TEXT page that also contains mach_port_construct.
-    // Runtime-confirmed on iPadOS 16.3: Terminal's fork child inherited that
-    // COW page as r--/rw- and faulted at mach_port_construct+0 during
-    // _pthread_main_thread_postfork_init.  Keep both halves of the namespace
-    // model in the same narrowly-scoped filesystem-metadata consumers (Dock,
-    // Finder, IconServices, lsd, launchservicesd, and Ventura locationd);
-    // ordinary applications retain the stock kernel entry.
-    if (!macws_needs_application_mount_namespace_compatibility()) return;
-
+static void macws_initialize_chroot_mount_namespace(void) {
+    // Root metadata is set by launchdchrootexec after realpath/chroot, not a
+    // feature switch. No opt-in, process allowlist or debug file may decide
+    // whether the process-visible filesystem has a coherent root. Native iOS
+    // processes without this exact launch contract remain untouched.
     const char *hostRoot = getenv("MACWS_CHROOT_HOST_ROOT");
-    if (hostRoot && hostRoot[0] == '/' && strcmp(hostRoot, "/") != 0) {
-        strlcpy(macws_chroot_host_root, hostRoot,
-                sizeof(macws_chroot_host_root));
-    }
+    size_t rootLength = hostRoot ? strnlen(hostRoot, MAXPATHLEN) : 0;
+    if (rootLength < 2 || rootLength >= MAXPATHLEN || hostRoot[0] != '/' ||
+        hostRoot[rootLength - 1] == '/' || strstr(hostRoot, "//") ||
+        strstr(hostRoot, "/./") || strstr(hostRoot, "/../") ||
+        strcmp(hostRoot + rootLength - 2, "/.") == 0 ||
+        (rootLength >= 3 &&
+         strcmp(hostRoot + rootLength - 3, "/..") == 0)) return;
 
     struct statfs rootFileSystem = {};
     if (statfs("/", &rootFileSystem) != 0 ||
-        strcmp(rootFileSystem.f_mntonname, "/") == 0) return;
+        rootFileSystem.f_mntonname[0] != '/' ||
+        strcmp(rootFileSystem.f_mntonname, "/") == 0 ||
+        (!rootFileSystem.f_fsid.val[0] &&
+         !rootFileSystem.f_fsid.val[1])) return;
 
-    macws_chroot_root_mount_needs_rebase = YES;
+    strlcpy(macws_chroot_host_root, hostRoot,
+            sizeof(macws_chroot_host_root));
     macws_chroot_root_fsid = rootFileSystem.f_fsid;
     strlcpy(macws_chroot_root_host_mount, rootFileSystem.f_mntonname,
             sizeof(macws_chroot_root_host_mount));
-
-    macws_install_root_parent_namespace_compatibility();
+    macws_chroot_root_mount_needs_rebase = YES;
+    macws_install_nsurl_namespace_protocol();
 
     if (getenv("MACWS_LAUNCHPAD_TRACE") ||
         getenv("MACWS_APP_MOUNT_TRACE")) {
@@ -22750,6 +22857,11 @@ static void macws_terminal_order_window_onscreen(id app, id target,
 }
 
 __attribute__((constructor)) static void InitMetalHooks() {
+    // Namespace initialization is metadata, one native statfs and NSURL
+    // protocol IMP data registration (no executable-page hooks or GPU). It
+    // must precede all headless/utility early returns: these processes also
+    // use the static filesystem interposes, without needing GPU/GUI setup.
+    macws_initialize_chroot_mount_namespace();
     // The startup `defaults` probe is a headless preferences client: it needs
     // the shared-cache XPC name mapping, but no CGSession, AppKit, Metal,
     // input, or diagnostic hook.  Install exactly that protocol boundary and
@@ -22826,7 +22938,6 @@ __attribute__((constructor)) static void InitMetalHooks() {
 #endif
     macws_install_iconservices_quarantine_fallback();
     macws_install_cgsession_login_handoff_compatibility();
-    macws_install_launchpad_mount_namespace_compatibility();
     macws_install_launchpad_source_diagnostics();
     macws_install_app_lifecycle_diagnostics();
     macws_install_catalyst_frontboard_route();

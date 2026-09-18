@@ -36,6 +36,18 @@ submit/error dump before launching WindowServer. It rejects launch plists that
 contain allocator instrumentation or known trace/flight-recorder environment
 variables. `MallocScribble` is explicitly forbidden.
 
+Production VS Code and Chrome jobs also omit Chromium's remote-debugging port,
+pipe and remote-origin overrides; the audit rejects these command-line options
+in shipped plists, including split option/value forms. Opening a web link in
+VS Code uses the private `macws_vscode_url.sock` Unix socket and the extension's
+`simpleBrowser.show` command, not CDP. The `misc/*cdp*` and browser benchmark
+tools remain explicit diagnostics: they require a separately launched,
+temporary browser job with an operator-selected debugging endpoint. Do not
+enable that endpoint by editing or reusing the production launch job, and stop
+the diagnostic job when the bounded measurement finishes. Updating a plist
+does not alter an already loaded job or running browser; the clean arguments
+take effect on its next controlled unload/load and launch.
+
 ## Production invariants
 
 - Native AGX and driver class registration default on even with no environment
@@ -68,12 +80,15 @@ variables. `MallocScribble` is explicitly forbidden.
   session hide-count contract while its global pointer position continues to
   move. Native menus and Chromium popups therefore retain WindowServer/AppKit
   hover semantics without duplicating Host's circular pointer affordance.
-- Validated custom-path apps, generic Catalyst children, and the stock
-  Finder, custom-path applications, generic Catalyst children, and the
-  UIKitSystem service receive the scoped `MACWS_APP_MOUNT_COMPAT=1` namespace
-  contract. UIKitSystem owns the CoreServices repository used while Catalyst
-  bundles initialize; without the same logical chroot root its CFURL cache can
-  recurse during finalization. Generic Catalyst children also
+- Every verified chroot process gets the same logical-root namespace, including
+  file-metadata consumers in ordinary apps, CLI processes and daemons. The
+  launcher-provided canonical host-root metadata and actual root filesystem
+  identity select this contract, not an application allowlist or a feature
+  flag. Legacy `MACWS_APP_MOUNT_COMPAT` values are ignored. The static statfs,
+  fsgetpath and CFURL interposes preserve shared executable pages across fork.
+  NSURL's same-image CF calls are covered at its actual resource-query method
+  protocol using runtime IMP data, including bulk and promised-item queries;
+  native iOS and unrelated filesystems remain untouched. Generic Catalyst children
   receive `MACWS_CATALYST_DIRECT_DRAWABLE=1`: if SkyLight captures their title
   bar but omits a CAMetalLayer client area, libmachook transfers the completed
   drawable's real IOSurface Mach right to the foreground Host. Host validates

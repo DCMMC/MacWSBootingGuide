@@ -293,3 +293,66 @@ fresh CoreImage request worker 13338 had already exited before identity
 sampling (`proc_pidpath` errno 3); its request/adapter logs are a separate
 witness, not evidence of a mapped hash. No protected-process permissions were
 changed to bypass these limitations, and this audit performed no restart.
+
+## Audit beyond the source flag inventory
+
+The subsequent read-only installed-policy audit inspected 66 installed plists,
+53 loaded jobs, 70 related running processes and 191 exact flag/legacy paths.
+All 70 running-process environments were free of forbidden diagnostic keys,
+and none of the 191 paths existed. This did **not** mean the installation was
+clean: idle loaded jobs and old files were additional authorities that a
+running-process-only audit would miss. The complete point-in-time receipt is
+`/tmp/macws-installed-policy-audit-20260919.json` on the controlling Mac.
+
+In particular, the unused system-launch-directory copy of locationd still set
+`MACWS_LOCATIOND_MIG_TRACE=1`; the actual PID 268 and its generated GUI job
+were clean. The old Chrome debug job was still registered in user/501 with:
+
+```text
+state = not running
+MACWS_SUSPEND_AT_EXEC => 1
+MACWS_JIT_MPROTECT_TRACE => 1
+```
+
+The exact historical locationd copy, sandbox-audit-probe and spaceprobe files
+were subsequently archived outside the autoload trees. Their original bytes,
+inode, owner and mode were preserved, just like the nine previously archived
+outer boot jobs. The retirement helper verifies their observed SHA-256 values
+before acting; an unknown revision fails without guessing its identity.
+The final helper check reported `LEGACY-BOOT current`.
+
+Four idle registrations were then independently revalidated against the exact
+archived plist's label, program arguments and former path, `active count = 0`,
+`state = not running`, and absence of a PID before explicit bootout:
+
+- `user/501/com.macwsguide.chrome150`
+- `user/501/UIKitApplication:com.macwsguide.chrome150`
+- `user/501/com.macwsguide.rootdir-ios-probe`
+- `user/501/com.macwsguide.steam`
+
+Every bootout returned 0 and the subsequent print returned 113 (absent).
+The current `UIKitApplication:com.macwsguide.steam` job was not targeted.
+The raw before/after receipt is
+`/tmp/macws-retired-idle-jobs-20260919.json`. No active application was killed.
+Earlier, the same idle-state/identity discipline was used for the cpu-fp,
+jitprobe and rootdir-macos-probe registrations. This is an upgrade cleanup,
+not a feature gate or a general policy of unloading arbitrary jobs.
+
+## Why isolated symptom fixes were insufficient
+
+The failures do not all have one cause, and the flag migration is not proven
+to have introduced every one. The reproducible shared-contract failures are:
+
+| Broken boundary | Concrete evidence | Repair and acceptance boundary |
+| --- | --- | --- |
+| Producer/consumer deployment identity | Old Windowing published persistent readiness while new Host read `/tmp`; actual `bridge-not-loaded` and 1004x807 scene | Versioned live capability, source-bound cross-build and actual package checks; user accepted window sizes |
+| Global runtime mutation across fork | Terminal child faulted on the executable page altered by the obsolete global superclass-auth patch | Remove obsolete runtime instruction rewrite; real native GPU then fork passes for both slices, real new Terminal tabs run shells |
+| Coordinate units across input adapters | Fullscreen native point was converted twice before focus selection | Shared activation-record coordinate contract; two real drags retained the intended focused window |
+| Shared GPU compiler target and old cache ABI | Actual CoreImage graph produced zero pixels; native AGX rejected the wrong target OS | Correct DAG producer target, preserve consumer checks, version recoverable caches; real CoreImage output and separate Preview visual tests |
+| Inconsistent filesystem root across consumers | Preview FileCache finalization recursed to the stack guard; direct CF query passed while actual NSURL still returned the host volume | Shared chroot namespace contract covering CF and Foundation without executable-page hooks; see Preview evidence for exact candidate and UI results |
+| Validation treated intermediate success as completion | Source/package equality did not imply a running process mapped it; automatic gate allowed pending manual checks | Separate automated outcome from release acceptance; reject stale test targets; require fresh mapped identity and visible output where accessible |
+
+These are the reasons to test shared boundaries and representative consumers,
+not to add more application-name exceptions or force success past an error.
+The Weather Mission Control failure and sustained heat complaint remain
+separate open acceptance items; no process-uptime result closes either one.

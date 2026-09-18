@@ -27,6 +27,17 @@ RETIRED = {
     "com.macwsguide.steam.runtime.plist": "1fcb5c5db2030f3057d9d51504ccda04f499d2411f316d821f6db80edaf771a4",
     "com.macwsguide.systemsettings.plist": "2c6785ddd74eb9091523f0c834cd1a8b5da3b248fc8c879019085a5a0a5fb1b6",
 }
+# Additional historical files in the two project-owned launch directories.
+# A duplicate locationd trace job is not the current clean gui-launchd job.
+EXTRA_RETIRED = {
+    "usr/macOS/LaunchDaemons/com.macwsguide.macos-locationd.plist": "d15d4ceff906560bd8f24d4e74301e5c8cdfe098ef400f1647492f286a8ebd4d",
+    "usr/macOS/gui-launchd/com.macwsguide.sandbox-audit-probe.plist": "33bec0abbfc95c19327fd77e07270b83608e2b50e0d9076aecc3abd5b5e0dc12",
+    "usr/macOS/gui-launchd/com.macwsguide.spaceprobe.plist": "de2748fc762d765f1fcaa08e94417f56e7b6ca49ba8299063f8c4dde746395d0",
+    "usr/macOS/gui-launchd/com.macwsguide.glassdemo.plist": "8eb420ad86a56fb62d9c1b89571cc276dc4808853e6c04a6856449be942b3670",
+    "usr/macOS/gui-launchd/com.macwsguide.iconservicesagent.diag.plist": "6c68a3d5a0f68d26a1d44180b0b4a786369a3fd4f1d5a3646880c3032fa3f244",
+    "usr/macOS/gui-launchd/com.macwsguide.inputlab.plist": "16bfac3b4e87d9083abb7d27e14a82bba53fb715ed77e3540a201b0f7ada6699",
+    "usr/macOS/gui-launchd/com.macwsguide.maps.plist": "daaf979705c4ba5c95893752e74f57a948f80b03b42e11cd3e88a88f6b6a52ab",
+}
 CURRENT = {
     "com.macwsguide.alloc.plist": ("com.macwsguide.alloc", "macwsallocd"),
     "com.macwsguide.hostd.plist": ("com.macwsguide.hostd", "macwshostd"),
@@ -83,6 +94,9 @@ def recognized_legacy(name, job, digest):
     # comment is sometimes invalid; exact launch identity was the existing
     # production migration contract, not a requirement to repair its bytes.
     arguments = job.get("ProgramArguments")
+    if "Program" in job and (not isinstance(arguments, list) or not arguments or
+                            job["Program"] != arguments[0]):
+        return False
     if (name == "com.macwsguide.glassdemo.plist" and
             job.get("Label") == "com.macwsguide.glassdemo" and
             arguments == ["/var/jb/usr/macOS/bin/launchdchrootexec", "0", "0",
@@ -145,6 +159,16 @@ def migrate(prefix, check=False):
         if not recognized_legacy(source.name, job, digest):
             raise ValueError("unrecognized legacy MacWS boot job retained: " + str(source))
         planned.append((source, raw, info, digest))
+    for relative, expected_digest in EXTRA_RETIRED.items():
+        source = prefix / relative
+        if not source.exists() and not source.is_symlink():
+            continue
+        directory(prefix, str(Path(relative).parent))
+        raw, info = read_regular(source)
+        digest = hashlib.sha256(raw).hexdigest()
+        if digest != expected_digest:
+            raise ValueError("unrecognized legacy GUI job retained: " + str(source))
+        planned.append((source, raw, info, digest))
     # Validate the full inventory before mutating any boot file.
     if check:
         return [str(source) for source, _, _, _ in planned]
@@ -170,7 +194,7 @@ def migrate(prefix, check=False):
         if identity(source.lstat()) != identity(info):
             raise ValueError("boot job replaced during archival: " + str(source))
         source.unlink()
-        sync(boot)
+        sync(source.parent)
         retired.append(str(destination))
     return retired
 

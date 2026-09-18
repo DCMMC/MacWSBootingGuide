@@ -39,6 +39,8 @@ PACKAGE_PATHS = (
     'var/jb/usr/macOS/gui-launchd/com.macwsguide.audiocomponentregistrar.plist',
     'var/jb/usr/macOS/gui-launchd/com.macwsguide.audio-output.plist',
     'var/jb/usr/macOS/lib/libmachook.dylib',
+    'var/jb/Library/MobileSubstrate/DynamicLibraries/MTLCompilerBypassOSCheck.dylib',
+    'var/jb/usr/macOS/gui-launchd/com.macwsguide.vscode.plist',
 )
 WINDOWING_PATH = PACKAGE_PATHS[2]
 CATALYST_PATH = PACKAGE_PATHS[3]
@@ -60,6 +62,8 @@ SOURCE_PAYLOADS = {
         'misc/com.macwsguide.audiocomponentregistrar.plist',
     'var/jb/usr/macOS/gui-launchd/com.macwsguide.audio-output.plist':
         'misc/com.macwsguide.audio-output.plist',
+    'var/jb/usr/macOS/gui-launchd/com.macwsguide.vscode.plist':
+        'misc/com.macwsguide.vscode.plist',
     'DEBIAN/postinst': 'layout/DEBIAN/postinst',
 }
 
@@ -202,6 +206,21 @@ def verify_catalyst_abi(binary: Path) -> None:
                          'use runtime CF strings/C callbacks or a validated Apple-ld64 build')
 
 
+def verify_production_policy(root: Path) -> None:
+    # A coherent archive can still faithfully ship a diagnostic configuration.
+    # Enforce the source inventory at the same mandatory admission boundary,
+    # not only when an operator remembers to run the separate audit.
+    try:
+        result = subprocess.run(
+            [sys.executable, str(root / 'misc/audit_runtime_switches.py')],
+            text=True, capture_output=True, timeout=30)
+    except subprocess.TimeoutExpired as error:
+        raise ValueError('production policy audit timed out') from error
+    if result.returncode:
+        raise ValueError('production policy audit failed: ' +
+                         (result.stderr + result.stdout).strip()[:4000])
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('action', choices=('snapshot', 'create', 'verify', 'verify-package'))
@@ -228,6 +247,7 @@ def main() -> int:
             if args.action == 'verify-package':
                 if not args.package or not args.staging:
                     parser.error('verify-package requires --package and --staging')
+                verify_production_policy(args.root)
                 verify_package(args.package, args.staging, args.binary, args.root)
                 verify_catalyst_abi(args.staging / CATALYST_PATH)
         print(f'MacWS artifact contract: {args.action} passed')

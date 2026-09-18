@@ -29,8 +29,8 @@
         <string>--force-disable-user-env</string>
         <string>--no-sandbox</string>
         <string>--disable-gpu-sandbox</string>
-        <string>--remote-debugging-port=9222</string>
-        <string>--remote-allow-origins=*</string>
+        <!-- Production web links use the extension's private Unix socket.
+             CDP is only for explicit, separately launched diagnostic runs. -->
         <string>--use-angle=metal</string>
         <string>--ignore-gpu-blocklist</string>
         <!-- Graphite is independent of WebGL/ANGLE. Keep it off because its

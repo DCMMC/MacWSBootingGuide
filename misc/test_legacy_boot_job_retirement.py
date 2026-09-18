@@ -155,6 +155,39 @@ class LegacyBootJobTests(unittest.TestCase):
                 '--legacy-option']}))
         self.assertEqual(len(MODULE.migrate(self.root)), 1)
 
+    def test_legacy_program_override_is_not_recognized_as_vscode(self):
+        source = self.fixture('com.macwsguide.vscode.plist', plistlib.dumps({
+            'Label': 'com.macwsguide.vscode', 'Program': '/tmp/other',
+            'ProgramArguments': ['/var/jb/usr/macOS/bin/launchdchrootexec', '0', '0',
+                '/var/mnt/rootfs', '/Applications/Visual Studio Code.app/Contents/MacOS/Electron']}))
+        with self.assertRaises(ValueError):
+            MODULE.migrate(self.root)
+        self.assertTrue(source.exists())
+
+    def test_exact_duplicate_job_retired_without_touching_live_directory_version(self):
+        relative = 'usr/macOS/LaunchDaemons/com.macwsguide.macos-locationd.plist'
+        duplicate = self.root / relative
+        duplicate.parent.mkdir(parents=True)
+        duplicate.write_bytes(self.raw)
+        active = self.root / 'usr/macOS/gui-launchd/com.macwsguide.macos-locationd.plist'
+        active.parent.mkdir()
+        active.write_bytes(b'current locationd source')
+        with patch.dict(MODULE.EXTRA_RETIRED, {relative: hashlib.sha256(self.raw).hexdigest()}):
+            self.assertEqual(MODULE.migrate(self.root, check=True), [str(duplicate)])
+            archived, = MODULE.migrate(self.root)
+        self.assertEqual(Path(archived).read_bytes(), self.raw)
+        self.assertEqual(active.read_bytes(), b'current locationd source')
+
+    def test_unknown_duplicate_blocks_all_retirement_before_mutation(self):
+        source = self.fixture()
+        duplicate = self.root / next(iter(MODULE.EXTRA_RETIRED))
+        duplicate.parent.mkdir(parents=True)
+        duplicate.write_bytes(b'unknown revision')
+        with self.assertRaisesRegex(ValueError, 'unrecognized legacy GUI'):
+            MODULE.migrate(self.root)
+        self.assertTrue(source.exists())
+        self.assertTrue(duplicate.exists())
+
     def test_shipped_glassdemo_diagnostic_migration_is_preserved(self):
         raw = (ROOT / 'misc/com.macwsguide.glassdemo.plist').read_bytes()
         self.fixture('com.macwsguide.glassdemo.plist', raw)

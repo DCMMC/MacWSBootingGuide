@@ -44,7 +44,55 @@ class ProductionDefaults(unittest.TestCase):
     def test_shipped_plists_have_no_off_switches(self):
         self.assertFalse(audit.production_environment_errors(
             audit.load_manifest(), audit.production_plists()))
+        self.assertFalse(audit.production_argument_errors(audit.production_plists()))
         self.assertIn(ROOT / 'misc/com.macwsguide.vscode.plist', audit.production_plists())
+        self.assertIn(ROOT / 'misc/com.macwsguide.chrome150.plist', audit.production_plists())
+
+    def test_remote_debugging_arguments_are_rejected_in_shipped_jobs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'job.plist'
+            for arguments in (
+                ['Electron', '--remote-debugging-port=9222'],
+                ['Electron', '--remote-debugging-port=0'],
+                ['Chrome', '--remote-debugging-port', '9223'],
+                ['Chrome', '--remote-debugging-pipe'],
+                ['Chrome', '--remote-allow-origins=*'],
+                ['Chrome', '--remote-allow-origins', 'http://localhost:9223'],
+            ):
+                with self.subTest(arguments=arguments):
+                    path.write_bytes(plistlib.dumps({'ProgramArguments': arguments}))
+                    errors = audit.production_argument_errors([path])
+                    self.assertEqual(len(errors), 1)
+                    self.assertIn('production=off argument', errors[0])
+            path.write_bytes(plistlib.dumps({'ProgramArguments': [
+                'Electron', '--use-angle=metal', '--disable-gpu-sandbox',
+                '--remote-debugging-portability',
+                'https://example.invalid/?--remote-debugging-port=9222',
+            ]}))
+            self.assertEqual(audit.production_argument_errors([path]), [])
+
+    def test_argument_audit_rejects_malformed_configuration(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'job.plist'
+            for arguments in ('not-an-array', [1], {'--remote-debugging-port': '0'}):
+                path.write_bytes(plistlib.dumps({'ProgramArguments': arguments}))
+                self.assertEqual(len(audit.production_argument_errors([path])), 1)
+
+    def test_web_url_route_uses_private_extension_socket_not_cdp(self):
+        host = (ROOT / 'macwshostd/main.m').read_text()
+        route = host.split('static BOOL SendWebURLToVSCodeExtension(', 1)[1]
+        route = route.split('static void ActivateVSCodeAfterWebOpen(', 1)[0]
+        self.assertIn('socket(AF_UNIX, SOCK_STREAM, 0)', route)
+        self.assertIn('kVSCodeURLSocket', route)
+        protocol = (ROOT / 'include/macws_control_protocol.h').read_text()
+        self.assertIn('"/private/tmp/macws_vscode_url.sock"', protocol)
+        extension = (ROOT / 'misc/vscode-aquarium-runner/extension.js').read_text()
+        self.assertIn('const urlSocketPath = "/private/tmp/macws_vscode_url.sock"', extension)
+        self.assertIn('server.listen(urlSocketPath', extension)
+        self.assertIn('vscode.commands.executeCommand("simpleBrowser.show", url)', extension)
+        for source in (route, extension):
+            self.assertNotIn('9222', source)
+            self.assertNotIn('/json/list', source)
 
     def test_boot_local_switches_do_not_use_persistent_preferences(self):
         sources = {
