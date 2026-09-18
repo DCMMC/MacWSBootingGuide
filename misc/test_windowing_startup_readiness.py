@@ -25,10 +25,14 @@ class WindowingStartupReadiness(unittest.TestCase):
         self.assertFalse(self.ready('/nonexistent/macws_control_probe'))
 
     def test_no_production_marker_dependency(self):
-        for source in (SCRIPT, POSTINST,
-                       (ROOT / 'MacWSHost/main.m').read_text(),
+        for source in ((ROOT / 'MacWSHost/main.m').read_text(),
                        (ROOT / 'MacWSWindowing/Tweak.x').read_text()):
             self.assertNotIn('dense-grid.loaded', source)
+        # Upgrade cleanup may name an obsolete file; no consumer may use it
+        # as the bridge's availability or feature-selection predicate.
+        self.assertNotIn('WINDOWING_READY_WITNESS', SCRIPT)
+        self.assertNotIn('windowing_witness', POSTINST)
+        self.assertIn('"$WINDOWING_STATUS_PROBE" windowing-status', SCRIPT)
 
     def test_readonly_command_cannot_respring(self):
         command = SCRIPT.split('    windowing-status)', 1)[1].split(';;', 1)[0]

@@ -89,9 +89,10 @@ echo "$MACWS_LOCAL_OUTPUT"
     def test_native_video_production_policies_do_not_require_opt_in(self):
         hooks = (ROOT / 'libmachook/mac_hooks.m').read_text()
         metal = (ROOT / 'libmachook/Metal_hooks.x').read_text()
-        self.assertIn('MacWSProductionDefaultEnabled(getenv("MACWS_CHROMIUM_COMPOSITE_OVERLAYS"))', hooks)
+        compact_hooks = ''.join(hooks.split())
+        self.assertTrue('MacWSProductionDefaultEnabled(getenv("MACWS_CHROMIUM_COMPOSITE_OVERLAYS"))' in compact_hooks)
         self.assertEqual(metal.count('MacWSProductionDefaultEnabled(getenv("MACWS_SDR_SCANOUT"))'), 2)
-        self.assertIn('MacWSDiagnosticSwitchEnabled(getenv("MACWS_PIN_FALLBACK"))', hooks)
+        self.assertTrue('MacWSDiagnosticSwitchEnabled(getenv("MACWS_PIN_FALLBACK"))' in compact_hooks)
         for path in list((ROOT / 'layout').rglob('*.plist')) + list((ROOT / 'misc').glob('com.macwsguide.*.plist')):
             with path.open('rb') as stream:
                 job = plistlib.load(stream)
