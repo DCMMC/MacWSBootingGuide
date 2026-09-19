@@ -7,9 +7,11 @@ observations below. Candidate 1 passed the small CoreUI fixture but failed Word
 86703. The actual Word request exposed an incorrect 16-byte container-alignment
 assumption; candidate 2 corrected it to the genuine 8-byte producer contract.
 Owned Word 87884 then passed the real fresh-cache Save-alert visual test.
-Ordinary shared-cache/default-launch acceptance is still pending: shared caches
-and the user's running applications have deliberately not been migrated or
-restarted.
+The subsequent ordinary shared-cache launch, Word 2999, still failed; see
+[the separate default-cache acceptance](word-default-cache-acceptance-20260920.md).
+Safe migration and final default-launch acceptance remain outstanding. Shared
+caches and the user's running applications have deliberately not been migrated
+or restarted.
 
 ## Discriminating runtime evidence
 

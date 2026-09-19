@@ -4,8 +4,10 @@ Status: the corrected kind-5 compiler adapter is installed. The real Word
 87884 unsaved-document alert passes raw-window, button-bitmap and iPad-screen
 inspection in a new process with a private diagnostic cache. The earlier
 failures below are retained as investigation history, not the current result.
-Normal shared-cache acceptance is still pending safe cache migration; live
-user applications and their mapped caches have not been disturbed.
+Normal shared-cache re-testing subsequently failed in owned Word 2999;
+see [the separate default-cache acceptance](word-default-cache-acceptance-20260920.md).
+Safe cache migration and final default-path acceptance remain outstanding;
+live user applications and their mapped caches have not been disturbed.
 
 ## Real Word reproduction
 
