@@ -16,11 +16,26 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class ChrootMountNamespace(unittest.TestCase):
+    @unittest.skipUnless(platform.system() == "Darwin", "requires Darwin vnode/stat ABI")
+    def test_kernel_identity_matches_complete_directory_record(self):
+        with tempfile.TemporaryDirectory(prefix="macws-root-identity-") as directory:
+            binary = str(Path(directory) / "identity")
+            subprocess.run(["clang", "-std=c11", "-O2", "-Wall", "-Wextra", "-Werror",
+                            "-I", str(ROOT / "include"),
+                            str(ROOT / "misc/test_chroot_root_identity.c"), "-o", binary], check=True)
+            result = subprocess.run([binary], check=True, capture_output=True, text=True, timeout=5)
+            self.assertIn("kernel self-root identity contract PASS", result.stdout)
+
     def test_default_namespace_is_not_selected_by_process_or_feature_flags(self):
         source = (ROOT / "libmachook/Metal_hooks.x").read_text()
         start = source.index("static void macws_rebase_application_mount_namespace(")
         end = source.index("static const char *macws_lp_utf8", start)
         namespace = source[start:end]
+        notification = source[source.index("static CFNotificationName macws_private_distributed_notification_name("):
+                              source.index("static void macws_cf_notification_post_options_compat(")]
+        self.assertNotIn("getenv(", notification)
+        self.assertIn("macws_has_verified_chroot_namespace()", notification)
+        self.assertIn("dispatch_once(&macws_chroot_identity_once", namespace)
         for retired in ("macws_needs_application_mount_namespace_compatibility",
                         'getenv("MACWS_APP_MOUNT_COMPAT")',
                         'getenv("MACWS_APP_MOUNT_COMPAT_DIAGNOSTIC")'):
@@ -47,6 +62,8 @@ class ChrootMountNamespace(unittest.TestCase):
         start = source.index("static void macws_rebase_application_mount_namespace(")
         end = source.index("static const char *macws_lp_utf8", start)
         functions = source[start:end]
+        notification = source[source.index("static CFNotificationName macws_private_distributed_notification_name("):
+                              source.index("static void macws_cf_notification_post_options_compat(")]
         harness = r'''
 #import <Foundation/Foundation.h>
 #include <objc/runtime.h>
@@ -57,7 +74,13 @@ class ChrootMountNamespace(unittest.TestCase):
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "macws_chroot_identity.h"
 static BOOL macws_chroot_root_mount_needs_rebase;
+static dispatch_once_t macws_chroot_identity_once;
+static BOOL macws_chroot_identity_verified;
+static struct statfs macws_chroot_identity_filesystem;
+static BOOL macws_has_verified_chroot_namespace(void);
+static CFNotificationCenterRef test_distributed_center(void) { return (CFNotificationCenterRef)(uintptr_t)1; }
 static fsid_t macws_chroot_root_fsid;
 static char macws_chroot_root_host_mount[MAXPATHLEN];
 static char macws_chroot_host_root[MAXPATHLEN];
@@ -66,6 +89,7 @@ static const char *test_mount = "/private/var";
 static const char *test_kernel_path;
 static int test_stat_error, test_zero_fsid, provider_calls, fcntl_calls, path_calls, trace;
 static int ns_provider_calls, method_install_calls;
+static int test_is_chroot = 1, root_identity_calls, test_proc_result = MacWSRootVnodeRecordSize;
 static Boolean provider_success = true;
 static CFURLRef provider_value;
 static char *test_getenv(const char *name) {
@@ -80,6 +104,27 @@ static int test_statfs(const char *path, struct statfs *value) {
     if (strncmp(path, "/other", 6) == 0) value->f_fsid.val[1] = 21;
     strlcpy(value->f_mntonname, test_mount, sizeof(value->f_mntonname));
     return 0;
+}
+static int test_stat(const char *path, struct stat *value) {
+    (void)path; memset(value, 0, sizeof(*value));
+    value->st_dev = 10; value->st_ino = 123; value->st_mode = S_IFDIR | 0755;
+    return 0;
+}
+static int test_proc_pidinfo(int pid, int flavor, uint64_t arg, void *buffer, int size) {
+    (void)pid; root_identity_calls++;
+    if (flavor != MacWSRootVnodeFlavor || arg || size != MacWSRootVnodeRecordSize) abort();
+    memset(buffer, 0, size);
+    if (test_is_chroot) {
+        unsigned char *bytes = buffer;
+        uint32_t dev = 10; uint16_t mode = S_IFDIR | 0755; uint64_t ino = 123;
+        fsid_t fsid = {{10, 20}};
+        memcpy(bytes + MacWSRootVnodeDeviceOffset, &dev, sizeof(dev));
+        memcpy(bytes + MacWSRootVnodeModeOffset, &mode, sizeof(mode));
+        memcpy(bytes + MacWSRootVnodeInodeOffset, &ino, sizeof(ino));
+        memcpy(bytes + MacWSRootVnodeFSIDOffset, &fsid, sizeof(fsid));
+        strcpy((char *)bytes + MacWSRootVnodePathOffset, "/");
+    }
+    return test_proc_result;
 }
 static int test_fstatfs(int descriptor, struct statfs *value) {
     (void)descriptor; return test_statfs("/", value);
@@ -126,6 +171,9 @@ static CFDictionaryRef test_cfurl_properties(CFURLRef url, CFArrayRef keys, CFEr
     return result ? (CFDictionaryRef)CFRetain((CFTypeRef)result) : NULL;
 }
 #define getenv test_getenv
+#define stat(path, value) test_stat(path, value)
+#define proc_pidinfo test_proc_pidinfo
+#define CFNotificationCenterGetDistributedCenter test_distributed_center
 #define statfs(path, value) test_statfs(path, value)
 #define fstatfs test_fstatfs
 #define fcntl test_fcntl
@@ -135,14 +183,19 @@ static CFDictionaryRef test_cfurl_properties(CFURLRef url, CFArrayRef keys, CFEr
 #define CFURLGetFileSystemRepresentation test_url_path
 #define method_setImplementation test_install_method
 #define DYLD_INTERPOSE(replacement, original)
-''' + functions + r'''
+''' + notification + functions + r'''
 #define CHECK(condition) do { if (!(condition)) { fprintf(stderr, "line %d: %s\n", __LINE__, #condition); return 1; } } while (0)
 static void reset_namespace(void) {
     macws_chroot_root_mount_needs_rebase = NO;
+    macws_chroot_identity_once = 0;
+    macws_chroot_identity_verified = NO;
+    memset(&macws_chroot_identity_filesystem, 0, sizeof(macws_chroot_identity_filesystem));
     memset(&macws_chroot_root_fsid, 0, sizeof(macws_chroot_root_fsid));
     memset(macws_chroot_root_host_mount, 0, sizeof(macws_chroot_root_host_mount));
     memset(macws_chroot_host_root, 0, sizeof(macws_chroot_host_root));
     test_stat_error = test_zero_fsid = provider_calls = fcntl_calls = path_calls = trace = 0;
+    method_install_calls = root_identity_calls = 0;
+    test_is_chroot = 1; test_proc_result = MacWSRootVnodeRecordSize;
     test_mount = "/private/var";
 }
 static CFURLRef url(const char *path) {
@@ -158,12 +211,28 @@ int main(void) {
         for (size_t i = 0; i < sizeof(invalid) / sizeof(invalid[0]); ++i) {
             reset_namespace(); test_host_root = invalid[i];
             macws_initialize_chroot_mount_namespace();
-            CHECK(!macws_chroot_root_mount_needs_rebase);
+            CHECK(macws_chroot_root_mount_needs_rebase && !macws_chroot_host_root[0]);
             struct statfs fs = {};
             test_statfs("/", &fs); macws_rebase_application_mount_namespace("/", &fs);
-            CHECK(!strcmp(fs.f_mntonname, "/private/var"));
+            CHECK(!strcmp(fs.f_mntonname, "/"));
+            CHECK(macws_has_verified_chroot_namespace() && root_identity_calls == 1);
+            CFStringRef name = CFSTR("com.apple.LaunchServices.applicationRegistered");
+            CHECK(CFEqual(macws_private_distributed_notification_name(test_distributed_center(), name),
+                          CFSTR("com.macwsguide.macOS.LaunchServices.applicationRegistered")));
+            CHECK(macws_private_distributed_notification_name(NULL, name) == name);
+            CHECK(macws_private_distributed_notification_name(test_distributed_center(), CFSTR("unrelated")) == CFSTR("unrelated"));
+            CHECK(root_identity_calls == 1);
         }
         test_host_root = "/private/var/mnt/rootfs";
+        // An inherited string must never activate a native or malformed task.
+        reset_namespace(); test_is_chroot = 0; macws_initialize_chroot_mount_namespace();
+        CHECK(!macws_chroot_identity_verified && !macws_chroot_root_mount_needs_rebase);
+        CFStringRef publicName = CFSTR("com.apple.LaunchServices.applicationRegistered");
+        CHECK(macws_private_distributed_notification_name(test_distributed_center(), publicName) == publicName);
+        CHECK(root_identity_calls == 1);
+        reset_namespace(); test_proc_result = MacWSRootVnodeRecordSize - 1;
+        macws_initialize_chroot_mount_namespace();
+        CHECK(!macws_chroot_identity_verified && !macws_chroot_root_mount_needs_rebase);
         for (int scenario = 0; scenario < 3; scenario++) {
             reset_namespace();
             if (scenario == 0) test_mount = "/";
@@ -260,6 +329,7 @@ int main(void) {
             path.write_text(harness)
             built = subprocess.run([compiler, "-O0", "-Wall", "-Wextra", "-Werror",
                                     "-Wno-unused-function", "-Wno-unused-parameter",
+                                    "-I", str(ROOT / "include"),
                                     str(path), "-framework", "Foundation", "-o", str(binary)],
                                    capture_output=True, text=True)
             self.assertEqual(built.returncode, 0, built.stderr)

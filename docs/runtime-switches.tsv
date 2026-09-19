@@ -323,7 +323,7 @@ flag	/tmp/macws_inspect_failed_pf550	off	unsafe diagnostic	Inspect failed compre
 flag	/tmp/macws_iogpu_error_diag	off	diagnostic	Raw IOGPU completion/error introspection.
 flag	/tmp/macws_kcmd_field_5e3_diag	off	diagnostic	KCMD field trace.
 flag	/tmp/macws_kcmd_field_6bc_diag	off	diagnostic	KCMD field trace.
-flag	/tmp/macws_kcmd_field_4d0_diag	off	diagnostic	Adds synchronous tracing to the Stray subtype-1 macOS +0x4d0 / normalized +0x4b0 semantic clearDepth field; zero and 1.0 are admitted and preserved byte-for-byte under MACWS_STRAY_AGX_COMPAT, as causally verified by paired PF260 depth-clear/readback probes.
+flag	/tmp/macws_kcmd_field_4d0_diag	off	obsolete production switch	Ignored and removed on upgrade; structurally verified subtype-1 zero/one clearDepth payloads are admitted and preserved byte-for-byte for every application by default, without a diagnostic marker or Stray identity.
 flag	/tmp/macws_kcmd_stray_subtype3_diag	off	diagnostic	Adds synchronous tracing to the exact Stray subtype-3 producer-version ABI family, including the NSError-bearing direct 0x210-byte resources=5/4 mode-1 record; compatibility without logging uses MACWS_STRAY_AGX_COMPAT.
 flag	/tmp/macws_kcmd_field_a4_diag	off	diagnostic	KCMD field trace.
 flag	/tmp/macws_kcmd_fix	off	obsolete production switch	Ignored and removed on upgrade; direct native-AGX command ABI translation runs with all structural checks by default.

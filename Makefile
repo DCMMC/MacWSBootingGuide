@@ -61,6 +61,7 @@ after-stage::
 		misc/vscode-aquarium-runner/README.md \
 		$(THEOS_STAGING_DIR)/usr/macOS/share/vscode/macwsguide.macws-aquarium-runner-0.0.2/
 	@install -m 0644 misc/metal2metal.py \
+		misc/ensure_office_metal2metal.py \
 		misc/metal2metal_manifest.py \
 		misc/metal2metal_profiles.py \
 		misc/repack_metallib_macabi.py \

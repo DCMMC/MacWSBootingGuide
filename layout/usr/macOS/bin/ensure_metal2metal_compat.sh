@@ -10,6 +10,7 @@ set -o pipefail
 
 ROOTFS=/var/mnt/rootfs
 METAL2METAL=/var/jb/usr/macOS/bin/metal2metal.py
+OFFICE_PROVISIONER=/var/jb/usr/macOS/bin/ensure_office_metal2metal.py
 LLVM_DIS=/var/jb/usr/lib/llvm-16/bin/llvm-dis
 LLVM_AS=/var/jb/usr/lib/llvm-16/bin/llvm-as
 APPLE_LLVM_DIS=/var/jb/usr/macOS/bin/macws-llvm-dis
@@ -23,17 +24,20 @@ BOOT_READY_MARKER=/tmp/macws-metal2metal.boot-ready
 # only while the exact scripts, sources, outputs and manifests retain their
 # filesystem identities. APFS replacement changes inode/ctime even when an
 # installer preserves mtime, while a reboot changes the first stamp field.
+# Keep fractional timestamps: same-inode, same-size corruption in one second
+# must not reuse an earlier successful verification from that second.
 metal2metal_runtime_stamp() {
 	local boot_id="" path=""
 	boot_id=$(/var/jb/usr/sbin/sysctl -n kern.bootsessionuuid 2>/dev/null |
 		/var/jb/usr/bin/tr -d '[:space:]')
 	[ -n "$boot_id" ] || return 1
 	{
-		printf 'schema=2 boot=%s\n' "$boot_id"
+		printf 'schema=3 boot=%s\n' "$boot_id"
 		for path in \
 			/var/jb/usr/macOS/bin/ensure_metal2metal_compat.sh \
 			/var/jb/usr/macOS/bin/ensure_quartzcore_compat.sh \
 			"$METAL2METAL" \
+			"$OFFICE_PROVISIONER" \
 			"$APPLE_LLVM_DIS" "$APPLE_LLVM_AS" \
 			"$ROOTFS/System/Library/Frameworks/QuartzCore.framework/Versions/A/Resources/default.metallib" \
 			"$ROOTFS/System/Library/Frameworks/QuartzCore.framework/Versions/A/Resources/default.metallib.macws-macos13.4-original" \
@@ -55,7 +59,23 @@ metal2metal_runtime_stamp() {
 			"$ROOTFS/usr/local/share/macws/mpsndarray/default-compute-macabi.metallib" \
 			"$ROUTE_DIR/mpsndarray-default.route.plist"; do
 			[ -f "$path" ] || return 1
-			/var/jb/usr/bin/stat -c '%d:%i:%s:%Y:%Z' "$path" || return 1
+			/var/jb/usr/bin/stat -c '%d:%i:%s:%y:%z' "$path" || return 1
+		done
+		# Optional installed application resources belong in this cache key too.
+		# Installing/updating Office or replacing/removing a generated artifact
+		# must invalidate the same-boot shortcut, without an enable sentinel.
+		for path in \
+			"$ROOTFS/Applications/Microsoft Word.app/Contents/Resources/Arc.bundle/Metal2DShaders.metallib.zip" \
+			"$ROOTFS/Applications/Microsoft PowerPoint.app/Contents/Resources/Arc.bundle/Metal2DShaders.metallib.zip" \
+			"$ROOTFS/Applications/Microsoft Excel.app/Contents/Resources/Arc.bundle/Metal2DShaders.metallib.zip" \
+			"$ROUTE_DIR"/office-metal2d-*.route.plist \
+			"$ROOTFS/usr/local/share/macws/metal2metal/office"/*/*.metallib; do
+			printf 'optional=%s\n' "$path"
+			if [ -f "$path" ]; then
+				/var/jb/usr/bin/stat -c '%d:%i:%s:%y:%z' "$path" || return 1
+			else
+				printf 'absent\n'
+			fi
 		done
 	} | /var/jb/usr/bin/sha256sum | /var/jb/usr/bin/awk '{print $1}'
 }
@@ -204,8 +224,20 @@ provision_route \
 	ff2d5117039292640d234037b4bc6f0081bb10d79d63a152ea72b1ec0de71ab1 \
 	1 "$APPLE_LLVM_DIS" "$APPLE_LLVM_AS" || exit 1
 
+# Office embeds a desktop-target library inside an archive rather than a
+# system-framework URL. Generate its complete native-compatible companion
+# from the installed original, preserving every shader/constant interface.
+# This is ordinary production data provisioning; /tmp is only a speed cache.
+# An unsupported optional app must not prevent Terminal/the desktop starting.
+# Do not publish a success stamp on failure, so the next preflight retries.
+office_ready=1
+if ! python3 "$OFFICE_PROVISIONER"; then
+	echo '[WARN] Office Metal compatibility provisioning failed; desktop startup remains available.' >&2
+	office_ready=0
+fi
+
 runtime_stamp=$(metal2metal_runtime_stamp 2>/dev/null || true)
-if [ -n "$runtime_stamp" ]; then
+if [ "$office_ready" = 1 ] && [ -n "$runtime_stamp" ]; then
 	marker_tmp="$BOOT_READY_MARKER.new.$$"
 	printf '%s\n' "$runtime_stamp" > "$marker_tmp" || exit 1
 	chmod 0644 "$marker_tmp" || exit 1

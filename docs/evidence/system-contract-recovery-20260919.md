@@ -116,6 +116,28 @@ stock superclass authentication intact. The functioning Terminal was left open.
 Other applications still mapping old libraries are tracked as such rather than
 claimed to be refreshed. No user documents or desktop services were closed.
 
+### Post-package new-boot Terminal acceptance
+
+After the successful `c3c8ec2` on-device package installation in the subsequent
+boot, the normal Host launcher created Terminal11054 (parent hostd8928,
+independent PGID11054). Its real New Tab menu action created bash11427 while
+the first shell11063 remained alive. Read-only mapped-image inspection of
+both Terminal11054 and bash11427 found the packaged LLVM generation:
+
+```text
+uuid=2be0ad847995373f84f4d38fb0583ae1
+text-bytes=626184
+text-sha256=1e25aa762fd7ba84df3012d716594736a1b8b9b4c41c12f5b989774de14b8124
+```
+
+The second tab received `echo macwsterminalnewboot` and a separate Return key
+through the native input ABI. The full iPadOS screenshot
+`/tmp/macws-terminal-newboot-accepted.png` was inspected and shows both tabs,
+the command, its exact result, and the returned shell prompt. This is actual
+new-tab/fork/input/output acceptance of the on-device LLVM package, not just
+an installed-file hash or process-uptime observation. No enable/debug sentinel
+was introduced for the test.
+
 ## Shipping discipline
 
 Each further production change needs a failing witness, a specific contract

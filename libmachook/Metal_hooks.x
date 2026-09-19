@@ -12,6 +12,7 @@
 #import <stdarg.h>
 #import <objc/message.h>
 #import <objc/runtime.h>
+#import <CommonCrypto/CommonDigest.h>
 #import <mach-o/dyld.h>
 #import <mach-o/getsect.h>
 #import <mach-o/loader.h>
@@ -35,6 +36,8 @@
 #include "macws_host_protocol.h"
 #include "macws_settings_paths.h"
 #include "macws_production_policy.h"
+#include "macws_chroot_identity.h"
+#include "macws_nocopy_abi.h"
 #import "MacWSFinalCompositePublisher.h"
 
 static BOOL macws_macho_has_uuid(const struct mach_header *header,
@@ -2011,6 +2014,10 @@ static BOOL macws_chroot_root_mount_needs_rebase = NO;
 static fsid_t macws_chroot_root_fsid = {};
 static char macws_chroot_root_host_mount[MAXPATHLEN] = {};
 static char macws_chroot_host_root[MAXPATHLEN] = {};
+static dispatch_once_t macws_chroot_identity_once;
+static BOOL macws_chroot_identity_verified = NO;
+static struct statfs macws_chroot_identity_filesystem = {};
+static BOOL macws_has_verified_chroot_namespace(void);
 
 // A chroot does not create a separate CF distributed-notification namespace.
 // Runtime-confirmed on iPadOS 16.3 (2026-08-21): Ventura lsd posts
@@ -2038,8 +2045,8 @@ extern CFNotificationCenterRef CFNotificationCenterGetDistributedCenter(void);
 
 static CFNotificationName macws_private_distributed_notification_name(
     CFNotificationCenterRef center, CFNotificationName name) {
-    const char *hostRoot = getenv("MACWS_CHROOT_HOST_ROOT");
-    if (!hostRoot || hostRoot[0] != '/' || !center || !name ||
+    if (!center || !name ||
+        !macws_has_verified_chroot_namespace() ||
         center != CFNotificationCenterGetDistributedCenter()) return name;
 
     static dispatch_once_t once;
@@ -2187,6 +2194,28 @@ static int macws_lp_statfs_namespace_compat(const char *path,
 // functions from within libmachook.
 DYLD_INTERPOSE(macws_lp_fstatfs_namespace_compat, fstatfs)
 DYLD_INTERPOSE(macws_lp_statfs_namespace_compat, statfs)
+
+extern int proc_pidinfo(int pid, int flavor, uint64_t arg, void *buffer,
+                        int buffersize);
+
+static BOOL macws_has_verified_chroot_namespace(void) {
+    // The same cached kernel identity drives filesystem and notification
+    // namespaces, including callers of the latter before this image's ctor.
+    // env -i can erase launch metadata but cannot erase this task's root vnode.
+    dispatch_once(&macws_chroot_identity_once, ^{
+        struct stat root = {};
+        struct statfs filesystem = {};
+        MacWSRootVnodeRecord record = {};
+        if (stat("/", &root) != 0 || statfs("/", &filesystem) != 0) return;
+        int received = proc_pidinfo(getpid(), MacWSRootVnodeFlavor, 0,
+                                    &record, sizeof(record));
+        if (!MacWSRootVnodeMatchesProcessRoot(&record, received, &root,
+                                             &filesystem)) return;
+        macws_chroot_identity_filesystem = filesystem;
+        macws_chroot_identity_verified = YES;
+    });
+    return macws_chroot_identity_verified;
+}
 
 // CFURL's resource-property provider is where NSURLParentDirectoryURLKey and
 // NSURLVolumeURLKey cross from a process-visible URL into the kernel's host
@@ -2530,28 +2559,27 @@ static ssize_t macws_fsgetpath_namespace_compat(char *buffer, size_t capacity,
 DYLD_INTERPOSE(macws_fsgetpath_namespace_compat, fsgetpath)
 
 static void macws_initialize_chroot_mount_namespace(void) {
-    // Root metadata is set by launchdchrootexec after realpath/chroot, not a
-    // feature switch. No opt-in, process allowlist or debug file may decide
-    // whether the process-visible filesystem has a coherent root. Native iOS
-    // processes without this exact launch contract remain untouched.
+    // A real kernel chroot root is authoritative even after env -i. Both the
+    // filesystem and distributed-notification adapters use this same identity;
+    // an inherited string alone cannot turn either adapter on in a native task.
+    if (!macws_has_verified_chroot_namespace()) return;
+    struct statfs rootFileSystem = macws_chroot_identity_filesystem;
+    if (rootFileSystem.f_mntonname[0] != '/' ||
+        !memchr(rootFileSystem.f_mntonname, '\0', sizeof(rootFileSystem.f_mntonname)) ||
+        strcmp(rootFileSystem.f_mntonname, "/") == 0) return;
+
+    // Optional host-prefix data remains useful for a kernel/provider that
+    // returns host paths. It is not needed to enable the namespace protocol.
+    // In the clean-env iPad control the raw fsgetpath syscall already returned
+    // process-visible paths, so do not invent a prefix when metadata is absent.
     const char *hostRoot = getenv("MACWS_CHROOT_HOST_ROOT");
     size_t rootLength = hostRoot ? strnlen(hostRoot, MAXPATHLEN) : 0;
-    if (rootLength < 2 || rootLength >= MAXPATHLEN || hostRoot[0] != '/' ||
-        hostRoot[rootLength - 1] == '/' || strstr(hostRoot, "//") ||
-        strstr(hostRoot, "/./") || strstr(hostRoot, "/../") ||
-        strcmp(hostRoot + rootLength - 2, "/.") == 0 ||
-        (rootLength >= 3 &&
-         strcmp(hostRoot + rootLength - 3, "/..") == 0)) return;
-
-    struct statfs rootFileSystem = {};
-    if (statfs("/", &rootFileSystem) != 0 ||
-        rootFileSystem.f_mntonname[0] != '/' ||
-        strcmp(rootFileSystem.f_mntonname, "/") == 0 ||
-        (!rootFileSystem.f_fsid.val[0] &&
-         !rootFileSystem.f_fsid.val[1])) return;
-
-    strlcpy(macws_chroot_host_root, hostRoot,
-            sizeof(macws_chroot_host_root));
+    if (rootLength >= 2 && rootLength < MAXPATHLEN && hostRoot[0] == '/' &&
+        hostRoot[rootLength - 1] != '/' && !strstr(hostRoot, "//") &&
+        !strstr(hostRoot, "/./") && !strstr(hostRoot, "/../") &&
+        strcmp(hostRoot + rootLength - 2, "/.") != 0 &&
+        !(rootLength >= 3 && strcmp(hostRoot + rootLength - 3, "/..") == 0))
+        strlcpy(macws_chroot_host_root, hostRoot, sizeof(macws_chroot_host_root));
     macws_chroot_root_fsid = rootFileSystem.f_fsid;
     strlcpy(macws_chroot_root_host_mount, rootFileSystem.f_mntonname,
             sizeof(macws_chroot_root_host_mount));
@@ -5391,6 +5419,18 @@ MACWS_DEFINE_STARTUP_FLAG(macws_video_diag_enabled,
                           "/tmp/macws_video_diag")
 MACWS_DEFINE_STARTUP_FLAG(macws_pipeline_diag_enabled,
                           "/tmp/macws_pipeline_diag")
+// These A/B and read-only observers use the same launch-time diagnostic
+// contract. Resolve lazily once, not once per completed frame/allocation.
+// Set/remove the sentinel before launching the target process; live
+// generation requests and capture circuit breakers are deliberately separate.
+MACWS_DEFINE_STARTUP_FLAG(macws_owned_no_read_enabled,
+                          "/tmp/macws_owned_no_read")
+MACWS_DEFINE_STARTUP_FLAG(macws_owned_unlocked_read_enabled,
+                          "/tmp/macws_owned_unlocked_read")
+MACWS_DEFINE_STARTUP_FLAG(macws_texture_stride_diag_enabled,
+                          "/private/tmp/macws_texture_stride_diag")
+MACWS_DEFINE_STARTUP_FLAG(macws_geekbench_numeric_diag_enabled,
+                          "/tmp/macws_geekbench_numeric_diag")
 
 #undef MACWS_DEFINE_STARTUP_FLAG
 
@@ -6131,9 +6171,9 @@ static id macws_geekbench_new_buffer_with_length_compat(
     id result = g_macws_geekbench_new_buffer_length_orig
         ? g_macws_geekbench_new_buffer_length_orig(
               self, selector, length, native_options) : nil;
-    if ((macws_runtime_diagnostics_enabled() ||
-         access("/tmp/macws_geekbench_numeric_diag", F_OK) == 0) &&
-        native_options != options) {
+    if (native_options != options &&
+        (macws_runtime_diagnostics_enabled() ||
+         macws_geekbench_numeric_diag_enabled())) {
         static _Atomic unsigned sequence;
         unsigned observation = atomic_fetch_add_explicit(
             &sequence, 1, memory_order_relaxed) + 1;
@@ -6582,7 +6622,7 @@ static void macws_geekbench_metal_buffer_read(
 }
 
 static void macws_install_geekbench_numeric_diagnostics(void) {
-    if (access("/tmp/macws_geekbench_numeric_diag", F_OK) != 0) return;
+    if (!macws_geekbench_numeric_diag_enabled()) return;
     const char *program = getprogname();
     if (!program || strcmp(program, "geekbench_aarch64") != 0) return;
     static const uint8_t geekbench_6_7_1_uuid[16] = {
@@ -7187,7 +7227,7 @@ static BOOL macws_vnc_publish_owned_texture(id<MTLTexture> texture) {
     // substitution itself remains reusable; unlocked_read distinguishes an
     // IOSurfaceLock coherency transition from a plain unified-memory read.
     // Neither probe is a production synchronization policy.
-    if (access("/tmp/macws_owned_no_read", F_OK) == 0) {
+    if (macws_owned_no_read_enabled()) {
         static _Atomic uint64_t noReadCount = 0;
         uint64_t n = atomic_fetch_add(&noReadCount, 1) + 1;
         if (n <= 32 || (n % 600) == 0) {
@@ -7198,8 +7238,7 @@ static BOOL macws_vnc_publish_owned_texture(id<MTLTexture> texture) {
         }
         return YES;
     }
-    BOOL unlockedRead =
-        access("/tmp/macws_owned_unlocked_read", F_OK) == 0;
+    BOOL unlockedRead = macws_owned_unlocked_read_enabled();
     if ([texture pixelFormat] != MTLPixelFormatBGRA8Unorm ||
         width < 1000 || height < 600 ||
         (!unlockedRead &&
@@ -12114,15 +12153,10 @@ static BOOL macws_pixel_format_is_block_compressed(NSUInteger pf) {
     }
 }
 
-// Opt-in evidence for plain-texture IOSurface layout failures.  Keep this
-// independent of the broad MACWS_TEX_TRACE environment switch: launchers may
-// intentionally sanitize diagnostic environment variables, while the chroot
-// sentinel remains visible at the exact allocator boundary.  This observer
-// never changes the descriptor or the IOSurface.
-static BOOL macws_texture_stride_diag_enabled(void) {
-    return access("/private/tmp/macws_texture_stride_diag", F_OK) == 0;
-}
-
+// Opt-in evidence for plain-texture IOSurface layout failures. The startup
+// diagnostic cache above is independent of MACWS_TEX_TRACE: launchers may
+// sanitize child environment variables, while the prelaunch chroot sentinel
+// remains visible. This observer never changes the descriptor or IOSurface.
 static void macws_log_plain_texture_surface_layout(
         MTLTextureDescriptor *desc, IOSurfaceRef surface,
         NSUInteger selectedBytesPerElement, uint32_t selectedPixelFormat) {
@@ -15756,6 +15790,10 @@ static void macws_install_half_float_function_compatibility(void) {
     });
 }
 
+static void macws_metal2metal_attribute_data_library(
+    id library, dispatch_data_t data, const void *mapped_bytes,
+    size_t mapped_length, BOOL substituted);
+
 static id macws_new_library_data_compat(id self, SEL selector,
                                         dispatch_data_t data,
                                         NSError **error)
@@ -15857,6 +15895,8 @@ static id macws_new_library_data_compat(id self, SEL selector,
     id result = g_macws_new_library_data_orig
         ? g_macws_new_library_data_orig(self, selector, selected_data, error)
         : nil;
+    macws_metal2metal_attribute_data_library(
+        result, data, bytes, length, substituted);
     if (transient_replacement) dispatch_release(transient_replacement);
     if (result && hash && macws_is_stray_process() &&
         macws_agx_native_enabled()) {
@@ -20299,10 +20339,13 @@ static macws_function_specialize_async_fn
 // contract. They contain exact source/output identities, the complete source
 // function set, the equally complete translated set, and function-constant
 // requirements derived from AIR metadata.
-// A library is attributed by URL when that public boundary is visible. If a
-// private framework bypasses it, equality of the COMPLETE function-name set
-// against exactly one validated manifest is accepted; one matching shader
-// name is never treated as provenance.
+// An observed data constructor is attributed by exact size+SHA-256, including
+// authoritative negative results. Otherwise a public URL may identify it; if
+// a private framework bypasses both boundaries, equality of the COMPLETE
+// function-name set against exactly one validated manifest is accepted only
+// when that manifest does not require exact source identity. Application
+// routes such as Office explicitly require it; one matching shader name is
+// never treated as provenance.
 static const void *kMacWSMetal2MetalLibraryRouteKey =
     &kMacWSMetal2MetalLibraryRouteKey;
 static const void *kMacWSMetal2MetalFunctionRouteKey =
@@ -20313,6 +20356,8 @@ static const void *kMacWSMetal2MetalCompanionFunctionKey =
     &kMacWSMetal2MetalCompanionFunctionKey;
 static const void *kMacWSMetal2MetalRouteCheckedKey =
     &kMacWSMetal2MetalRouteCheckedKey;
+static const void *kMacWSMetal2MetalDataObservedKey =
+    &kMacWSMetal2MetalDataObservedKey;
 static NSArray<NSMutableDictionary *> *g_macws_metal2metal_routes = nil;
 
 // Maps-2026-08-29-152646.ips runtime-confirmed that the generic route loader
@@ -20329,6 +20374,8 @@ typedef struct {
     NSString *routeSuffix;
     NSString *size;
     NSString *fnv1a64;
+    NSString *sha256;
+    NSString *requiresSourceIdentity;
     NSString *source;
     NSString *output;
     NSString *translation;
@@ -20346,6 +20393,7 @@ typedef struct {
     NSString *translatedFunctionCount;
     NSString *manifestPathInternal;
     NSString *sourceNamesInternal;
+    NSString *sourceDigestInternal;
     NSString *translatedNamesInternal;
     NSString *companionInternal;
     NSString *needsFunctionConstants;
@@ -20371,6 +20419,8 @@ macws_metal2metal_runtime_objects(void) {
         MACWS_M2M_STRING(routeSuffix, ".route.plist");
         MACWS_M2M_STRING(size, "size");
         MACWS_M2M_STRING(fnv1a64, "fnv1a64");
+        MACWS_M2M_STRING(sha256, "sha256");
+        MACWS_M2M_STRING(requiresSourceIdentity, "requires_source_identity");
         MACWS_M2M_STRING(source, "source");
         MACWS_M2M_STRING(output, "output");
         MACWS_M2M_STRING(translation, "translation");
@@ -20389,6 +20439,7 @@ macws_metal2metal_runtime_objects(void) {
             "translated_function_count");
         MACWS_M2M_STRING(manifestPathInternal, "_manifest_path");
         MACWS_M2M_STRING(sourceNamesInternal, "_source_names");
+        MACWS_M2M_STRING(sourceDigestInternal, "_source_sha256");
         MACWS_M2M_STRING(translatedNamesInternal, "_translated_names");
         MACWS_M2M_STRING(companionInternal, "_companion");
         MACWS_M2M_STRING(needsFunctionConstants,
@@ -20426,6 +20477,35 @@ static uint64_t macws_metal2metal_hex64(NSString *text, BOOL *valid) {
     return (uint64_t)value;
 }
 
+static NSData *macws_metal2metal_sha256(const void *bytes, size_t length) {
+    if (!bytes || !length || length > UINT32_MAX) return nil;
+    unsigned char digest[CC_SHA256_DIGEST_LENGTH];
+    if (!CC_SHA256(bytes, (CC_LONG)length, digest)) return nil;
+    return [NSData dataWithBytes:digest length:sizeof(digest)];
+}
+
+static NSData *macws_metal2metal_digest_from_hex(id value) {
+    if (![value isKindOfClass:[NSString class]] ||
+        [(NSString *)value length] != CC_SHA256_DIGEST_LENGTH * 2) return nil;
+    const char *text = [(NSString *)value UTF8String];
+    if (!text || strlen(text) != CC_SHA256_DIGEST_LENGTH * 2) return nil;
+    unsigned char digest[CC_SHA256_DIGEST_LENGTH];
+    for (size_t index = 0; index < sizeof(digest); index++) {
+        unsigned result = 0;
+        for (size_t part = 0; part < 2; part++) {
+            unsigned char character = text[index * 2 + part];
+            unsigned nibble;
+            if (character >= '0' && character <= '9') nibble = character - '0';
+            else if (character >= 'a' && character <= 'f') nibble = character - 'a' + 10;
+            else if (character >= 'A' && character <= 'F') nibble = character - 'A' + 10;
+            else return nil;
+            result = result * 16 + nibble;
+        }
+        digest[index] = (unsigned char)result;
+    }
+    return [NSData dataWithBytes:digest length:sizeof(digest)];
+}
+
 static BOOL macws_metal2metal_identity_matches(
         NSDictionary *identity, NSString *path) {
     if (![identity isKindOfClass:[NSDictionary class]] || !path.length)
@@ -20438,9 +20518,13 @@ static BOOL macws_metal2metal_identity_matches(
     BOOL hash_valid = NO;
     uint64_t expected_hash = macws_metal2metal_hex64(
         identity[keys->fnv1a64], &hash_valid);
+    NSData *expected_digest = macws_metal2metal_digest_from_hex(
+        identity[keys->sha256]);
     return data && [expected_size isKindOfClass:[NSNumber class]] &&
         data.length == expected_size.unsignedLongLongValue && hash_valid &&
-        macws_source_fnv1a64(data.bytes, data.length) == expected_hash;
+        macws_source_fnv1a64(data.bytes, data.length) == expected_hash &&
+        expected_digest && [expected_digest isEqualToData:
+            macws_metal2metal_sha256(data.bytes, data.length)];
 }
 
 static NSArray<NSMutableDictionary *> *macws_metal2metal_routes(void) {
@@ -20508,6 +20592,8 @@ static NSArray<NSMutableDictionary *> *macws_metal2metal_routes(void) {
             NSMutableDictionary *route = [manifest mutableCopy];
             route[keys->manifestPathInternal] = manifest_path;
             route[keys->sourceNamesInternal] = source_set;
+            route[keys->sourceDigestInternal] =
+                macws_metal2metal_digest_from_hex(source[keys->sha256]);
             route[keys->translatedNamesInternal] = translated_set;
             [loaded addObject:route];
             [route release];
@@ -20523,6 +20609,51 @@ static NSArray<NSMutableDictionary *> *macws_metal2metal_routes(void) {
         g_macws_metal2metal_routes = loaded;
     });
     return g_macws_metal2metal_routes;
+}
+
+// A public data constructor is stronger provenance than a coincidentally
+// identical function-name set. Attribute only bytes actually admitted by the
+// original constructor, without changing its data, result, or NSError.
+// ANGLE/Stray's separate byte substitutions must never inherit the original
+// input's route. Their resulting libraries receive an authoritative negative
+// data observation instead; their existing replacement behavior is unchanged.
+static void macws_metal2metal_attribute_data_library(
+        id library, dispatch_data_t data, const void *mapped_bytes,
+        size_t mapped_length, BOOL substituted) {
+    if (!library || !macws_agx_native_enabled()) return;
+    const MacWSMetal2MetalRuntimeObjects *keys =
+        macws_metal2metal_runtime_objects();
+    NSMutableDictionary *match = nil;
+    dispatch_data_t owned_map = NULL;
+    size_t length = data ? dispatch_data_get_size(data) : 0;
+    BOOL candidate_size = NO;
+    NSArray *routes = substituted ? nil : macws_metal2metal_routes();
+    for (NSMutableDictionary *route in routes) {
+        if ([route[keys->source][keys->size] unsignedLongLongValue] == length &&
+            length != 0) { candidate_size = YES; break; }
+    }
+    if (candidate_size) {
+        const void *bytes = mapped_bytes;
+        size_t observed_length = mapped_length;
+        if (!bytes || observed_length != length)
+            owned_map = dispatch_data_create_map(data, &bytes, &observed_length);
+        NSData *digest = bytes && observed_length == length
+            ? macws_metal2metal_sha256(bytes, length) : nil;
+        if (digest) for (NSMutableDictionary *route in routes) {
+            if ([route[keys->source][keys->size] unsignedLongLongValue] != length ||
+                ![route[keys->sourceDigestInternal] isEqualToData:digest]) continue;
+            if (match) { match = nil; break; } // Duplicate identities fail closed.
+            match = route;
+        }
+    }
+    if (owned_map) dispatch_release(owned_map);
+    // Clear any earlier weaker attribution if Metal returned a cached object.
+    objc_setAssociatedObject(library, kMacWSMetal2MetalLibraryRouteKey, match,
+        OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(library, kMacWSMetal2MetalRouteCheckedKey,
+        keys->checkedMarker, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(library, kMacWSMetal2MetalDataObservedKey,
+        keys->checkedMarker, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 }
 
 static NSMutableDictionary *macws_metal2metal_route_for_url(NSURL *url) {
@@ -20554,7 +20685,7 @@ static NSMutableDictionary *macws_metal2metal_route_for_library(id library) {
     NSMutableDictionary *associated = objc_getAssociatedObject(
         library, kMacWSMetal2MetalLibraryRouteKey);
     if (associated) return associated;
-    // Most application libraries are not one of the three framework inputs
+    // Most application libraries are not one of the packaged inputs
     // in the validated route directory.  Their function-name set is
     // immutable after MTLLibrary creation, so a complete negative match is
     // authoritative for that object.  Without this marker every hooked
@@ -20574,6 +20705,11 @@ static NSMutableDictionary *macws_metal2metal_route_for_library(id library) {
         macws_metal2metal_runtime_objects();
     NSMutableDictionary *match = nil;
     for (NSMutableDictionary *route in macws_metal2metal_routes()) {
+        // This is only the unobserved private-library fallback. Any explicit
+        // source-identity policy (including malformed/unknown values) refuses
+        // inference from names. Exact Data and URL attribution returned above
+        // remains authoritative, and existing system manifests are unchanged.
+        if (route[keys->requiresSourceIdentity]) continue;
         NSSet *expected = route[keys->sourceNamesInternal];
         if (![observed isEqualToSet:expected]) continue;
         if (match) {
@@ -20673,6 +20809,11 @@ static id macws_new_library_url_metal2metal(
                            : "(nil)");
     }
     if (!library || !macws_agx_native_enabled()) return library;
+
+    // Some URL implementations delegate to the observed data constructor.
+    // Do not replace its exact positive/negative result with path inference.
+    if (objc_getAssociatedObject(library, kMacWSMetal2MetalDataObservedKey))
+        return library;
 
     const MacWSMetal2MetalRuntimeObjects *keys =
         macws_metal2metal_runtime_objects();
@@ -22074,14 +22215,11 @@ static void install_agx_init_redirect(Class agx) {
     }
 #endif // !arm64e || !on-device — MTLFakeDevice unavailable on arm64e on-device
 
-    // -[AGXBuffer initWithDevice:bytes:length:options:deallocator:
-    //                pinnedGPUAddress:] is what SkyLight calls (caller chain
-    // confirmed via backtrace in IOConnectCallMethod_new).  When `bytes` is
-    // malloc'd CPU memory the iOS IOGPU kernel rejects the sel=0xa type=0x80
-    // sub-resource — Apple's malloc returns pages with a private (non-MAP_
-    // SHARED) backing that the GPU can't pin.  Same trick as the existing
-    // MTLFakeDevice hooked_newBufferWithBytesNoCopy: vm_remap to a MAP_SHARED
-    // mirror, pass that VA to %orig, and chain the deallocator to free both.
+    // Public NoCopy buffers retain their original CPU allocation. The former
+    // copy-and-early-deallocate redirect breaks that contract (and Office's
+    // DirectSharedBuffer). Native PRIVATE mmap pages work: the measured
+    // incompatibility is the producer's extra alignment slot in ResCreate.
+    // See docs/evidence/office-nocopy-contract-20260919.md.
     Class agxbuf = objc_getClass("AGXBuffer");
     if (agxbuf) {
         SEL bytes_sel = sel_registerName(
@@ -22093,6 +22231,14 @@ static void install_agx_init_redirect(Class agx) {
                                   uint64_t);
             static orig_t s_orig = NULL;
             s_orig = (orig_t)method_getImplementation(m);
+            Method resource_initializer = class_getInstanceMethod(
+                objc_getClass("IOGPUMetalBuffer"), sel_registerName(
+                "initWithDevice:pointer:length:alignment:options:sysMemSize:gpuAddress:args:argsSize:deallocator:"));
+            BOOL nocopy_abi_ready = resource_initializer &&
+                MacWSAGXNoCopyABIReady(
+                    ptrauth_strip((void *)s_orig, ptrauth_key_function_pointer),
+                    ptrauth_strip((void *)method_getImplementation(
+                        resource_initializer), ptrauth_key_function_pointer));
             IMP shim = imp_implementationWithBlock(^id(
                     id self, id dev, void *bytes, NSUInteger length,
                     NSUInteger opt,
@@ -22109,54 +22255,39 @@ static void install_agx_init_redirect(Class agx) {
                         bytes ? malloc_size(bytes) : 0);
                     seen_log++;
                 }
-                // 2026-06-19 — when pinnedGPUAddress != 0 the caller (e.g.
-                // SkyLight MetalTiledBacking::PrepareForUse) wants the
-                // buffer placed at a specific GPU VA. On macOS this maps
-                // to kernel sel=0x9 type=0x80 scanout-class allocation,
-                // which iOS kernel treats as a display-engine source —
-                // wires our buffer to the physical LCD and corrupts iOS UI
-                // (proven 2026-06-19). The kernel's NoMemory rejection is
-                // the safe behavior. Short-circuit to nil here so we don't
-                // call %orig (which would call IOGPUResourceCreate and try
-                // sel=0x9 type=0x80). SkyLight's PrepareForUse already has
-                // a tolerate-nil hook in mac_hooks.m, so nil should flow
-                // through.
-                // The current native redirect defaults on. Only the explicit
-                // MACWS_AGX_KEEP_PINNED_ALLOC diagnostic retains the old
-                // path for A/B comparison; no enable variable is required.
-                // 2026-06-20 — Widened gate. Previously only fired when
-                // pinnedGPUAddress != 0, but runtime traces show this init
-                // is called with pinnedGPUAddress=0 from
-                // MetalTiledBacking::PrepareForUse AND the internal code
-                // path still goes to kernel sel=0x9 type=0x80 (which
-                // iOS rejects). The init-bytes variant always routes
-                // through that broken path. Redirect for any AGX-native
-                // invocation.
+                if (nocopy_abi_ready && macws_agx_native_enabled() &&
+                    pinnedGPUAddress == 0 && ((opt >> 4) & 0xf) <= 1 &&
+                    MacWSNoCopySpanValid((uintptr_t)bytes, length,
+                                        (size_t)vm_page_size)) {
+                    struct MacWSNoCopyScope scope = {
+                        (uintptr_t)bytes, length, (size_t)vm_page_size,
+                        g_macws_nocopy_scope};
+                    g_macws_nocopy_scope = &scope;
+                    @try {
+                        // Preserve self, storage mode, allocation ownership,
+                        // and the deallocator. A real failure stays a failure.
+                        return s_orig(self, bytes_sel, dev, bytes, length, opt,
+                                      deallocator, pinnedGPUAddress);
+                    } @finally {
+                        g_macws_nocopy_scope = scope.previous;
+                    }
+                }
+                // Legacy scaffold retained for unverified pinned/internal
+                // paths outside the measured ordinary NoCopy ABI above.
+                // Historical comments treated every type=0x80 request as
+                // structurally unusable. The measured 104->96-byte producer
+                // translation disproves that for normal unpinned buffers.
+                // The remaining redirect does NOT preserve CPU aliasing,
+                // requested GPU VA, or the original allocation's lifetime;
+                // its successful return must not be called a contract fix.
+                // MACWS_AGX_KEEP_PINNED_ALLOC is only the existing diagnostic
+                // bypass for this legacy branch, never a production enable.
                 if (macws_agx_native_enabled() &&
                     !getenv("MACWS_AGX_KEEP_PINNED_ALLOC")) {
-                    // 2026-06-20 — REDIRECT-iOS-NATIVE.
-                    // Previously this returned nil because the macOS-pattern
-                    // pinnedGPUAddress: call routes through kernel sel=0x9
-                    // type=0x80 (scanout class) which iOS structurally
-                    // rejects from chroot. The "self-implement tile buffer"
-                    // detour was overcomplicated.
-                    //
-                    // Real fix: just redirect to `[device newBufferWithLength:
-                    // options:]` — iOS-native Metal's normal buffer alloc
-                    // which goes through kernel sel=0x9 type=0 heap (known
-                    // working, 3700+ successes per WS lifetime). The buffer
-                    // gets a GPU VA from AGX (not the caller-requested
-                    // pinned VA). SkyLight queries it via [buffer gpuAddress]
-                    // at bind time, so the mismatch is transparent to
-                    // downstream code. iOS Metal tile-pipeline support is
-                    // native on M1 — blur/vibrancy should render properly
-                    // once the buffer is alloc'd through this iOS-compatible
-                    // path.
-                    //
-                    // If the caller supplied init `bytes`, memcpy them into
-                    // the new buffer's CPU contents. Invoke their deallocator
-                    // immediately since we no longer need the original
-                    // pointer.
+                    // Preserve existing behavior until those remaining
+                    // callers have an independently verified native ABI.
+                    // This creates separate storage and copies initial data
+                    // only; later writes to the original pointer are lost.
                     static int redirect_log = 0;
                     if (diagnostics && redirect_log++ < 8) {
                         fprintf(stderr,
@@ -22178,8 +22309,8 @@ static void install_agx_init_redirect(Class agx) {
                             if (contents) memcpy(contents, bytes, length);
                         }
                         if (deallocator) {
-                            // Caller expects bytes to be freed eventually.
-                            // We've copied; release them now.
+                            // Known legacy lifetime violation. The verified
+                            // NoCopy branch above never invokes this early.
                             deallocator(bytes, length);
                         }
                         if (diagnostics && redirect_log < 12) {

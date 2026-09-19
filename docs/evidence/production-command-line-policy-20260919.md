@@ -60,3 +60,35 @@ admission instead of relying on a separate manual step. Package checking also
 includes the actual compiler tweak and VS Code job; the latter must agree with
 the current source configuration as well as the archived/staged bytes. New
 tests cover these admission failures and old compiler/browser payloads.
+
+## Subsequent real no-CDP launch and web acceptance
+
+After the verified package payload was published, the old VS Code job was
+revalidated as `active count = 0`, `state = not running`, with no PID and the
+exact expected plist path and old arguments. Only that idle registration was
+booted out (status 0; subsequent print 113/absent). The ordinary Host web-URL
+command then launched PID 66614 from the installed production template:
+
+```text
+ok=yes launched-pid=66614 message=链接已由 VS Code Simple Browser 接收
+connect 127.0.0.1:9222 errno=61
+```
+
+Both actual process argv and loaded launchd arguments lacked remote-debugging
+and wildcard-origin options. The independent native iPadOS composite screenshot
+`/tmp/macws-vscode-no-cdp-web-20260919.png` visibly shows the Example Domain
+page inside VS Code at `https://example.com/`. This validates real web delivery
+and rendering without CDP, not merely the extension's acknowledgement.
+
+Quit acceptance is **not** passed by that test. Old PID 4696 exited after the
+ordinary AppKit PerformQuit request, and fresh PID 66614 exited after its real
+enabled Quit menu item, but both launchd observations reported:
+
+```text
+last terminating signal = Bad system call: 12
+```
+
+The latter menu request reported `completion=UNVERIFIED` before that explicit
+exit check. No new matching crash report was found at that point. Disappearance
+of the window is not counted as a clean quit, and these results alone do not
+identify the failing syscall or attribute it to the flag migration.

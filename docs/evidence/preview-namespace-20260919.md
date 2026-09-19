@@ -162,6 +162,10 @@ was an `NSFileVersion` missing-backup-file error for the disposable test PDF's
 
 ## Actual drawing, zoom, save and reopen acceptance
 
+The visual acceptance in this section used the **Apple-ld64-linked namespace
+candidate**, UUID `7C247FAD-482D-31F4-9008-04B4D4FC060C`. It is not a visual
+acceptance result for the later on-device LLVM-lld package.
+
 The controlling agent exercised real Preview UI on PID 28300, not a synthetic
 rendering probe. A new green stroke appeared above the document heading while
 the original annotations remained visible. It stayed visible while zooming
@@ -235,3 +239,20 @@ The VS Code startup preflight no longer requires the retired
 shell check block with the remaining required settings but without that
 obsolete opt-in. Namespace identity comes from the launcher/root filesystem,
 not from retaining an ignored compatibility switch to satisfy admission.
+
+## Later on-device package: separate acceptance scope
+
+The e55eb2d LLVM-lld build passed isolated, signed device probes for namespace
+APIs and native Metal rendering followed by fork on **both** arm64 and arm64e.
+Those are real functional checks, but they do not repeat the Preview UI
+drawing/zoom/save/reopen matrix above. A fresh LLVM-backed VS Code displayed
+the real example.com page without CDP; its subsequent real Quit ended with
+launchd reporting `Bad system call: 12`. The webpage result passed; normal
+Quit did not. Neither result may be substituted for Preview acceptance.
+
+After the next device boot, the c3c8ec2 package was checked read-only against
+its source, staging, Windowing manifest and archive. All 18 device artifact
+tests passed. The compiler and libmachook slices retained the same UUID,
+raw `__text` hash and chained-fixup payload hash as the e55eb2d candidates.
+This establishes on-disk execution-artifact parity, not current process
+mapping identity or a new-boot Preview visual result.

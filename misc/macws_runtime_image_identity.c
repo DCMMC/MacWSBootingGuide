@@ -22,7 +22,12 @@ extern kern_return_t mach_vm_read_overwrite(vm_map_t, mach_vm_address_t,
 static const char *const processes[] = {
     "MTLCompilerService", "WindowServer", "MacWSHost", "SpringBoard",
     "runningboardd", "macwsinputd", "macwsdisplayd", "macwshostd",
-    "macwsaudiooutd", "macwsallocd", "autosignd", "OSXvnc-server", NULL
+    "macwsaudiooutd", "macwsallocd", "autosignd", "OSXvnc-server",
+    // Explicit representative consumers for installed-vs-mapped acceptance.
+    // Still inspect only the allowlisted image headers/text below, never
+    // application documents, heap, stack, environment, or arbitrary images.
+    "Terminal", "bash", "Finder", "Preview", "Weather", "Electron",
+    "iconservicesagent", "com.apple.quicklook.ThumbnailsAgent", NULL
 };
 static const char *const images[] = {
     "MTLCompilerService", "MTLCompilerBypassOSCheck.dylib", "WindowServer",

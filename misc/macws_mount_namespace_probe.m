@@ -15,7 +15,31 @@
 #include <dlfcn.h>
 #include <ptrauth.h>
 #include <mach/mach.h>
-#include <mach/mach_vm.h>
+#include <mach-o/dyld.h>
+#include <mach-o/loader.h>
+
+static void describe_hook_identity(void) {
+    printf("namespace launch metadata=%s\n", getenv("MACWS_CHROOT_HOST_ROOT") ?: "<absent>");
+    for (uint32_t i = 0; i < _dyld_image_count(); i++) {
+        const char *name = _dyld_get_image_name(i);
+        if (!name || !strstr(name, "libmachook")) continue;
+        const struct mach_header_64 *header = (const struct mach_header_64 *)_dyld_get_image_header(i);
+        if (!header || header->magic != MH_MAGIC_64 || header->sizeofcmds > 65536) continue;
+        const unsigned char *cursor = (const unsigned char *)(header + 1);
+        const unsigned char *end = cursor + header->sizeofcmds;
+        for (uint32_t n = 0; n < header->ncmds && (size_t)(end-cursor) >= sizeof(struct load_command); n++) {
+            const struct load_command *command = (const struct load_command *)cursor;
+            if (command->cmdsize < sizeof(*command) || command->cmdsize > (size_t)(end-cursor)) break;
+            if (command->cmd == LC_UUID && command->cmdsize == sizeof(struct uuid_command)) {
+                const struct uuid_command *uuid = (const struct uuid_command *)command;
+                printf("namespace mapped-image=%s UUID=", name);
+                for (unsigned byte = 0; byte < sizeof(uuid->uuid); byte++) printf("%02X", uuid->uuid[byte]);
+                putchar('\n');
+            }
+            cursor += command->cmdsize;
+        }
+    }
+}
 
 static void describe_provider_method(id receiver, const char *selector) {
     Method method = class_getInstanceMethod(object_getClass(receiver),
@@ -25,9 +49,9 @@ static void describe_provider_method(id receiver, const char *selector) {
     Dl_info image = {};
     (void)dladdr((void *)entry, &image);
     uint32_t code[64] = {};
-    mach_vm_size_t received = 0;
-    kern_return_t result = mach_vm_read_overwrite(mach_task_self(), entry,
-        sizeof(code), (mach_vm_address_t)code, &received);
+    vm_size_t received = 0;
+    kern_return_t result = vm_read_overwrite(mach_task_self(), (vm_address_t)entry,
+        sizeof(code), (vm_address_t)code, &received);
     printf("NSURL-provider selector=%s class=%s image=%s offset=%#lx read=%d bytes=%llu code=",
         selector, object_getClassName(receiver), image.dli_fname ?: "?",
         (unsigned long)(entry - (uintptr_t)image.dli_fbase), result,
@@ -75,8 +99,12 @@ static BOOL verify(const char *path) {
     char rootPath[PATH_MAX] = {}, filePath[PATH_MAX] = {}, canonical[PATH_MAX] = {};
     ssize_t rootLength = fsgetpath(rootPath, sizeof(rootPath), &root.f_fsid, rootNode.st_ino);
     ssize_t fileLength = fsgetpath(filePath, sizeof(filePath), &byPath.f_fsid, node.st_ino);
+    // Do not short-circuit this independent witness after a statfs mismatch:
+    // that previously left canonical empty and falsely reported file-ID failure.
+    BOOL canonicalResolved = realpath(path, canonical) != NULL;
+    BOOL fileIDMatches = fileLength > 0 && canonicalResolved && !strcmp(filePath, canonical);
     ok = ok && rootLength > 0 && !strcmp(rootPath, "/") && fileLength > 0 &&
-        realpath(path, canonical) && !strcmp(filePath, canonical);
+        fileIDMatches;
     CFURLRef rootURL = CFURLCreateFromFileSystemRepresentation(NULL, (const UInt8 *)"/", 1, true);
     CFURLRef fileURL = CFURLCreateFromFileSystemRepresentation(NULL, (const UInt8 *)path, strlen(path), false);
     CFTypeRef parent = NULL, volume = NULL;
@@ -133,7 +161,7 @@ static BOOL verify(const char *path) {
     printf("namespace pid=%d statfs=%s fstatfs=%s root-fileid=%s fileid-matches=%d "
            "root-parent-nil=%d cf-volume-root=%d ns-volume-root=%d result=%s\n",
            getpid(), byPath.f_mntonname, byDescriptor.f_mntonname, rootPath,
-           fileLength > 0 && !strcmp(filePath, canonical), rootParentNil, volumeRoot,
+           fileIDMatches, rootParentNil, volumeRoot,
            foundationRoot, ok ? "PASS" : "FAIL");
     if (parent) CFRelease(parent);
     if (volume) CFRelease(volume);
@@ -148,6 +176,7 @@ int main(int argc, const char **argv) {
         return 64;
     }
     alarm(8);
+    describe_hook_identity();
     @autoreleasepool {
         if (!verify(argv[1])) return 1;
         fflush(stdout);

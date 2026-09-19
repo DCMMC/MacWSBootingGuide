@@ -41,3 +41,43 @@ com.macwsguide.hostd upgrade activation DEFERRED: job is already loaded (PID 926
 The independent hostd child-spawn correction places future GUI processes
 in their own process groups. That does not retroactively isolate existing
 children, so the conservative installer policy is still necessary.
+
+## Completed replacement installation on the subsequent boot
+
+The device had already rebooted before this test resumed; the test did not
+initiate that reboot. With the GUI stack stopped, source commit `c3c8ec2`
+and the clean device checkout were verified against package SHA256
+`e323c43b713a76d70bba133069b24a825ff797914477310183f33f2f3d86e674`.
+The independent installer receipt
+`/tmp/macws-install-c3c8ec2-20260919-newboot.json` records:
+
+```text
+dpkg_returncode: 0
+Status: install ok installed
+MACWS_FINAL_DPKG_STATUS=0
+```
+
+The actual maintainer output deferred loaded hostd342 and kept the absent
+input/Dock jobs stopped. It did not restart the existing services. This
+completed transaction supersedes the earlier intentionally aborted,
+half-configured transaction; the latter is retained as historical evidence.
+
+Separately, to exercise the new launcher while no GUI applications existed,
+hostd342 alone was stopped and a fresh inventory confirmed no other live
+process-group members or children. Only then was its exact job reloaded,
+creating hostd8928. This quiescent diagnostic activation is not an automatic
+installer operation. A normal Host launch subsequently produced:
+
+```text
+ PID   PPID  PGID
+ 8928     1  8928 /var/jb/usr/macOS/bin/macwshostd
+11054  8928 11054 /System/Applications/Utilities/Terminal.app/Contents/MacOS/Terminal
+```
+
+The ordinary startup checked 172 native/rootfs sentinel paths with none
+present, reported production diagnostics OFF, and reached the first frame
+in 105 seconds without a retry. The native iPadOS capture
+`/tmp/macws-first-gui-20260919-newboot.png` was inspected: Finder's desktop,
+Dock and the Host control center were visible. This is a real no-flag GUI
+startup acceptance in an already-booted device session, not proof of an
+unattended full iPad reboot or a claim that its startup time is optimized.

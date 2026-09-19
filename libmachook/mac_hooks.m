@@ -39,6 +39,9 @@
 #include "macws_agx_compute_abi.h"
 #include "macws_production_policy.h"
 #include "macws_diagnostics_policy.h"
+#include "macws_iosurface_protection_abi.h"
+#include "macws_iosurface_layout_abi.h"
+#include "macws_nocopy_abi.h"
 
 // These macOS code-signing entry points are present in the iPadOS shared
 // cache and used by Ventura's CoreLocationAgent, but the iPhoneOS SDK omits
@@ -368,8 +371,6 @@ MACWS_DEFINE_STARTUP_FLAG(macws_kcmd_field_5e3_diag_enabled,
                           "/tmp/macws_kcmd_field_5e3_diag")
 MACWS_DEFINE_STARTUP_FLAG(macws_kcmd_field_6bc_diag_enabled,
                           "/tmp/macws_kcmd_field_6bc_diag")
-MACWS_DEFINE_STARTUP_FLAG(macws_kcmd_field_4d0_diag_enabled,
-                          "/tmp/macws_kcmd_field_4d0_diag")
 MACWS_DEFINE_STARTUP_FLAG(macws_kcmd_stray_subtype3_diag_enabled,
                           "/tmp/macws_kcmd_stray_subtype3_diag")
 
@@ -1308,6 +1309,10 @@ extern size_t IOSurfaceGetBytesPerRow(IOSurfaceRef surface);
 extern size_t IOSurfaceGetBytesPerElement(IOSurfaceRef surface);
 extern size_t IOSurfaceGetPlaneCount(IOSurfaceRef surface);
 extern OSType IOSurfaceGetPixelFormat(IOSurfaceRef surface);
+extern uint64_t IOSurfaceGetProtectionOptions(IOSurfaceRef surface);
+extern uint64_t IOSurfaceClientGetProtectionOptions(void *client);
+uint64_t macws_IOSurfaceGetProtectionOptions(IOSurfaceRef surface);
+uint64_t macws_IOSurfaceClientGetProtectionOptions(void *client);
 extern size_t IOSurfaceGetWidthOfPlane(IOSurfaceRef surface, size_t plane);
 extern size_t IOSurfaceGetHeightOfPlane(IOSurfaceRef surface, size_t plane);
 extern int IOSurfaceLock(IOSurfaceRef surface, uint32_t options,
@@ -1885,6 +1890,16 @@ static void macws_repair_got_via_symtab(const struct mach_header_64 *header,
                 // compatibility wrappers below; these are semantic field
                 // recoveries, not constant check bypasses.
                 if (strstr(image_name, "AGXMetal13_3") &&
+                    !strcmp(lookup, "IOSurfaceGetProtectionOptions")) {
+                    resolved = (void *)macws_IOSurfaceGetProtectionOptions;
+                    force_override = 1;
+                } else if (strstr(image_name, "AGXMetal13_3") &&
+                           !strcmp(lookup,
+                               "IOSurfaceClientGetProtectionOptions")) {
+                    resolved =
+                        (void *)macws_IOSurfaceClientGetProtectionOptions;
+                    force_override = 1;
+                } else if (strstr(image_name, "AGXMetal13_3") &&
                     !strcmp(lookup,
                         "IOSurfaceGetCompressionTypeOfPlane")) {
                     resolved =
@@ -4791,12 +4806,15 @@ static void macws_optimize_stray_steam_overlay_debug_label(
                            sizeof(sequence[kFormatCallIndex]), ^{
         sequence[kFormatCallIndex] = replacement;
     });
-    dprintf(STDERR_FILENO,
-        "#### MACWS-STEAM-OVERLAY label optimization %s at %p "
-        "format=constant debug-group=preserved\n",
-        sequence[kFormatCallIndex] == replacement ? "installed" :
-                                                   "write-failed",
-        &sequence[kFormatCallIndex]);
+    if (sequence[kFormatCallIndex] != replacement ||
+        macws_runtime_diagnostics_enabled()) {
+        dprintf(STDERR_FILENO,
+            "#### MACWS-STEAM-OVERLAY label optimization %s at %p "
+            "format=constant debug-group=preserved\n",
+            sequence[kFormatCallIndex] == replacement ? "installed" :
+                                                       "write-failed",
+            &sequence[kFormatCallIndex]);
+    }
 }
 
 void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) {
@@ -11212,10 +11230,12 @@ mach_msg_return_t mach_msg_new(mach_msg_header_t *message,
             originalCoreServicesTaskPort = coreServicesTaskDescriptor->name;
             coreServicesTaskDescriptor->name = bridgePort;
             usingCoreServicesMapBridge = true;
-            dprintf(STDERR_FILENO,
-                    "#### CORESERVICES-MAP-BRIDGE client pid=%d "
-                    "message=10054 task-self=%u bridge-port=%u\n",
-                    getpid(), originalCoreServicesTaskPort, bridgePort);
+            if (macws_runtime_diagnostics_enabled()) {
+                dprintf(STDERR_FILENO,
+                        "#### CORESERVICES-MAP-BRIDGE client pid=%d "
+                        "message=10054 task-self=%u bridge-port=%u\n",
+                        getpid(), originalCoreServicesTaskPort, bridgePort);
+            }
         } else {
             dprintf(STDERR_FILENO,
                     "#### CORESERVICES-MAP-BRIDGE client pid=%d "
@@ -11252,12 +11272,15 @@ mach_msg_return_t mach_msg_new(mach_msg_header_t *message,
         // the request buffer with its reply and must not be edited.
         if (result != MACH_MSG_SUCCESS && coreServicesTaskDescriptor)
             coreServicesTaskDescriptor->name = originalCoreServicesTaskPort;
-        dprintf(STDERR_FILENO,
-                "#### CORESERVICES-MAP-BRIDGE client-result pid=%d "
-                "message=10054 result=%#x reply-id=%d reply-size=%u\n",
-                getpid(), result,
-                result == MACH_MSG_SUCCESS ? message->msgh_id : 0,
-                result == MACH_MSG_SUCCESS ? message->msgh_size : 0);
+        if (result != MACH_MSG_SUCCESS ||
+            macws_runtime_diagnostics_enabled()) {
+            dprintf(STDERR_FILENO,
+                    "#### CORESERVICES-MAP-BRIDGE client-result pid=%d "
+                    "message=10054 result=%#x reply-id=%d reply-size=%u\n",
+                    getpid(), result,
+                    result == MACH_MSG_SUCCESS ? message->msgh_id : 0,
+                    result == MACH_MSG_SUCCESS ? message->msgh_size : 0);
+        }
     }
     if (tracePostRendezvous && postRendezvousRecord < 256) {
         char line[384];
@@ -11679,11 +11702,13 @@ static bool macws_core_services_bridge_map(
 
     *address = message.reply.address;
     *resultOut = message.reply.result;
-    dprintf(STDERR_FILENO,
-            "#### CORESERVICES-MAP-BRIDGE server pid=%d target=%u "
-            "object=%u size=%#llx result=%#x address=%#llx\n",
-            getpid(), targetTask, object, (unsigned long long)size,
-            *resultOut, (unsigned long long)*address);
+    if (*resultOut != KERN_SUCCESS || macws_runtime_diagnostics_enabled()) {
+        dprintf(STDERR_FILENO,
+                "#### CORESERVICES-MAP-BRIDGE server pid=%d target=%u "
+                "object=%u size=%#llx result=%#x address=%#llx\n",
+                getpid(), targetTask, object, (unsigned long long)size,
+                *resultOut, (unsigned long long)*address);
+    }
     return true;
 }
 
@@ -14471,9 +14496,11 @@ static BOOL macws_install_qlsatellite_connection_owner(void) {
     }
     method_setImplementation(method,
                              (IMP)macws_qlsatellite_set_connection);
-    dprintf(STDERR_FILENO,
-            "#### MACWS-QUICKLOOK-XPC connection owner installed "
-            "class=%p method=%p\n", satelliteClass, method);
+    if (macws_runtime_diagnostics_enabled()) {
+        dprintf(STDERR_FILENO,
+                "#### MACWS-QUICKLOOK-XPC connection owner installed "
+                "class=%p method=%p\n", satelliteClass, method);
+    }
     return YES;
 }
 
@@ -14595,6 +14622,291 @@ DYLD_INTERPOSE(macws_xpc_main, macws_xpc_main_raw);
 // The simplest hack (DYLD_INTERPOSE GetClientShared to fall back to the
 // resource pointer when it returns NULL) was tried + reverted — user
 // asked for structural understanding first, not whack-a-mole.
+
+// IOSurface protection metadata compatibility. See the bounded native/macOS
+// controls in docs/evidence/weather-mission-control-20260919.md.
+//
+// Ventura's Client getter reads client+0xc8, a cached field not populated by
+// the iOS protocol. On a planar surface it instead overlaps plane-0 width:
+// the self-owned 16x16 b3a8 control returned 16<<32 instead of zero, and CA
+// correctly refused to sample this supposedly protected image. A genuinely
+// protected BGRA surface returned zero instead of one, so masking the stray
+// high bits would be both incorrect and unsafe. The real iOS getter reads the
+// CURRENT options from client->shared(+0x70)->protectionOptions(+0x30).
+//
+// Adapt this data boundary, not QuartzCore's protection check. Public C and
+// Client C callers use static dyld interposition; the one framework-internal
+// tailcall is -[IOSurface protectionOptions], adapted through its IMP. Never
+// mutate IOSurface's executable pages (including pages inherited across fork).
+static ptrdiff_t g_macws_iosurface_impl_offset = -1;
+// 0 means registration may still be pending, -1 is a measured ABI mismatch,
+// and 1 publishes both the validated layout and the implementation offset.
+static int g_macws_iosurface_protection_abi;
+static uint64_t (*g_macws_iosurface_protection_method)(id, SEL);
+static const uint8_t g_macws_iosurface_protection_uuid[16] = {
+    0x2b, 0x44, 0xb8, 0x50, 0x7d, 0x19, 0x34, 0xf3,
+    0xab, 0x8e, 0xa3, 0xb9, 0x30, 0x16, 0xa9, 0x6d,
+};
+static void macws_install_iosurface_protection_options_method(void);
+
+static BOOL macws_iosurface_protection_abi_ready(void) {
+    int state = __atomic_load_n(&g_macws_iosurface_protection_abi,
+                                __ATOMIC_ACQUIRE);
+    if (state != 0) return state == 1;
+    // Do not permanently consume the one-time guard if an early image-load
+    // callback arrived before ObjC registration. A later getter can retry.
+    Class cls = objc_getClass("IOSurface");
+    Ivar impl = cls ? class_getInstanceVariable(cls, "_impl") : NULL;
+    if (!impl) return NO;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        BOOL accepted = NO;
+        do {
+        // This exact kernel/userland pair was measured on-device. An unknown
+        // OS or consumer is not permission to reinterpret an opaque client.
+        char build[32] = {0};
+        size_t buildSize = sizeof(build);
+        if (macws_real_sysctlbyname("kern.osversion", build, &buildSize,
+                                   NULL, 0) != 0 ||
+            buildSize == 0 || buildSize >= sizeof(build) ||
+            strcmp(build, "20D67") != 0) break;
+        Dl_info image = {0};
+        if (!dladdr((void *)IOSurfaceGetProtectionOptions, &image) ||
+            !image.dli_fbase || !macws_macho_uuid_matches(
+                image.dli_fbase, g_macws_iosurface_protection_uuid)) break;
+        const uint8_t *base = image.dli_fbase;
+        static const uint32_t clientGetter[] = {
+            0xf9406400, // ldr x0, [x0, #0xc8]
+            0xd65f03c0, // ret
+        };
+        if (memcmp(base + 0x3df8, clientGetter,
+                   sizeof(clientGetter)) != 0) break;
+        if (ivar_getOffset(impl) != 8) break;
+        g_macws_iosurface_impl_offset = ivar_getOffset(impl);
+        accepted = YES;
+        } while (0);
+        // Publish only the final decision. A concurrent first caller must
+        // wait in dispatch_once, not briefly fall through to the wrong ABI.
+        __atomic_store_n(&g_macws_iosurface_protection_abi, accepted ? 1 : -1,
+                         __ATOMIC_RELEASE);
+    });
+    return __atomic_load_n(&g_macws_iosurface_protection_abi,
+                           __ATOMIC_ACQUIRE) == 1;
+}
+
+uint64_t macws_IOSurfaceClientGetProtectionOptions(void *client) {
+    uint64_t options;
+    if (macws_iosurface_protection_abi_ready()) {
+        macws_install_iosurface_protection_options_method();
+        if (macws_iosurface_native_protection_options(client, &options))
+            return options;
+    }
+    return IOSurfaceClientGetProtectionOptions(client);
+}
+
+uint64_t macws_IOSurfaceGetProtectionOptions(IOSurfaceRef surface) {
+    if (surface && macws_iosurface_protection_abi_ready()) {
+        macws_install_iosurface_protection_options_method();
+        void *client = NULL;
+        memcpy(&client, (const uint8_t *)surface +
+            g_macws_iosurface_impl_offset, sizeof(client));
+        uint64_t options;
+        if (macws_iosurface_native_protection_options(client, &options))
+            return options;
+    }
+    // Preserve the original nil/unknown-ABI behavior; never synthesize an
+    // unprotected result when the actual metadata could not be obtained.
+    return IOSurfaceGetProtectionOptions(surface);
+}
+
+static uint64_t macws_iosurface_protection_options_method(id surface, SEL cmd) {
+    if (surface && macws_iosurface_protection_abi_ready()) {
+        void *client = NULL;
+        memcpy(&client, (const uint8_t *)(__bridge void *)surface +
+            g_macws_iosurface_impl_offset, sizeof(client));
+        uint64_t options;
+        if (macws_iosurface_native_protection_options(client, &options))
+            return options;
+    }
+    return g_macws_iosurface_protection_method(surface, cmd);
+}
+
+__attribute__((constructor))
+static void macws_install_iosurface_protection_options_method(void) {
+    static int installed;
+    if (__atomic_load_n(&installed, __ATOMIC_ACQUIRE)) return;
+    if (!macws_iosurface_protection_abi_ready()) return;
+    Class cls = objc_getClass("IOSurface");
+    SEL selector = sel_registerName("protectionOptions");
+    Method method = class_getInstanceMethod(cls, selector);
+    if (!method || strcmp(method_getTypeEncoding(method), "Q16@0:8") != 0)
+        return;
+    IMP original = method_getImplementation(method);
+    Dl_info owner = {0};
+    void *raw = ptrauth_strip((void *)original, ptrauth_key_function_pointer);
+    if (!dladdr(raw, &owner) || !owner.dli_fbase ||
+        !macws_macho_uuid_matches(owner.dli_fbase,
+                                  g_macws_iosurface_protection_uuid) ||
+        (uintptr_t)raw - (uintptr_t)owner.dli_fbase != 0x6564) return;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        g_macws_iosurface_protection_method = (void *)original;
+        method_setImplementation(method,
+            (IMP)macws_iosurface_protection_options_method);
+        __atomic_store_n(&installed, 1, __ATOMIC_RELEASE);
+    });
+}
+
+DYLD_INTERPOSE(macws_IOSurfaceGetProtectionOptions,
+                IOSurfaceGetProtectionOptions);
+DYLD_INTERPOSE(macws_IOSurfaceClientGetProtectionOptions,
+                IOSurfaceClientGetProtectionOptions);
+
+// Native IOSurface Client layout boundary. Public C import interposition does
+// not intercept IOSurface's own ObjC -> Client direct branches. Cover the
+// exported Client entry points and those ObjC methods without making any code
+// page writable. Same-image non-ObjC C branches remain an explicit boundary.
+static BOOL macws_iosurface_layout_abi_ready(void) {
+    if (!macws_iosurface_protection_abi_ready()) return NO;
+    static BOOL accepted;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        Dl_info image = {0};
+        if (!dladdr((void *)IOSurfaceGetProtectionOptions, &image) ||
+            !image.dli_fbase || !macws_macho_uuid_matches(image.dli_fbase,
+                                        g_macws_iosurface_protection_uuid)) return;
+        static const struct { uint32_t offset, instruction; } anchors[] = {
+            {0x4260, 0x91034108}, {0x42b0, 0x91035108}, // width/height
+            {0x4210, 0x91038108}, {0x4460, 0x9103a108}, // BPR/BPE
+            {0x44b0, 0x9103a908}, {0x6a8c, 0x9103ad08}, // element W/H
+            {0x6ac0, 0x91037108}, {0x6af4, 0x91039108}, // offset/size
+            {0x4594, 0x91037108}, {0x8284, 0x39449100}, // base/compression
+            {0x8370, 0xb9411900}, {0x8398, 0xb9411d00}, // tile W/H
+            {0x8150, 0x3943b100}, {0x8320, 0xb9413100}, // components/tile bytes
+            {0x8620, 0x3943b500},                       // address format
+        };
+        for (size_t i = 0; i < sizeof(anchors) / sizeof(anchors[0]); ++i) {
+            uint32_t instruction;
+            memcpy(&instruction, (const uint8_t *)image.dli_fbase +
+                   anchors[i].offset, sizeof(instruction));
+            if (instruction != anchors[i].instruction) return;
+        }
+        accepted = YES;
+    });
+    return accepted;
+}
+
+static void macws_install_iosurface_layout_methods(void);
+
+static BOOL macws_iosurface_native_plane_value(IOSurfaceRef surface,
+        size_t plane, MacWSNativePlaneField field, uintptr_t *value) {
+    if (!surface || !macws_iosurface_layout_abi_ready()) return NO;
+    macws_install_iosurface_layout_methods();
+    void *client = NULL;
+    memcpy(&client, (const uint8_t *)(__bridge void *)surface +
+           g_macws_iosurface_impl_offset, sizeof(client));
+    return MacWSIOSurfaceReadNativePlane(client, plane, field, value);
+}
+
+// Actual Client ABI uses w1 for all listed indices except component count,
+// whose measured native and macOS implementations use x1. Do not truncate an
+// ObjC NSUInteger before its original bounds/exception handling.
+#define MACWS_CLIENT_PLANE_GETTER(Name, Return, Index) \
+    extern Return IOSurfaceClientGet##Name##OfPlane(void *, Index); \
+    Return macws_IOSurfaceClientGet##Name##OfPlane(void *client, Index plane) { \
+        uintptr_t value; \
+        if (macws_iosurface_layout_abi_ready()) { \
+            macws_install_iosurface_layout_methods(); \
+            if (MacWSIOSurfaceReadNativePlane(client, plane, \
+                    MacWSNativePlane##Name, &value)) return (Return)value; \
+        } \
+        return IOSurfaceClientGet##Name##OfPlane(client, plane); \
+    } \
+    DYLD_INTERPOSE(macws_IOSurfaceClientGet##Name##OfPlane, \
+                    IOSurfaceClientGet##Name##OfPlane)
+
+MACWS_CLIENT_PLANE_GETTER(Width, size_t, uint32_t);
+MACWS_CLIENT_PLANE_GETTER(Height, size_t, uint32_t);
+MACWS_CLIENT_PLANE_GETTER(BytesPerRow, size_t, uint32_t);
+MACWS_CLIENT_PLANE_GETTER(BytesPerElement, size_t, uint32_t);
+MACWS_CLIENT_PLANE_GETTER(ElementWidth, size_t, uint32_t);
+MACWS_CLIENT_PLANE_GETTER(ElementHeight, size_t, uint32_t);
+MACWS_CLIENT_PLANE_GETTER(Offset, size_t, uint32_t);
+MACWS_CLIENT_PLANE_GETTER(Size, size_t, uint32_t);
+MACWS_CLIENT_PLANE_GETTER(BaseAddress, void *, uint32_t);
+MACWS_CLIENT_PLANE_GETTER(CompressionType, uint32_t, uint32_t);
+MACWS_CLIENT_PLANE_GETTER(WidthInCompressedTiles, size_t, uint32_t);
+MACWS_CLIENT_PLANE_GETTER(HeightInCompressedTiles, size_t, uint32_t);
+MACWS_CLIENT_PLANE_GETTER(NumberOfComponents, size_t, size_t);
+MACWS_CLIENT_PLANE_GETTER(BytesPerTileData, size_t, uint32_t);
+MACWS_CLIENT_PLANE_GETTER(AddressFormat, uint32_t, uint32_t);
+#undef MACWS_CLIENT_PLANE_GETTER
+
+#define MACWS_OBJC_PLANE_GETTER(Name, Return) \
+    static Return (*g_macws_iosurface_plane_##Name)(id, SEL, NSUInteger); \
+    static Return macws_iosurface_plane_##Name(id surface, SEL cmd, NSUInteger plane) { \
+        uintptr_t value; \
+        if (macws_iosurface_native_plane_value(surface, plane, \
+                MacWSNativePlane##Name, &value)) return (Return)value; \
+        return g_macws_iosurface_plane_##Name(surface, cmd, plane); \
+    }
+MACWS_OBJC_PLANE_GETTER(Width, NSInteger)
+MACWS_OBJC_PLANE_GETTER(Height, NSInteger)
+MACWS_OBJC_PLANE_GETTER(BytesPerRow, NSInteger)
+MACWS_OBJC_PLANE_GETTER(BytesPerElement, NSInteger)
+MACWS_OBJC_PLANE_GETTER(ElementWidth, NSInteger)
+MACWS_OBJC_PLANE_GETTER(ElementHeight, NSInteger)
+MACWS_OBJC_PLANE_GETTER(BaseAddress, void *)
+#undef MACWS_OBJC_PLANE_GETTER
+
+__attribute__((constructor))
+static void macws_install_iosurface_layout_methods(void) {
+    static int installed;
+    if (__atomic_load_n(&installed, __ATOMIC_ACQUIRE)) return;
+    if (!macws_iosurface_layout_abi_ready()) return;
+    Class cls = objc_getClass("IOSurface");
+    static const struct { const char *name, *types; uint32_t offset; } specs[] = {
+        {"widthOfPlaneAtIndex:", "q24@0:8Q16", 0x5dac},
+        {"heightOfPlaneAtIndex:", "q24@0:8Q16", 0x5e90},
+        {"bytesPerRowOfPlaneAtIndex:", "q24@0:8Q16", 0x5f74},
+        {"bytesPerElementOfPlaneAtIndex:", "q24@0:8Q16", 0x6058},
+        {"elementWidthOfPlaneAtIndex:", "q24@0:8Q16", 0x613c},
+        {"elementHeightOfPlaneAtIndex:", "q24@0:8Q16", 0x6220},
+        {"baseAddressOfPlaneAtIndex:", "^v24@0:8Q16", 0x6304},
+    };
+    // The once block serializes first callers before inspecting IMPs: a
+    // concurrent installer must not mistake our partially installed methods
+    // for an unrelated ABI. Validate all seven before changing any method.
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        Method methods[7];
+        IMP originals[7];
+        for (size_t i = 0; i < 7; ++i) {
+            methods[i] = class_getInstanceMethod(cls, sel_registerName(specs[i].name));
+            if (!methods[i] || strcmp(method_getTypeEncoding(methods[i]), specs[i].types))
+                return;
+            originals[i] = method_getImplementation(methods[i]);
+            void *raw = ptrauth_strip((void *)originals[i], ptrauth_key_function_pointer);
+            Dl_info owner = {0};
+            if (!dladdr(raw, &owner) || !owner.dli_fbase ||
+                !macws_macho_uuid_matches(owner.dli_fbase,
+                                         g_macws_iosurface_protection_uuid) ||
+                (uintptr_t)raw - (uintptr_t)owner.dli_fbase != specs[i].offset) return;
+        }
+#define INSTALL_PLANE(index, Name) \
+        g_macws_iosurface_plane_##Name = (void *)originals[index]; \
+        method_setImplementation(methods[index], (IMP)macws_iosurface_plane_##Name)
+        INSTALL_PLANE(0, Width);
+        INSTALL_PLANE(1, Height);
+        INSTALL_PLANE(2, BytesPerRow);
+        INSTALL_PLANE(3, BytesPerElement);
+        INSTALL_PLANE(4, ElementWidth);
+        INSTALL_PLANE(5, ElementHeight);
+        INSTALL_PLANE(6, BaseAddress);
+#undef INSTALL_PLANE
+        __atomic_store_n(&installed, 1, __ATOMIC_RELEASE);
+    });
+}
 
 // IOSurface per-plane-layout compatibility.
 //
@@ -14957,6 +15269,9 @@ static uint64_t macws_iosurface_plane_property(IOSurfaceRef surface,
 // explicit creation-property values too; never infer dimensions from pixel
 // format or return a constant merely to pass Chromium's bounds check.
 size_t macws_IOSurfaceGetWidthOfPlane(IOSurfaceRef surface, size_t plane) {
+    uintptr_t native;
+    if (macws_iosurface_native_plane_value(surface, (uint32_t)plane,
+            MacWSNativePlaneWidth, &native)) return (size_t)native;
     size_t original = IOSurfaceGetWidthOfPlane(surface, plane);
     if (!macws_agx_native_enabled()) return original;
     uint64_t property = macws_iosurface_plane_property(
@@ -14977,6 +15292,9 @@ size_t macws_IOSurfaceGetWidthOfPlane(IOSurfaceRef surface, size_t plane) {
 }
 
 size_t macws_IOSurfaceGetHeightOfPlane(IOSurfaceRef surface, size_t plane) {
+    uintptr_t native;
+    if (macws_iosurface_native_plane_value(surface, (uint32_t)plane,
+            MacWSNativePlaneHeight, &native)) return (size_t)native;
     size_t original = IOSurfaceGetHeightOfPlane(surface, plane);
     if (!macws_agx_native_enabled()) return original;
     uint64_t property = macws_iosurface_plane_property(
@@ -14998,6 +15316,9 @@ size_t macws_IOSurfaceGetHeightOfPlane(IOSurfaceRef surface, size_t plane) {
 
 uint32_t macws_IOSurfaceGetCompressionTypeOfPlane(IOSurfaceRef surface,
                                                    size_t plane) {
+    uintptr_t native;
+    if (macws_iosurface_native_plane_value(surface, (uint32_t)plane,
+            MacWSNativePlaneCompressionType, &native)) return (uint32_t)native;
     uint32_t original = IOSurfaceGetCompressionTypeOfPlane(surface, plane);
     if (original != 0 || !macws_agx_native_enabled()) return original;
     uint64_t property = macws_iosurface_plane_property(
@@ -15017,6 +15338,9 @@ uint32_t macws_IOSurfaceGetCompressionTypeOfPlane(IOSurfaceRef surface,
 
 size_t macws_IOSurfaceGetHeightInCompressedTilesOfPlane(
         IOSurfaceRef surface, size_t plane) {
+    uintptr_t native;
+    if (macws_iosurface_native_plane_value(surface, (uint32_t)plane,
+            MacWSNativePlaneHeightInCompressedTiles, &native)) return (size_t)native;
     size_t original = IOSurfaceGetHeightInCompressedTilesOfPlane(
         surface, plane);
     if (original != 0 || !macws_agx_native_enabled()) return original;
@@ -15037,6 +15361,9 @@ size_t macws_IOSurfaceGetHeightInCompressedTilesOfPlane(
 
 size_t macws_IOSurfaceGetWidthInCompressedTilesOfPlane(
         IOSurfaceRef surface, size_t plane) {
+    uintptr_t native;
+    if (macws_iosurface_native_plane_value(surface, (uint32_t)plane,
+            MacWSNativePlaneWidthInCompressedTiles, &native)) return (size_t)native;
     size_t original = IOSurfaceGetWidthInCompressedTilesOfPlane(
         surface, plane);
     if (!macws_agx_native_enabled()) return original;
@@ -15058,6 +15385,9 @@ size_t macws_IOSurfaceGetWidthInCompressedTilesOfPlane(
 
 size_t macws_IOSurfaceGetBytesPerRowOfPlane(IOSurfaceRef surface,
                                             size_t plane) {
+    uintptr_t native;
+    if (macws_iosurface_native_plane_value(surface, (uint32_t)plane,
+            MacWSNativePlaneBytesPerRow, &native)) return (size_t)native;
     size_t original = IOSurfaceGetBytesPerRowOfPlane(surface, plane);
     if (!macws_agx_native_enabled()) return original;
     uint64_t property = macws_iosurface_plane_property(
@@ -15113,6 +15443,9 @@ static size_t macws_iosurface_explicit_plane_size(
 
 size_t macws_IOSurfaceGetBytesPerElementOfPlane(IOSurfaceRef surface,
                                                 size_t plane) {
+    uintptr_t native;
+    if (macws_iosurface_native_plane_value(surface, (uint32_t)plane,
+            MacWSNativePlaneBytesPerElement, &native)) return (size_t)native;
     size_t original = IOSurfaceGetBytesPerElementOfPlane(surface, plane);
     return macws_iosurface_explicit_plane_size(surface, plane, original,
         MacWSIOSurfacePlaneBytesPerElement,
@@ -15121,6 +15454,9 @@ size_t macws_IOSurfaceGetBytesPerElementOfPlane(IOSurfaceRef surface,
 
 size_t macws_IOSurfaceGetElementWidthOfPlane(IOSurfaceRef surface,
                                              size_t plane) {
+    uintptr_t native;
+    if (macws_iosurface_native_plane_value(surface, (uint32_t)plane,
+            MacWSNativePlaneElementWidth, &native)) return (size_t)native;
     size_t original = IOSurfaceGetElementWidthOfPlane(surface, plane);
     return macws_iosurface_explicit_plane_size(surface, plane, original,
         MacWSIOSurfacePlaneElementWidth, "elementWidth");
@@ -15128,12 +15464,18 @@ size_t macws_IOSurfaceGetElementWidthOfPlane(IOSurfaceRef surface,
 
 size_t macws_IOSurfaceGetElementHeightOfPlane(IOSurfaceRef surface,
                                               size_t plane) {
+    uintptr_t native;
+    if (macws_iosurface_native_plane_value(surface, (uint32_t)plane,
+            MacWSNativePlaneElementHeight, &native)) return (size_t)native;
     size_t original = IOSurfaceGetElementHeightOfPlane(surface, plane);
     return macws_iosurface_explicit_plane_size(surface, plane, original,
         MacWSIOSurfacePlaneElementHeight, "elementHeight");
 }
 
 size_t macws_IOSurfaceGetSizeOfPlane(IOSurfaceRef surface, size_t plane) {
+    uintptr_t native;
+    if (macws_iosurface_native_plane_value(surface, (uint32_t)plane,
+            MacWSNativePlaneSize, &native)) return (size_t)native;
     size_t original = IOSurfaceGetSizeOfPlane(surface, plane);
     return macws_iosurface_explicit_plane_size(surface, plane, original,
         MacWSIOSurfacePlaneSize, "size");
@@ -15141,6 +15483,9 @@ size_t macws_IOSurfaceGetSizeOfPlane(IOSurfaceRef surface, size_t plane) {
 
 size_t macws_IOSurfaceGetNumberOfComponentsOfPlane(IOSurfaceRef surface,
                                                     size_t plane) {
+    uintptr_t native;
+    if (macws_iosurface_native_plane_value(surface, plane,
+            MacWSNativePlaneNumberOfComponents, &native)) return (size_t)native;
     size_t original = IOSurfaceGetNumberOfComponentsOfPlane(surface, plane);
     if (!macws_agx_native_enabled()) return original;
     uint64_t property = 0;
@@ -15159,6 +15504,9 @@ size_t macws_IOSurfaceGetNumberOfComponentsOfPlane(IOSurfaceRef surface,
 
 size_t macws_IOSurfaceGetBytesPerTileDataOfPlane(IOSurfaceRef surface,
                                                  size_t plane) {
+    uintptr_t native;
+    if (macws_iosurface_native_plane_value(surface, (uint32_t)plane,
+            MacWSNativePlaneBytesPerTileData, &native)) return (size_t)native;
     size_t original = IOSurfaceGetBytesPerTileDataOfPlane(surface, plane);
     if (!macws_agx_native_enabled()) return original;
     uint64_t property = macws_iosurface_plane_property(
@@ -15178,6 +15526,9 @@ size_t macws_IOSurfaceGetBytesPerTileDataOfPlane(IOSurfaceRef surface,
 }
 
 size_t macws_IOSurfaceGetOffsetOfPlane(IOSurfaceRef surface, size_t plane) {
+    uintptr_t native;
+    if (macws_iosurface_native_plane_value(surface, (uint32_t)plane,
+            MacWSNativePlaneOffset, &native)) return (size_t)native;
     size_t original = IOSurfaceGetOffsetOfPlane(surface, plane);
     if (!macws_agx_native_enabled()) return original;
     uint64_t property = 0;
@@ -15199,6 +15550,9 @@ size_t macws_IOSurfaceGetOffsetOfPlane(IOSurfaceRef surface, size_t plane) {
 
 void *macws_IOSurfaceGetBaseAddressOfPlane(IOSurfaceRef surface,
                                            size_t plane) {
+    uintptr_t native;
+    if (macws_iosurface_native_plane_value(surface, (uint32_t)plane,
+            MacWSNativePlaneBaseAddress, &native)) return (void *)native;
     void *original = IOSurfaceGetBaseAddressOfPlane(surface, plane);
     if (!macws_agx_native_enabled()) return original;
     uint64_t propertyOffset = 0;
@@ -15224,6 +15578,9 @@ void *macws_IOSurfaceGetBaseAddressOfPlane(IOSurfaceRef surface,
 
 uint32_t macws_IOSurfaceGetAddressFormatOfPlane(IOSurfaceRef surface,
                                                 size_t plane) {
+    uintptr_t native;
+    if (macws_iosurface_native_plane_value(surface, (uint32_t)plane,
+            MacWSNativePlaneAddressFormat, &native)) return (uint32_t)native;
     uint32_t original = IOSurfaceGetAddressFormatOfPlane(surface, plane);
     if (!macws_agx_native_enabled()) return original;
     uint64_t property = macws_iosurface_plane_property(
@@ -18309,8 +18666,7 @@ static unsigned macws_translate_agx_wrapped_single_subtype1(
             "\xff\xff\xff\xff", 12) == 0 &&
         macws_submit_bytes_are_zero(record + 0x4c0, 0x10) &&
         (*(uint32_t *)(record + 0x4d0) == 0x3f800000 ||
-         (macws_stray_agx_compat_enabled() &&
-          *(uint32_t *)(record + 0x4d0) == 0)) &&
+         *(uint32_t *)(record + 0x4d0) == 0) &&
         (*(uint32_t *)(record + 0x4d4) == 0x100 ||
          *(uint32_t *)(record + 0x4d4) == 0x300) &&
         memcmp(record + 0x4e8,
@@ -18488,8 +18844,7 @@ static unsigned macws_translate_agx_trailing_wrapped_subtype1(
             "\xff\xff\xff\xff", 12) == 0 &&
         macws_submit_bytes_are_zero(record + 0x4c0, 0x10) &&
         (*(uint32_t *)(record + 0x4d0) == 0x3f800000 ||
-         (macws_stray_agx_compat_enabled() &&
-          *(uint32_t *)(record + 0x4d0) == 0)) &&
+         *(uint32_t *)(record + 0x4d0) == 0) &&
         (*(uint32_t *)(record + 0x4d4) == 0x100 ||
          *(uint32_t *)(record + 0x4d4) == 0x300) &&
         memcmp(record + 0x4e8,
@@ -19508,11 +19863,13 @@ static unsigned macws_translate_agx_segment_list_records(
         // PF260 controls are causal: native iOS clearDepth=0 reads back 0;
         // the chroot record has macOS +0x4d0=0; skipping normalization returns
         // 0x102; and changing this word to 1.0 makes every depth pixel 1.0.
-        // Admit zero so the proven layout compaction runs, but preserve the
-        // semantic word byte-for-byte as it moves to native +0x4b0.
-        BOOL subtype1_field_4d0_zero_valid = subtype1_field_4d0 == 0 &&
-            (macws_stray_agx_compat_enabled() ||
-             macws_kcmd_field_4d0_diag_enabled());
+        // Weather's exact NSError-matched serial 2 (2026-09-19) contains
+        // three fully framed 0x858-byte records with this same legitimate
+        // zero payload. Restricting zero to Stray left all three untouched.
+        // Admit the verified zero/one payloads independent of application
+        // identity, retaining every layout/list anchor below and preserving
+        // the word byte-for-byte as it moves to native +0x4b0.
+        BOOL subtype1_field_4d0_zero_valid = subtype1_field_4d0 == 0;
         // Runtime-correlated Stray gameplay batch PID 5851 / submit 41126:
         // its first four records retain the complete macOS subtype-1 layout
         // and every independent structural anchor below, but carry 0xffff in
@@ -20421,9 +20778,7 @@ macws_inspect_agx_submit(const uint64_t *in, uint32_t inCnt,
 
             BOOL subtype1_direct_field_4d0_zero_valid =
                 off == 0 && total > 0x4d4 &&
-                *(uint32_t *)(commands + 0x4d0) == 0 &&
-                (macws_stray_agx_compat_enabled() ||
-                 macws_kcmd_field_4d0_diag_enabled());
+                *(uint32_t *)(commands + 0x4d0) == 0;
             // Runtime-confirmed by Stray PID 88562, NSError-bearing submit
             // serial 7917 (2026-08-17).  The direct count-1 list is a complete
             // macOS subtype-1 record (KCMD/list 0x840/0x5f0, every framing,
@@ -21083,6 +21438,31 @@ static BOOL macws_submit_with_forward_progress_bridge(
     return YES;
 }
 
+__thread struct MacWSNoCopyScope *g_macws_nocopy_scope;
+
+bool MacWSAGXNoCopyABIReady(const void *agx_initializer,
+                           const void *iogpu_initializer) {
+    static const uint8_t agx_uuid[16] = {
+        0x72,0x7c,0x25,0x0e,0x55,0x4d,0x39,0x21,
+        0xa5,0xb3,0x48,0xda,0xe6,0x19,0x5b,0x79};
+    static const uint8_t iogpu_uuid[16] = {
+        0xce,0x2b,0x55,0x51,0x85,0x7f,0x3e,0xdd,
+        0x9e,0x4f,0x43,0x52,0x15,0xcc,0x8c,0x27};
+    Dl_info agx = {0}, iogpu = {0};
+    char build[32] = {0};
+    size_t build_size = sizeof(build);
+    return agx_initializer && iogpu_initializer &&
+        dladdr(agx_initializer, &agx) && dladdr(iogpu_initializer, &iogpu) &&
+        macws_macho_uuid_matches(agx.dli_fbase, agx_uuid) &&
+        macws_macho_uuid_matches(iogpu.dli_fbase, iogpu_uuid) &&
+        (uintptr_t)agx_initializer - (uintptr_t)agx.dli_fbase == 0x1f4bb4 &&
+        (uintptr_t)iogpu_initializer - (uintptr_t)iogpu.dli_fbase == 0x1c24 &&
+        macws_real_sysctlbyname("kern.osversion", build, &build_size,
+                               NULL, 0) == 0 &&
+        build_size > 0 && build_size < sizeof(build) &&
+        strcmp(build, "20D67") == 0;
+}
+
 IOReturn IOConnectCallMethod_new(io_connect_t client, uint32_t selector, const uint64_t *in, uint32_t inCnt, const void *inStruct, size_t inStructCnt, uint64_t *out, uint32_t *outCnt, void *outStruct, size_t *outStructCnt) {
     uint32_t orig = selector;
     int skip = caller_is_libmachook(__builtin_return_address(0));
@@ -21137,7 +21517,25 @@ IOReturn IOConnectCallMethod_new(io_connect_t client, uint32_t selector, const u
     uint32_t resDiagSequence = 0;
     int resDiagActive = macws_res_diag_enabled();
     int agxIsRes = (IOConnectIsIOGPU(client) && selector == 0x9 && inStruct && inStructCnt >= 0x60 && inStructCnt <= sizeof(shadowbuf));
-    if(agxIsRes) {
+    // Ordinary bytesNoCopy must map the SAME CPU allocation. This scoped,
+    // version-validated producer has a distinct 104 -> 96 byte layout; the
+    // legacy resource heuristics below must not clear either of its VAs.
+    BOOL translated_nocopy = NO;
+    if (g_macws_nocopy_scope && IOConnectIsIOGPU(client) &&
+        selector == 0x9 && inStruct && inStructCnt > 0 &&
+        ((const uint8_t *)inStruct)[0] == 0x80) {
+        if (!MacWSNoCopyTranslateRequest(g_macws_nocopy_scope,
+                inStruct, inStructCnt, shadowbuf, sizeof(shadowbuf))) {
+            free(qbuf);
+            return kIOReturnBadArgument;
+        }
+        inStruct = shadowbuf;
+        inStructCnt = 96;
+        agxType = 0x80;
+        agxIsRes = YES;
+        translated_nocopy = YES;
+    }
+    if(agxIsRes && !translated_nocopy) {
         const unsigned char *src = (const unsigned char *)inStruct;
         if (resDiagActive) {
             static _Atomic uint32_t sequence = 0;

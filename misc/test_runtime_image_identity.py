@@ -58,6 +58,12 @@ static void prepare(void) {
     strcpy(text->sectname, "__text"); text->addr = s->vmaddr + 512; text->size = 32;
 }
 int main(void) {
+    const char *consumers[] = {"Terminal", "bash", "Finder", "Preview", "Weather",
+        "Electron", "iconservicesagent", "com.apple.quicklook.ThumbnailsAgent", NULL};
+    for (unsigned i = 0; consumers[i]; ++i)
+        if (!allowed(consumers[i], processes)) return 10;
+    if (allowed("arbitrary-private-app", processes) ||
+        allowed("Documents", images) || allowed("private.dylib", images)) return 11;
     struct mach_header_64 *h = (void *)fixture;
     struct uuid_command *u = (void *)(h + 1);
     struct segment_command_64 *s = (void *)(u + 1);

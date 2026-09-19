@@ -1,16 +1,16 @@
 // Freestanding launch stub for macOS XPC services inside the chroot.
 //
-// This executable deliberately has no libSystem dependency.  xpcproxy gives
-// the service process a one-shot launchd receive right in XPC_FLAGS/XPC_*.
-// Merely starting libSystem would initialize libxpc before main(), consume
-// that context for the iOS stub, and leave the macOS executable created by a
-// later execve() classified as an unmanaged process.  Enter the chroot and
-// replace this image using raw BSD syscalls so the real service is the first
-// runtime in this task to consume the XPC launch context.
+// xpcproxy gives the service process a one-shot launchd receive right in
+// XPC_FLAGS/XPC_*. Preserve that context through a raw chroot/exec transition;
+// do not introduce an intermediate posix_spawn or XPC client initialization.
+// The transition below calls no libSystem APIs, although the current build
+// still links libSystem (-lSystem in the Makefile and the deployed Mach-O).
+// Calling this executable dependency-free would therefore be inaccurate.
 
 #include <stddef.h>
 #include <stdint.h>
 #include "../include/macws_settings_paths.h"
+#include "../include/macws_chroot_environment.h"
 #if defined(MACWS_WEBKIT_PROXY_EXPERIMENT)
 #include "../include/macws_webkit_services.h"
 #endif
@@ -68,6 +68,20 @@ static long MacWSSyscall3(long number, const void *argument0,
                      : "+r"(x0)
                      : "r"(x1), "r"(x2), "r"(x16)
                      : "memory", "cc");
+    return x0;
+}
+
+// Unlike libc, Darwin's raw BSD syscall returns positive errno with carry
+// set. Namespace setup opens a real descriptor, so preserve that distinction
+// and never treat an error number as a descriptor to query/close.
+static long MacWSCheckedSyscall3(long number, long a, long b, long c) {
+    register long x0 __asm("x0") = a;
+    register long x1 __asm("x1") = b;
+    register long x2 __asm("x2") = c;
+    register long x16 __asm("x16") = number;
+    __asm__ volatile("svc #0x80\n\tcneg x0, x0, cs"
+                     : "+r"(x0), "+r"(x1), "+r"(x2)
+                     : "r"(x16) : "memory", "cc");
     return x0;
 }
 
@@ -252,6 +266,13 @@ int main(int argc, char *argv[], char *envp[]) {
     static char home[] = "HOME=/Users/root";
     static char temporaryDirectory[] = "TMPDIR=/tmp";
     static char nanoZone[] = "MallocNanoZone=0";
+    static char rootEnvironment[MACWS_CHROOT_ROOT_ENV_SIZE];
+
+    // Every entry route must establish the same real chroot namespace as
+    // launchdchrootexec. Without it, CoreServices sees a host root parent and
+    // can traverse/cache paths that are not reachable inside this process.
+    if (!MacWSBuildChrootRootEnvironment(MACWS_ROOTFS, rootEnvironment,
+            sizeof(rootEnvironment), MacWSCheckedSyscall3)) MacWSExit(118);
 
     const char *target = MacWSTargetForProxy(
         argc > 0 && argv ? argv[0] : (const char *)0, envp);
@@ -274,15 +295,18 @@ int main(int argc, char *argv[], char *envp[]) {
     targetArguments[argumentCount] = (char *)0;
 
     size_t environmentCount = 0;
-    for (char **entry = envp; entry && *entry &&
-         environmentCount + 5 < MACWS_MAX_ENVIRONMENT; entry++) {
+    for (char **entry = envp; entry && *entry; entry++) {
         // Replace only values that must describe the macOS process.  Preserve
         // XPC_FLAGS and every launchd-provided entry byte-for-byte.
         if (MacWSHasEnvironmentKey(*entry, "DYLD_INSERT_LIBRARIES") ||
             MacWSHasEnvironmentKey(*entry, "HOME") ||
             MacWSHasEnvironmentKey(*entry, "TMPDIR") ||
-            MacWSHasEnvironmentKey(*entry, "MallocNanoZone"))
+            MacWSHasEnvironmentKey(*entry, "MallocNanoZone") ||
+            MacWSHasEnvironmentKey(*entry, MACWS_CHROOT_ROOT_KEY))
             continue;
+        // Five canonical values plus NULL remain. Reject an oversized launch
+        // context instead of silently discarding trailing one-shot XPC data.
+        if (environmentCount + 6 >= MACWS_MAX_ENVIRONMENT) MacWSExit(119);
         targetEnvironment[environmentCount++] = *entry;
     }
     // Settings panes are sandboxed ExtensionKit processes.  They cannot fork,
@@ -298,6 +322,7 @@ int main(int argc, char *argv[], char *envp[]) {
     targetEnvironment[environmentCount++] = home;
     targetEnvironment[environmentCount++] = temporaryDirectory;
     targetEnvironment[environmentCount++] = nanoZone;
+    targetEnvironment[environmentCount++] = rootEnvironment;
     targetEnvironment[environmentCount] = (char *)0;
 
     if (MacWSSyscall1(MACWS_SYS_chroot, MACWS_ROOTFS) != 0) MacWSExit(111);

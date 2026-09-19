@@ -59,6 +59,14 @@ SOURCE_PAYLOADS = {
         'layout/usr/macOS/bin/macws_refresh_managed_job.py',
     'var/jb/usr/macOS/bin/ensure_settings_extensions_runtime.sh':
         'layout/usr/macOS/bin/ensure_settings_extensions_runtime.sh',
+    'var/jb/usr/macOS/bin/ensure_metal2metal_compat.sh':
+        'layout/usr/macOS/bin/ensure_metal2metal_compat.sh',
+    'var/jb/usr/macOS/bin/ensure_office_metal2metal.py':
+        'misc/ensure_office_metal2metal.py',
+    'var/jb/usr/macOS/bin/metal2metal.py': 'misc/metal2metal.py',
+    'var/jb/usr/macOS/bin/metal2metal_manifest.py': 'misc/metal2metal_manifest.py',
+    'var/jb/usr/macOS/bin/metal2metal_profiles.py': 'misc/metal2metal_profiles.py',
+    'var/jb/usr/macOS/bin/repack_metallib_macabi.py': 'misc/repack_metallib_macabi.py',
     'var/jb/usr/macOS/gui-launchd/com.macwsguide.coreaudiod.plist':
         'misc/com.macwsguide.coreaudiod.plist',
     'var/jb/usr/macOS/gui-launchd/com.macwsguide.audiocomponentregistrar.plist':
@@ -69,6 +77,12 @@ SOURCE_PAYLOADS = {
         'misc/com.macwsguide.vscode.plist',
     'DEBIAN/postinst': 'layout/DEBIAN/postinst',
 }
+
+# Source-controlled payloads must reach the actual archive, not just staging.
+# Maintainer scripts live in the separate control archive checked below.
+ARCHIVE_PATHS = tuple(sorted(set(PACKAGE_PATHS) | {
+    name for name in SOURCE_PAYLOADS if not name.startswith('DEBIAN/')
+}))
 
 
 def sha256(path: Path) -> str:
@@ -131,7 +145,7 @@ def verify(root: Path, binary: Path, manifest_path: Path) -> None:
 
 def verify_package(package: Path, staging: Path, binary: Path,
                    root: Path | None = None) -> None:
-    expected = {name: sha256(staging / name) for name in PACKAGE_PATHS}
+    expected = {name: sha256(staging / name) for name in ARCHIVE_PATHS}
     if root is not None:
         for name, source in SOURCE_PAYLOADS.items():
             # Theos converts XML plists to binary during normal staging.

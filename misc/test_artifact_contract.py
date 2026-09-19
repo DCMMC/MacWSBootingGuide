@@ -90,7 +90,7 @@ class ArtifactContract(unittest.TestCase):
 
     def package(self, omitted=None):
         staging = self.root / 'staging'
-        for name in contract.PACKAGE_PATHS:
+        for name in contract.ARCHIVE_PATHS:
             path = staging / name
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(plistlib.dumps({'EnvironmentVariables': {'MACWS_TEST': '1'}},
@@ -147,6 +147,25 @@ class ArtifactContract(unittest.TestCase):
         name = 'var/jb/usr/macOS/bin/macws_refresh_managed_job.py'
         package, staging = self.package(omitted=name)
         with self.assertRaisesRegex(ValueError, 'missing runtime payload'):
+            contract.verify_package(package, staging, self.binary)
+
+    def test_all_source_payloads_are_covered_by_archive_verification(self):
+        self.assertTrue(set(contract.SOURCE_PAYLOADS) - {'DEBIAN/postinst'} <=
+                        set(contract.ARCHIVE_PATHS))
+
+    @unittest.skipUnless(shutil.which('dpkg-deb'), 'dpkg-deb required')
+    def test_missing_office_shader_provisioner_stops_installation(self):
+        name = 'var/jb/usr/macOS/bin/ensure_office_metal2metal.py'
+        package, staging = self.package(omitted=name)
+        with self.assertRaisesRegex(ValueError, 'missing runtime payload'):
+            contract.verify_package(package, staging, self.binary)
+
+    @unittest.skipUnless(shutil.which('dpkg-deb'), 'dpkg-deb required')
+    def test_changed_office_shader_provisioner_must_reach_actual_archive(self):
+        name = 'var/jb/usr/macOS/bin/ensure_office_metal2metal.py'
+        package, staging = self.package()
+        (staging / name).write_bytes(b'new-office-shader-provisioner')
+        with self.assertRaisesRegex(ValueError, 'package differs from staged runtime'):
             contract.verify_package(package, staging, self.binary)
 
     @unittest.skipUnless(shutil.which('dpkg-deb'), 'dpkg-deb required')
