@@ -889,3 +889,86 @@ identity/PID inventory. This PASS applies to **03558D10…**. A subsequently
 tightened manifest provenance policy was not yet in this tested binary and
 requires its own final-artifact acceptance; it is not implicitly covered by
 these screenshots.
+
+## On-device package: isolated PowerPoint visual acceptance
+
+The subsequent on-device-built package was tested separately with the
+production-generated route requiring exact source identity. The owned
+PowerPoint PID 63261 loaded this exact artifact, confirmed with a bounded
+no-suspend mapped-image reader before opening the copied stock template:
+
+```text
+isolated path: /private/tmp/libmachook-release-acceptance-arm64-20260919.dylib
+signed SHA256: be9b20c1be4164bbf5996ee363e04a7bb05b0ef9376bd9166c2eb9bbaf979c8b
+actual mapped arm64 UUID: 5EC31E06-F7D0-38CE-9989-34862E420C21
+mapped __text bytes: 668868
+mapped __text SHA256: 7f9c6e06380acedd01f8bc2758e473d4f92e340dfc40c774185c7f4f005769f1
+```
+
+No observation dylib, diagnostic environment, or flag was used. The owned
+template SHA remained `4734751a9b76f2f2fcbe5315d7b7f6abd6260c1c0b1f5da8cb5e98fb9b7b04a5`.
+The real document window was 316. Both native screenshots were inspected:
+
+- `/tmp/macws-office-ondevice-release-20260919-ppt-initial.png`: normal
+  orange cover, logo, and populated nonblack slide thumbnails.
+- `/tmp/macws-office-ondevice-release-20260919-ppt-slide3.png`: toolbar,
+  comments panel, reply field, and status-bar images all visible at normal
+  geometry, with correct white/orange thumbnail backgrounds.
+
+The real `Quit PowerPoint` menu item 9 was delivered to this owned window;
+the following process inventory confirmed PID 63261 had exited and user
+PowerPoint 19000 and Terminal 17280 were unchanged. The detached observer's
+300-second observation period had already expired before Quit, so its
+receipt says `still-running-not-killed`; **a numeric exit status was not
+captured and is not asserted**. Receipt and launch log are preserved at
+`/tmp/macws-office-ondevice-release-20260919-ppt.{json,log}` on the device
+and the local machine. Word and Excel were deliberately deferred to the
+post-install canonical-library check, rather than counted as covered by
+this PowerPoint-only package test.
+
+The reusable test-only entry point is
+`/tmp/macws_office_release_acceptance_20260919.py`, taking explicit product,
+operation, candidate path, expected signed SHA, expected mapped UUID, fresh
+receipt prefix, and the two protected user PIDs. Its separate read-only
+identity helper is `/tmp/macws_office_release_identity_20260919`. Neither
+tool is installed into production startup or changes application behavior.
+
+## Installed package: canonical Word and Excel visual acceptance
+
+After the package installation, Word and Excel were tested sequentially
+against the **installed canonical** arm64 library, not a `/tmp` substitute:
+
+```text
+chroot path: /usr/local/lib/libmachook_arm64.dylib
+installed signed SHA256: 273edeca9604272d4305b6c7f9b630d011367ce8c530701ca95ca8084454a141
+actual mapped UUID in both applications: 5EC31E06-F7D0-38CE-9989-34862E420C21
+mapped __text bytes: 668868
+mapped __text SHA256: 7f9c6e06380acedd01f8bc2758e473d4f92e340dfc40c774185c7f4f005769f1
+```
+
+Both launches had no observer dylib and no diagnostic environment/flag.
+The same stock source hashes were checked before copying and before target-PID
+delivery. Word PID 67368/window 322 showed the previously missing blue
+Quick Access Toolbar image and the menu screenshot on page 1. The actual
+native screenshot is
+`/tmp/macws-office-installed-release-20260919-word-images.png`.
+The old user PowerPoint visible **behind** Word still showed its old black
+thumbnails; that process was deliberately preserved and still used its old
+library mapping. It is not a failure of this new Word process.
+
+Excel PID 67644/window 329 showed the stock Start sheet with its green
+welcome panel, complete white Excel logo, and orange owl illustration in
+`/tmp/macws-office-installed-release-20260919-excel-images.png`.
+Both images were inspected, rather than accepted from the document-open ACK.
+
+Each owned application was closed using its real Quit menu. Excel's prompt
+was first captured and checked to name only the newly instantiated owned
+template (`...excel-owned1`), then its **Don't Save** button was selected;
+that screenshot is
+`/tmp/macws-office-installed-release-20260919-excel-quit.png`.
+The detached launchers recorded `state=exited, returncode=0` for **both**
+applications. Receipts and logs are
+`/tmp/macws-office-installed-release-20260919-{word,excel}.{json,log}`
+on the local machine and device. Final process checks retained user
+PowerPoint 19000 and Terminal 17280 unchanged. No production service,
+library, or user document was modified by these acceptance steps.

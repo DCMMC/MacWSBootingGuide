@@ -85,3 +85,106 @@ sendfile fallback, and remove repeated disabled-diagnostic filesystem queries
 and successful-call logging. Their separate evidence files distinguish API
 tests from whole-application acceptance. Finder PDF/TXT icons and intermittent
 Preview annotation rendering are **not** certified by this Office acceptance.
+
+## Final on-device build and executable controls
+
+Source commit `9b88667864e02c2a5f41509d75cd64ffa52e800a` was pushed and
+fast-forwarded into the clean device checkout. The complete
+`THEOS=/var/jb/var/mobile/theos MAKEFLAGS=-j2 bash misc/build_on_ios.sh --package-only`
+build succeeded. The Apple-ld64 Windowing artifact was rebuilt/staged first,
+with 179 authenticated CF-string fixups and zero plain CF-string binds.
+The actual package and Host ABI admission gates passed; this phase did not
+install or restart applications.
+
+Package `com.kdt.macosbooter_0.3.4_iphoneos-arm64.deb` SHA-256:
+`7a4fb82c57a2b3b597f638e39a4df41ee3f16e2073a1ee6070465b8287a8a01d`.
+The library was extracted from that archive, split, platform-patched, signed
+and admitted under fresh isolated paths before any production installation:
+
+| Slice | UUID | Signed isolated SHA-256 |
+| --- | --- | --- |
+| arm64 | `5EC31E06-F7D0-38CE-9989-34862E420C21` | `be9b20c1be4164bbf5996ee363e04a7bb05b0ef9376bd9166c2eb9bbaf979c8b` |
+| arm64e | `D25AFFEA-E257-3921-A845-785A6012ACBA` | `ddbc67a63f859e42384bfe4170279bcfa1d3e3f62998efce8cbac6295782dc71` |
+
+Both actual slices passed Shared/Managed NoCopy ownership and GPU writes,
+the real Office bitmap specialization/reflection/render with **0/77250**
+pixel mismatches, a GPU render followed by a successful fork, namespace
+resource-property protocols before/after fork, and public sendfile exact-byte
+checks. IOSurface layout checks likewise reported zero disagreements for
+both slices. Logs:
+
+- `/tmp/macws-office-package-candidate-20260919.log`
+- `/tmp/macws-office-package-contracts-20260919.log`
+- `/tmp/macws-office-package-helper-admission-20260919.log`
+- `/tmp/macws-office-release-layout-checks-20260919.log`
+
+One initial arm64e namespace test was killed before output. The initial
+inspection mistakenly checked the arm64 fixture's CDHash; reviewing the full
+log correctly located the failure in the arm64e phase. The arm64e fixture
+also failed against the older canonical library. Its actual CDHash
+`9468a189c9097c038be72d8f55fe8b72e96d3f1c` was absent from the device trustcache.
+After admitting that exact unchanged test binary, its namespace/fork checks
+passed with the unchanged new library. No production bypass or code change
+was made to hide the failed run. Two attempted native logging tools also
+failed during this diagnosis; their reports must not be counted as new Office
+or locationd failures.
+
+The full local suite ran 414 cases: 402 executed successfully and 12 archive
+cases were skipped for missing local `dpkg-deb`; all those archive cases were
+executed successfully on the device as part of the 21-case artifact suite.
+The source-policy inventory passed (275 environment names, 76 source flag
+paths, 423 recorded entries). A separate read-only device check found no
+registered diagnostic flag present in either the iOS or chroot namespace.
+
+## Production installation
+
+The exact verified Debian archive was installed successfully with
+`MACWS_POSTINST_NO_RESPRING=1`. `dpkg` returned 0 and reported
+`install ok installed`. Source/staging/archive gates were run again immediately
+before installation. The maintenance script verified all 49 Settings panes,
+the unchanged original Office archives and the complete 28-function route.
+It refreshed autosignd and verified its endpoint, but deferred loaded
+hostd/input/Dock/keychain jobs. No SpringBoard or GUI-stack restart occurred.
+
+Package-storage and rootfs copies match byte-for-byte for each final slice:
+
+| Installed basename | Final signed SHA-256 |
+| --- | --- |
+| `libmachook_arm64.dylib` | `273edeca9604272d4305b6c7f9b630d011367ce8c530701ca95ca8084454a141` |
+| `libmachook.dylib` (arm64e) | `885d51f36af050e8833f0b9bfe7e1f2bb353ef42f826aa8344b5547576301e15` |
+
+UUIDs remain the on-device build identities above. Post-install probes loaded
+the actual canonical `/usr/local/lib/` files, not the isolated `/tmp` copies.
+Both again rendered the real Office bitmap with zero pixel/byte mismatches,
+kept stock superclass authentication and completed GPU work followed by
+fork/exit0. Receipt: `/tmp/macws-office-installed-bitmap-fork-20260919.log`.
+
+The complete before/after read-only mapped-image outputs for user PPT19000,
+Terminal17280 and WindowServer16900 were identical, including load address,
+UUID and text SHA-256. Their original start times, and SpringBoard315/Dock17120/
+hostd8928/locationd23153, were preserved. This protects existing documents;
+it **does not** mean those old processes magically loaded the new library.
+In particular, the user's old PowerPoint must be saved and normally reopened
+before its own document uses the repaired rendering path.
+
+Installation log: `/tmp/macws-office-package-install-20260919.log`.
+The four previous runtime files were retained under the scoped recovery
+directory `/tmp/macws-office-preinstall.Xc1EFx`; no user file was removed.
+
+Post-install visual acceptance also used the canonical arm64 path and verified
+its actual mapped UUID/text identity. The main agent inspected:
+
+- Word67368/window322:
+  `/tmp/macws-office-installed-release-20260919-word-images.png` shows both
+  formerly absent toolbar/menu pictures with their original colors.
+- Excel67644/window329:
+  `/tmp/macws-office-installed-release-20260919-excel-images.png` shows the
+  white Excel logo, orange owl, green background, text and sheet controls.
+
+The package's earlier PowerPoint63261/window316 slide-3 screenshot likewise
+shows all four pictures and nonblack thumbnails. These are three real owned
+Office fixtures, not a claim that the still-running user's old PPT was
+hot-repaired. The no-flag canonical shader/fork controls and application
+screenshots close the reported Office image/thumbnail acceptance for this
+installed source generation. They do not close the unrelated pending
+Finder-icon/Preview-annotation matrix or certify an actual iPad reboot.
