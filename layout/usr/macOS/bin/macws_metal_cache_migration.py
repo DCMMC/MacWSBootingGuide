@@ -15,7 +15,12 @@ import stat
 import sys
 import tempfile
 
-SCHEMA = "macws-macabi-dag-v2"
+# Kind-5 CoreUI image-filter composition preserves the request bytes/cache key
+# while translating the parsed modules to Catalyst. Caches produced under v2
+# can therefore retain incompatible macOS-target libraries even after the
+# compiler repair. Retire them once at the existing quiescent boundary; this
+# revision never enables the compatibility code and never touches live clients.
+SCHEMA = "macws-macabi-image-filter-v3"
 CACHE_RELATIVE = Path("private/var/folders/zz/zyxvpxvq6csfxvn_n0000000000000/C")
 STATE_RELATIVE = Path("Library/Caches/MacWS/metal-library-target")
 NAMES = ("libraries.list", "libraries.data")

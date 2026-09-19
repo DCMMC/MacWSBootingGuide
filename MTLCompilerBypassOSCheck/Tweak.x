@@ -13,6 +13,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include "../include/macws_metal_dag_request.h"
+#include "../include/macws_metal_image_filter_request.h"
 #include "../include/macws_code_pointer.h"
 
 // The rootless iOS 16 Theos SDK used by this project omits xpc/xpc.h.  This
@@ -474,6 +475,128 @@ static bool InstallCatalystDAGTargetContext(void) {
     return gCatalystDAGTargetReady;
 }
 
+// CoreUI uses the distinct image-filter compiler request (kind 5). The
+// captured raw-80913-001-5 request and its reply prove that this path emits
+// macOS AIR even with the default-Triple adapter above. RE-confirmed in
+// libComposeFilters BEAEC489-ED9B-3F62-B645-BC10399B2D18: +0x9bb8 receives
+// three opaque vectors and an error-output pointer; its first vector contains
+// Module pointers. It links the input modules, then composes the kernel using
+// their target. It does not obtain that target from getDefaultTargetTriple.
+//
+// Adapt the request-owned LLVM modules BEFORE linking, through LLVM's real
+// C API, without direct Module/Triple field writes or changes to request bytes,
+// archive headers, compiler checks or return values. The original compose owns the modules
+// and may destroy them, so never inspect or restore them after that call.
+typedef void *(*MacWSComposeImageFiltersFn)(void *, void *, void *, void *);
+typedef const char *(*MacWSLLVMGetTargetFn)(void *);
+typedef void (*MacWSLLVMSetTargetFn)(void *, const char *);
+static MacWSComposeImageFiltersFn gOriginalComposeImageFilters;
+static MacWSLLVMGetTargetFn gImageFilterGetTarget;
+static MacWSLLVMSetTargetFn gImageFilterSetTarget;
+static _Thread_local uint32_t gImageFilterRequestModuleCount;
+static bool gImageFilterTargetAttempted;
+static bool gImageFilterTargetReady;
+
+static void *MacWSComposeImageFilters(void *moduleVector, void *functions,
+                                      void *filterInfo, void *errorOutput) {
+    uint32_t count = gImageFilterRequestModuleCount;
+    bool supported = count && count <= 4096 && moduleVector;
+    void **modules = NULL;
+    if (supported) {
+        // Only this UUID-locked function's actual vector ABI is interpreted;
+        // no ownership/construction/destruction of the C++ object is assumed.
+        uintptr_t bounds[3];
+        memcpy(bounds, moduleVector, sizeof(bounds));
+        supported = bounds[0] && !(bounds[0] & 7) &&
+            bounds[1] >= bounds[0] && bounds[2] >= bounds[1] &&
+            !((bounds[1] - bounds[0]) & 7) &&
+            !((bounds[2] - bounds[0]) & 7) &&
+            bounds[1] - bounds[0] == (uintptr_t)count * sizeof(void *) &&
+            bounds[2] - bounds[0] <= 4096U * sizeof(void *);
+        if (supported) modules = (void **)bounds[0];
+    }
+    // Validate the entire live set before mutating any module. The byte-level
+    // request classifier alone is not a substitute for LLVM's parsed target.
+    for (uint32_t i = 0; supported && i < count; ++i) {
+        if (!modules[i]) { supported = false; break; }
+        for (uint32_t j = 0; j < i; ++j)
+            if (modules[i] == modules[j]) { supported = false; break; }
+        if (!supported) break;
+        const char *target = gImageFilterGetTarget(modules[i]);
+        supported = target && !strcmp(target, "air64-apple-macosx13.4.0");
+    }
+    if (supported) {
+        for (uint32_t i = 0; i < count; ++i)
+            gImageFilterSetTarget(modules[i], "air64-apple-ios19.0.0-macabi");
+    }
+    if (count && MacWSCompilerDiagnosticsEnabled())
+        MTLPatchLog("MacWS image-filter module-target count=%u adapted=%d",
+                    count, supported);
+    return gOriginalComposeImageFilters(moduleVector, functions,
+                                         filterInfo, errorOutput);
+}
+
+static bool MacWSCompilerSymbolMatches(const void *symbol,
+        const uint8_t uuid[16], uintptr_t offset, const uint32_t prologue[4]) {
+    if (!symbol) return false;
+    uintptr_t entry = StripPAC(symbol);
+    Dl_info info = {0};
+    if (!dladdr((void *)entry, &info) || !info.dli_fbase ||
+        entry - (uintptr_t)info.dli_fbase != offset) return false;
+    const struct mach_header_64 *header = info.dli_fbase;
+    if (header->magic != MH_MAGIC_64 || header->sizeofcmds > 1048576 ||
+        header->ncmds > 2048) return false;
+    const uint8_t *cursor = (const void *)(header + 1);
+    const uint8_t *end = cursor + header->sizeofcmds;
+    bool matched = false;
+    for (uint32_t i = 0; i < header->ncmds; ++i) {
+        if ((size_t)(end - cursor) < sizeof(struct load_command)) return false;
+        const struct load_command *command = (const void *)cursor;
+        if (command->cmdsize < sizeof(*command) ||
+            command->cmdsize > (size_t)(end - cursor)) return false;
+        if (command->cmd == LC_UUID &&
+            command->cmdsize >= sizeof(struct uuid_command))
+            matched = !memcmp(((const struct uuid_command *)command)->uuid, uuid, 16);
+        cursor += command->cmdsize;
+    }
+    return matched && !memcmp((const void *)entry, prologue, 16);
+}
+
+// Called only under the compiler-request write lock, after a completely
+// recognized native-macOS kind-5 envelope. Ordinary iOS compiler startup does
+// not load or install this adapter. Unknown compiler ABIs retain stock behavior.
+static bool InstallImageFilterTargetContext(void) {
+    if (gImageFilterTargetAttempted) return gImageFilterTargetReady;
+    gImageFilterTargetAttempted = true;
+    void *compose = dlopen("/System/Library/PrivateFrameworks/GPUCompiler.framework/Libraries/libComposeFilters.dylib", RTLD_NOW | RTLD_LOCAL);
+    void *llvm = dlopen("/usr/lib/libLLVM.dylib", RTLD_NOW | RTLD_LOCAL);
+    void *function = compose ? dlsym(compose, "composeImageFilterFunctionsFromModulesSPI") : NULL;
+    void *getTarget = llvm ? dlsym(llvm, "LLVMGetTarget") : NULL;
+    void *setTarget = llvm ? dlsym(llvm, "LLVMSetTarget") : NULL;
+    static const uint8_t composeUUID[16] = {0xbe,0xae,0xc4,0x89,0xed,0x9b,0x3f,0x62,0xb6,0x45,0xbc,0x10,0x39,0x9b,0x2d,0x18};
+    static const uint8_t llvmUUID[16] = {0x3c,0x9d,0x9d,0x6c,0xcc,0x92,0x32,0x6a,0x91,0x1c,0x14,0x1b,0xc9,0x6d,0xc8,0xbe};
+    static const uint32_t composeEntry[4] = {0xd503237f,0xd10443ff,0xa90b6ffc,0xa90c67fa};
+    static const uint32_t getEntry[4] = {0xaa0003e8,0x91036000,0x39c3bd08,0x37f80048};
+    static const uint32_t setEntry[4] = {0xd503237f,0xa9be4ff4,0xa9017bfd,0x910043fd};
+    if (!MacWSCompilerSymbolMatches(function, composeUUID, 0x9bb8, composeEntry) ||
+        !MacWSCompilerSymbolMatches(getTarget, llvmUUID, 0x844fb0, getEntry) ||
+        !MacWSCompilerSymbolMatches(setTarget, llvmUUID, 0x844fcc, setEntry)) {
+        MTLPatchLog("Image-filter target context: unsupported compiler ABI; original retained");
+        return false;
+    }
+    gImageFilterGetTarget = (MacWSLLVMGetTargetFn)getTarget;
+    gImageFilterSetTarget = (MacWSLLVMSetTargetFn)setTarget;
+    MSHookFunction(function, (void *)MacWSComposeImageFilters,
+                   (void **)&gOriginalComposeImageFilters);
+    kern_return_t protection = vm_protect(mach_task_self(),
+        (vm_address_t)StripPAC(function), sizeof(composeEntry), false,
+        VM_PROT_READ | VM_PROT_EXECUTE);
+    gImageFilterTargetReady = gOriginalComposeImageFilters && protection == KERN_SUCCESS;
+    MTLPatchLog("Image-filter target context installed=%d restore-rx=%d",
+                gImageFilterTargetReady, protection);
+    return gImageFilterTargetReady;
+}
+
 static uint64_t MacWSFNV1a64(const void *data, size_t length) {
     const uint8_t *bytes = (const uint8_t *)data;
     uint64_t hash = UINT64_C(1469598103934665603);
@@ -806,7 +929,9 @@ static uintptr_t MacWSMTLCodeGenServiceBuildRequest(
 
     MacWSMetalDAGInputTarget dagInputTarget = a2 == 14
         ? MacWSMetalDAGGetInputTarget(request, requestSize) : MacWSMetalDAGInputUnknown;
-    if (adapted || dagInputTarget != MacWSMetalDAGInputUnknown)
+    bool nativeImageFilter = a2 == 5 &&
+        MacWSMetalImageFilterGetInputTarget(request, requestSize) == MacWSMetalDAGInputMacOS134;
+    if (adapted || dagInputTarget != MacWSMetalDAGInputUnknown || nativeImageFilter)
         pthread_rwlock_wrlock(&gMetalBuildRequestLock);
     else
         pthread_rwlock_rdlock(&gMetalBuildRequestLock);
@@ -824,11 +949,15 @@ static uintptr_t MacWSMTLCodeGenServiceBuildRequest(
     MacWSMetalDAGInputTarget previousDAGContext = gMacWSDAGInputTarget;
     gMacWSDAGInputTarget = dagInputTarget && InstallCatalystDAGTargetContext()
         ? dagInputTarget : MacWSMetalDAGInputUnknown;
+    uint32_t previousImageFilterCount = gImageFilterRequestModuleCount;
+    gImageFilterRequestModuleCount = nativeImageFilter && InstallImageFilterTargetContext()
+        ? MacWSMetalImageFilterReadLE32((const uint8_t *)request + 8) : 0;
     if (diagnostics && dagInputTarget)
         MTLPatchLog("MacWS DAG request input-target=%u catalyst-context=%d size=%zu",
             dagInputTarget, gMacWSDAGInputTarget != MacWSMetalDAGInputUnknown, requestSize);
     uintptr_t result = OrigMTLCodeGenServiceBuildRequest(
         a0, a1, a2, request, requestSize, a5);
+    gImageFilterRequestModuleCount = previousImageFilterCount;
     gMacWSDAGInputTarget = previousDAGContext;
     atomic_store_explicit(&gMacWSMetalBuildRequestActive, false,
                           memory_order_release);

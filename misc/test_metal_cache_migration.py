@@ -71,6 +71,65 @@ class MetalCacheMigrationTests(unittest.TestCase):
             result = migration.migrate(self.root, process_inventory=lambda root: [321])
         self.assertEqual(result["state"], "current")
 
+    def test_v2_upgrade_retires_new_pair_and_preserves_previous_archive(self):
+        old_schema = "macws-macabi-dag-v2"
+        cache = self.cache("com.microsoft.Word")
+        with mock.patch.object(migration, "SCHEMA", old_schema):
+            self.assertEqual(self.migrate()["retired_files"], 2)
+        old_archive = self.root / migration.STATE_RELATIVE / "retired" / old_schema
+        old_files = {path: (path.read_bytes(), migration.stamp(path))
+                     for path in old_archive.rglob("libraries.*")}
+        old_journal = self.root / migration.STATE_RELATIVE / (old_schema + ".json")
+        old_journal_bytes = old_journal.read_bytes()
+        self.cache("com.microsoft.Word")
+        for name in migration.NAMES:
+            (cache / name).write_bytes(b"v2-coreui-wrong-target-" + name.encode())
+        pending = {name: ((cache / name).read_bytes(), migration.stamp(cache / name))
+                   for name in migration.NAMES}
+        self.assertFalse(migration.current(self.root))
+        self.assertEqual(self.migrate(), {"state": "migrated", "retired_files": 2})
+        self.assertEqual(migration.read_json(self.root / migration.STATE_RELATIVE / "schema.json"),
+                         {"schema": "macws-macabi-image-filter-v3"})
+        for name in migration.NAMES:
+            archived = (self.root / migration.STATE_RELATIVE / "retired" / migration.SCHEMA /
+                        (cache / name).relative_to(self.root))
+            self.assertEqual((archived.read_bytes(), migration.stamp(archived)), pending[name])
+            self.assertFalse((cache / name).exists())
+        self.assertEqual(old_journal.read_bytes(), old_journal_bytes)
+        for path, original in old_files.items():
+            self.assertEqual((path.read_bytes(), migration.stamp(path)), original)
+
+    def test_v3_warm_pair_is_unchanged_even_with_live_clients(self):
+        self.migrate()
+        cache = self.cache("com.microsoft.Word")
+        before = {path: (path.read_bytes(), migration.stamp(path)) for path in cache.iterdir()}
+        inventory = mock.Mock(side_effect=AssertionError("warm cache must not scan/retire"))
+        self.assertEqual(migration.migrate(self.root, process_inventory=inventory),
+                         {"state": "current", "retired_files": 0})
+        inventory.assert_not_called()
+        for path, original in before.items():
+            self.assertEqual((path.read_bytes(), migration.stamp(path)), original)
+
+    def test_live_word_defers_v2_upgrade_without_updating_old_record(self):
+        old_schema = "macws-macabi-dag-v2"
+        self.cache("com.microsoft.Word")
+        with mock.patch.object(migration, "SCHEMA", old_schema):
+            self.migrate()
+        self.cache("com.microsoft.Word")
+        # Include the committed v2 schema, old journal/archive, and current
+        # mmap-able pair: not even metadata is changed while a client lives.
+        before = {path: (path.read_bytes(), migration.stamp(path))
+                  for path in self.root.rglob("*") if path.is_file()}
+        with self.assertRaises(migration.Busy):
+            migration.migrate(self.root, process_inventory=lambda root: [321])
+        self.assertFalse(migration.current(self.root))
+        after_paths = {path for path in self.root.rglob("*") if path.is_file()}
+        self.assertEqual(after_paths, set(before))
+        for path, original in before.items():
+            self.assertEqual((path.read_bytes(), migration.stamp(path)), original)
+        self.assertEqual(migration.read_json(self.root / migration.STATE_RELATIVE / "schema.json"),
+                         {"schema": old_schema})
+
     def test_partial_rename_failure_is_resumable_without_false_completion(self):
         self.cache()
         original = migration.os.rename

@@ -6,6 +6,7 @@
 #import <CoreImage/CoreImage.h>
 #import <Metal/Metal.h>
 #import <objc/runtime.h>
+#include <dlfcn.h>
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
@@ -32,7 +33,8 @@ static id ObserveDAG(id device, SEL command, NSString *dag, NSArray *functions,
 int main(int argc, const char **argv) {
     BOOL validateReply = argc == 3 && !strcmp(argv[1], "--compiled-reply") && argv[2][0] == '/';
     BOOL gamma = argc == 2 && !strcmp(argv[1], "--gamma");
-    if (!validateReply && !gamma && argc != 1 && (argc != 2 || strcmp(argv[1], "--fresh-dag"))) return 64;
+    BOOL coreUI = argc == 2 && !strcmp(argv[1], "--coreui");
+    if (!validateReply && !gamma && !coreUI && argc != 1 && (argc != 2 || strcmp(argv[1], "--fresh-dag"))) return 64;
     alarm(15);
     FreshDAG = argc == 2 && !strcmp(argv[1], "--fresh-dag");
     @autoreleasepool {
@@ -84,8 +86,40 @@ int main(int argc, const char **argv) {
         CGColorSpaceRef colorSpace = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
         CIImage *input = [CIImage imageWithBitmapData:[NSData dataWithBytes:source length:sizeof(source)]
             bytesPerRow:64 size:CGSizeMake(16, 16) format:kCIFormatRGBA8 colorSpace:colorSpace];
-        CIImage *filtered = [input imageByApplyingFilter:@"CIColorControls"
-            withInputParameters:@{kCIInputSaturationKey:@0.37, kCIInputContrastKey:@1.12}];
+        CIImage *filtered = nil;
+        if (coreUI) {
+            // Runtime-confirmed on 2026-09-20: the real CoreUI tint filter
+            // reproduces Word's transparent Save button in a 16x16 image.
+            // It submits compiler request kind 5, not kind 14 as the ordinary
+            // CoreImage graph below does. Use its actual class/defaults, no
+            // replacement kernel, software context or altered return value.
+            void *framework = dlopen(
+                "/System/Library/PrivateFrameworks/CoreUI.framework/CoreUI",
+                RTLD_NOW | RTLD_LOCAL);
+            Class filterClass = framework ? NSClassFromString(
+                @"CUIHueSaturationFilterLocal") : Nil;
+            if (!filterClass || ![filterClass isSubclassOfClass:[CIFilter class]]) {
+                CGColorSpaceRelease(colorSpace);
+                return 8;
+            }
+            CIFilter *filter = [[filterClass alloc] init];
+            [filter setDefaults];
+            if (![filter.inputKeys containsObject:kCIInputImageKey]) {
+                CGColorSpaceRelease(colorSpace);
+                return 8;
+            }
+            [filter setValue:input forKey:kCIInputImageKey];
+            filtered = filter.outputImage;
+            fprintf(stderr, "CI-PROBE filter=%s compiler-contract=image-filter\n",
+                    object_getClassName(filter));
+        } else {
+            filtered = [input imageByApplyingFilter:@"CIColorControls"
+                withInputParameters:@{kCIInputSaturationKey:@0.37, kCIInputContrastKey:@1.12}];
+        }
+        if (!filtered) {
+            CGColorSpaceRelease(colorSpace);
+            return 8;
+        }
         if (gamma) filtered = [filtered imageByApplyingFilter:@"CIGammaAdjust"
             withInputParameters:@{@"inputPower":@2.13}];
         [context render:filtered toBitmap:output rowBytes:64
