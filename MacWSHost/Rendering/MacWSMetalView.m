@@ -25,6 +25,12 @@
 #include "macws_viewport_math.h"
 #include "macws_window_configuration.h"
 #include "macws_resize_gesture.h"
+#include "macws_keyboard_state.h"
+#include "macws_keyboard_source.h"
+
+// UIKit routes one keyboard across the app's Scenes. Keep ownership global,
+// not one independent owner per captured macOS window.
+static __weak MacWSMetalView *MacWSHardwareKeyboardOwner;
 
 typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
     MacWSDirectTouchStateIdle = 0,
@@ -318,6 +324,10 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
     uint32_t _interopDragProbeContactID;
     uint32_t _lastKeyboardFrameWidth;
     uint32_t _lastKeyboardFrameHeight;
+    uint8_t _hardwareModifierSides;
+    MacWSKeyboardSourceState _hardwareModifierSource;
+    BOOL _ownsHardwareKeyboard;
+    NSMutableDictionary<NSNumber *, NSData *> *_heldHardwareKeys;
     CGSize _lastRequestedWindowSize;
     CGFloat _lastRequestedDensityScale;
     CGSize _lastObservedTargetWindowLogicalSize;
@@ -985,6 +995,7 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
 
 - (void)suspendStream {
     [self cancelSceneResizeFollowingTargetWindow];
+    [self releaseHardwareKeyboardState];
     _constrainedWindowSettlementSerial++;
     _constrainedWindowSettlementPending = NO;
     _deferredConstrainedWindowSettlement = nil;
@@ -1962,7 +1973,8 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
                  self.targetPID, [self currentFrameWidth],
                  [self currentFrameHeight]);
     }
-    if (!self.isMacWSInputEnabled) return NO;
+    if (MacWSHardwareKeyboardOwner != self) return NO;
+    if (!self.isMacWSInputEnabled && kind != MacWSInputKindKeyUp) return NO;
     uint32_t width = [self currentFrameWidth];
     uint32_t height = [self currentFrameHeight];
     if (width != 0 && height != 0) {
@@ -1978,7 +1990,13 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
         width = _lastKeyboardFrameWidth;
         height = _lastKeyboardFrameHeight;
     }
-    if (width == 0 || height == 0) return NO;
+    // A keyboard release has no coordinate dependency. Reuse the original
+    // down below; the 1x1 envelope also covers a release first seen after an
+    // interrupted drawable/scene transition.
+    if (width == 0 || height == 0) {
+        if (kind != MacWSInputKindKeyUp) return NO;
+        width = height = 1;
+    }
     BOOL emitted = NO;
     for (UIPress *press in presses) {
         UIKey *key = press.key;
@@ -2023,7 +2041,8 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
             // AppInputBridge's established v3 keyboard ABI stores AppKit-
             // compatible modifier bits in sceneID's low 32 bits.
             .sceneID = [self inputSceneIDWithModifiers:
-                (uint32_t)key.modifierFlags],
+                ((uint32_t)key.modifierFlags & ~MacWSKeyboardModifierMask) |
+                    MacWSKeyboardFlagsForSides(_hardwareModifierSides)],
             .timestamp = press.timestamp,
             .x = (float)keyPoint.x,
             .y = (float)keyPoint.y,
@@ -2034,11 +2053,123 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
             .targetPID = self.targetPID,
             .source = MacWSInputSourceHardwareKeyboard,
             .sampleSequence = ++_inputSampleSequence,
+            .reserved = 0x100u | _hardwareModifierSides,
         };
+        NSData *originalDown = _heldHardwareKeys[@(keyCode)];
+        if (kind == MacWSInputKindKeyUp && originalDown.length == sizeof(record)) {
+            MacWSInputRecord original;
+            [originalDown getBytes:&original length:sizeof(original)];
+            record.targetPID = original.targetPID;
+            record.frameWidth = original.frameWidth;
+            record.frameHeight = original.frameHeight;
+            record.x = original.x;
+            record.y = original.y;
+            record.sceneID = MacWSInputSceneForWindow(
+                MacWSInputWindowIDForScene(original.sceneID),
+                MacWSInputModifiersForScene(record.sceneID));
+        }
+        if (!_heldHardwareKeys) _heldHardwareKeys = [NSMutableDictionary dictionary];
+        if (kind == MacWSInputKindKeyDown)
+            _heldHardwareKeys[@(keyCode)] = [NSData dataWithBytes:&record length:sizeof(record)];
+        else
+            [_heldHardwareKeys removeObjectForKey:@(keyCode)];
         [self.statusDelegate metalView:self emittedInput:record];
         emitted = YES;
     }
     return emitted;
+}
+
+// A modifier release can belong to a different responder or Scene than its
+// down. Use the public UIEvent snapshot at the UIWindow boundary, including
+// mouse/finger edges, instead of trusting an indefinitely retained down mask.
+- (void)observeHardwareModifiersForEvent:(UIEvent *)event {
+    if (!event || (!self.isMacWSInputEnabled &&
+                  MacWSHardwareKeyboardOwner != self)) return;
+    static const NSInteger usages[] = {225,229,224,228,226,230,227,231};
+    uint8_t downs = 0, ups = 0, sides = 0;
+    BOOL edge = !_ownsHardwareKeyboard;
+    if ([event isKindOfClass:UIPressesEvent.class]) {
+        for (UIPress *press in ((UIPressesEvent *)event).allPresses) {
+            BOOL down = press.phase == UIPressPhaseBegan;
+            BOOL up = press.phase == UIPressPhaseEnded || press.phase == UIPressPhaseCancelled;
+            if (!down && !up) continue;
+            edge = YES;
+            for (unsigned i = 0; press.key && i < 8; ++i) {
+                if (press.key.keyCode != usages[i]) continue;
+                if (down) downs |= (uint8_t)(1u << i);
+                else ups |= (uint8_t)(1u << i);
+            }
+        }
+    } else if (event.type == UIEventTypeTouches) {
+        for (UITouch *touch in event.allTouches) {
+            if (touch.phase == UITouchPhaseBegan || touch.phase == UITouchPhaseEnded ||
+                touch.phase == UITouchPhaseCancelled) edge = YES;
+        }
+    } else {
+        return;
+    }
+    uint32_t modifiers = (uint32_t)event.modifierFlags;
+    if (MacWSHardwareKeyboardOwner != self) {
+        [MacWSHardwareKeyboardOwner releaseHardwareKeyboardState];
+        MacWSHardwareKeyboardOwner = self;
+        edge = YES;
+    }
+    if (!MacWSKeyboardSourceApplyOwned(&_hardwareModifierSource,
+            self.isMacWSInputEnabled, MacWSHardwareKeyboardOwner == self,
+            modifiers, downs, ups, &sides)) return;
+    if (!edge && sides == _hardwareModifierSides) return;
+    _hardwareModifierSides = sides;
+    _ownsHardwareKeyboard = YES;
+    modifiers = (modifiers & ~MacWSKeyboardModifierMask) |
+        MacWSKeyboardFlagsForSides(sides);
+    MacWSInputRecord snapshot = {
+        .magic = MACWS_INPUT_MAGIC, .version = MACWS_INPUT_VERSION,
+        .kind = MacWSInputKindModifierSnapshot,
+        .sceneID = MacWSInputSceneForWindow(0, modifiers),
+        .timestamp = event.timestamp,
+        .source = MacWSInputSourceHardwareKeyboard,
+        .reserved = sides, .sampleSequence = ++_inputSampleSequence,
+    };
+    [self.statusDelegate metalView:self emittedInput:snapshot];
+}
+
+- (void)releaseHardwareKeyboardState {
+    // Retired Scenes can receive delayed background/cancel callbacks after a
+    // new Scene has acquired the keyboard. Never release the new owner's keys.
+    if (MacWSHardwareKeyboardOwner != self) {
+        [_heldHardwareKeys removeAllObjects];
+        _ownsHardwareKeyboard = NO;
+        _hardwareModifierSides = 0;
+        _hardwareModifierSource = (MacWSKeyboardSourceState){0};
+        return;
+    }
+    if (!_ownsHardwareKeyboard && _heldHardwareKeys.count == 0) return;
+    // Preserve the exact key's original destination even if the presentation
+    // target changed, and permit release after the drawable was retired.
+    for (NSData *value in _heldHardwareKeys.allValues) {
+        MacWSInputRecord release;
+        [value getBytes:&release length:sizeof(release)];
+        release.kind = MacWSInputKindKeyUp;
+        release.timestamp = CACurrentMediaTime();
+        release.sceneID = MacWSInputSceneForWindow(
+            MacWSInputWindowIDForScene(release.sceneID), 0);
+        release.reserved = 0x100u;
+        release.sampleSequence = ++_inputSampleSequence;
+        [self.statusDelegate metalView:self emittedInput:release];
+    }
+    [_heldHardwareKeys removeAllObjects];
+    _hardwareModifierSides = 0;
+    _hardwareModifierSource = (MacWSKeyboardSourceState){0};
+    _ownsHardwareKeyboard = NO;
+    MacWSInputRecord snapshot = {
+        .magic = MACWS_INPUT_MAGIC, .version = MACWS_INPUT_VERSION,
+        .kind = MacWSInputKindModifierSnapshot,
+        .timestamp = CACurrentMediaTime(), .contactID = 1,
+        .source = MacWSInputSourceHardwareKeyboard,
+        .sampleSequence = ++_inputSampleSequence,
+    };
+    [self.statusDelegate metalView:self emittedInput:snapshot];
+    MacWSHardwareKeyboardOwner = nil;
 }
 
 - (BOOL)forwardHardwarePresses:(NSSet<UIPress *> *)presses

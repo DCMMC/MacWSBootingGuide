@@ -147,6 +147,7 @@ static const char *KindName(MacWSInputKind kind) {
         case MacWSInputKindMenuHover: return "menu-hover";
         case MacWSInputKindKeyDown: return "key-down";
         case MacWSInputKindKeyUp: return "key-up";
+        case MacWSInputKindModifierSnapshot: return "modifier-snapshot";
         case MacWSInputKindSecondaryTap: return "secondary-tap";
         case MacWSInputKindScroll: return "scroll";
         case MacWSInputKindMagnify: return "magnify";
@@ -180,7 +181,28 @@ static bool IsSystemPointerKind(MacWSInputKind kind) {
     }
 }
 
+// Down and up must use the same session-vs-AppKit transport. In particular,
+// ordinary software text goes through AppInput on both edges; sending only
+// its up to the CG session would lose the original pair's destination.
+static bool IsNativeKeyboardProxyRecord(const MacWSInputRecord *record) {
+    if (!record || (record->kind != MacWSInputKindKeyDown &&
+                    record->kind != MacWSInputKindKeyUp)) return false;
+    uint32_t modifiers = MacWSInputModifiersForScene(record->sceneID);
+    return record->source == MacWSInputSourceHardwareKeyboard ||
+        (record->source == MacWSInputSourceSoftwareKeyboard &&
+         (record->contactID >= 0xff00u ||
+          (modifiers & (0x40000u | 0x80000u | 0x100000u)) != 0));
+}
+
 static bool RecordIsValid(const MacWSInputRecord *record) {
+    if (record->kind == MacWSInputKindModifierSnapshot) {
+        return record->magic == MACWS_INPUT_MAGIC &&
+            MacWSInputVersionSupportsKind(record->version, record->kind) &&
+            record->source == MacWSInputSourceHardwareKeyboard &&
+            record->reserved <= 0xffu && record->contactID <= 1 &&
+            (record->contactID == 0 || record->reserved == 0) &&
+            isfinite(record->timestamp) && record->timestamp >= 0;
+    }
     if (record->magic != MACWS_INPUT_MAGIC ||
         !MacWSInputVersionSupportsKind(record->version, record->kind) ||
         !isfinite(record->x) || !isfinite(record->y) ||
@@ -1423,6 +1445,20 @@ int main(void) {
         // emitted as v5 so a new broker can talk to either endpoint revision.
         record.version = MacWSInputWireVersionForKind(record.kind);
 
+        // State release must not depend on an app, a focused window or a live
+        // framebuffer. UIKit can retire all three before delivering key-up.
+        if (record.kind == MacWSInputKindModifierSnapshot) {
+            int proxyError = 0;
+            if (!SendToVNCPointerProxy(socketFD, &record, &proxyError))
+                fprintf(stderr, "MACWS-INPUT MODIFIER-SNAPSHOT failed errno=%d\n", proxyError);
+            continue;
+        }
+        if (record.kind == MacWSInputKindKeyUp &&
+            IsNativeKeyboardProxyRecord(&record)) {
+            int proxyError = 0;
+            if (SendToVNCPointerProxy(socketFD, &record, &proxyError)) continue;
+        }
+
         NoteUserInteraction();
 
         // Window configuration is an exact-PID control-plane transaction.
@@ -1555,14 +1591,7 @@ int main(void) {
         bool systemGestureRecord =
             record.kind == MacWSInputKindSystemGesture;
         bool gestureRecord = scrollRecord || magnifyRecord || rotateRecord;
-        uint32_t keyModifiers = keyRecord
-            ? MacWSInputModifiersForScene(record.sceneID) : 0;
-        bool nativeKeyboardProxyRecord = keyRecord &&
-            record.targetPID > 1 &&
-            (record.source == MacWSInputSourceHardwareKeyboard ||
-             (record.source == MacWSInputSourceSoftwareKeyboard &&
-              (record.contactID >= 0xff00u ||
-               (keyModifiers & (0x40000u | 0x80000u | 0x100000u)) != 0)));
+        bool nativeKeyboardProxyRecord = IsNativeKeyboardProxyRecord(&record);
         if (nativeKeyboardProxyRecord) {
             int proxyError = 0;
             bool proxySent = SendToVNCPointerProxy(

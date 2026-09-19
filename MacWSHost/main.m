@@ -321,6 +321,8 @@ static NSString *MacWSLocalizedPhase(NSString *phase) {
 - (void)reassertFullscreenScenePresentation;
 - (void)restoreHardwareKeyboardFocusWithReason:(NSString *)reason;
 - (BOOL)forwardHardwarePressEvent:(UIPressesEvent *)event;
+- (void)observeHardwareModifiersForEvent:(UIEvent *)event;
+- (void)releaseHardwareKeyboardState;
 - (void)restoreWorkspaceReturnFromActivity:(NSUserActivity *)activity;
 - (BOOL)detachMissingWorkspaceReturnOwnerPID:(int32_t)ownerPID
                                     windowID:(uint32_t)windowID;
@@ -3764,13 +3766,14 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
 
 - (BOOL)forwardHardwarePressEvent:(UIPressesEvent *)event {
     if (_keyboardProxy.isFirstResponder || _appSearchField.isFirstResponder ||
-        !_metalView.isMacWSInputEnabled || !event)
+        !event)
         return NO;
     BOOL forwarded = NO;
     for (UIPress *press in event.allPresses) {
         BOOL keyDown = NO;
         switch (press.phase) {
             case UIPressPhaseBegan:
+                if (!_metalView.isMacWSInputEnabled) continue;
                 keyDown = YES;
                 break;
             case UIPressPhaseEnded:
@@ -3788,6 +3791,21 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
                  (unsigned long)event.allPresses.count, _metalView.targetPID);
     }
     return forwarded;
+}
+
+- (void)observeHardwareModifiersForEvent:(UIEvent *)event {
+    UIWindow *window = self.viewIfLoaded.window;
+    if ([window respondsToSelector:@selector(_isApplicationKeyWindow)] &&
+        ![window _isApplicationKeyWindow]) return;
+    if (_keyboardProxy.isFirstResponder || _appSearchField.isFirstResponder) {
+        [_metalView releaseHardwareKeyboardState];
+        return;
+    }
+    [_metalView observeHardwareModifiersForEvent:event];
+}
+
+- (void)releaseHardwareKeyboardState {
+    [_metalView releaseHardwareKeyboardState];
 }
 
 - (void)setNotice:(NSString *)notice success:(BOOL)success {
@@ -7468,6 +7486,7 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
     if (_streamMode == MacWSStreamModeFullscreen &&
         record.kind != MacWSInputKindKeyDown &&
         record.kind != MacWSInputKindKeyUp &&
+        record.kind != MacWSInputKindModifierSnapshot &&
         record.kind != MacWSInputKindPerformPaste &&
         record.kind != MacWSInputKindActivateTarget &&
         record.kind != MacWSInputKindDesktopCommand &&
@@ -7497,6 +7516,7 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
         case MacWSInputKindSystemGesture: phase = @"system-gesture"; break;
         case MacWSInputKindKeyDown: phase = @"key-down"; break;
         case MacWSInputKindKeyUp: phase = @"key-up"; break;
+        case MacWSInputKindModifierSnapshot: phase = @"modifier-snapshot"; break;
         case MacWSInputKindConfigureWindow: phase = @"configure-window"; break;
         case MacWSInputKindActivateTarget: phase = @"activate-target"; break;
         case MacWSInputKindCloseWindow: phase = @"close-window"; break;
@@ -7602,6 +7622,9 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
 }
 
 - (void)sendEvent:(UIEvent *)event {
+    UIViewController *root = self.rootViewController;
+    if ([root isKindOfClass:MacWSViewController.class])
+        [(MacWSViewController *)root observeHardwareModifiersForEvent:event];
     if ([event isKindOfClass:UIPressesEvent.class]) {
         UIViewController *root = self.rootViewController;
         if ([root isKindOfClass:MacWSViewController.class] &&
@@ -7610,6 +7633,12 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
             return;
     }
     [super sendEvent:event];
+}
+- (void)resignKeyWindow {
+    UIViewController *root = self.rootViewController;
+    if ([root isKindOfClass:MacWSViewController.class])
+        [(MacWSViewController *)root releaseHardwareKeyboardState];
+    [super resignKeyWindow];
 }
 @end
 

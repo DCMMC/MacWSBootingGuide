@@ -7,7 +7,8 @@
 #define MACWS_INPUT_MAGIC 0x4d574556u /* "MWEV" */
 #define MACWS_INPUT_LEGACY_VERSION 5u
 #define MACWS_INPUT_DOCUMENT_VERSION 6u
-#define MACWS_INPUT_VERSION 7u
+#define MACWS_INPUT_QUIT_VERSION 7u
+#define MACWS_INPUT_VERSION 8u
 #define MACWS_INPUT_CONTACT_DIAGNOSTIC 0x44494147u /* "DIAG" */
 #define MACWS_INPUT_WINDOW_SCENE_FLAG UINT64_C(0x0000000080000000)
 #define MACWS_TARGET_PROBE_MAGIC 0x4d575450u /* "MWTP" */
@@ -181,28 +182,40 @@ enum {
     // own Ventura quit handler on its main thread; applicationShouldTerminate,
     // unsaved-document prompts and cancellation remain application-owned.
     MacWSInputKindPerformQuit = 25,
+    // Physical keyboard ownership snapshot, independent of any window/frame.
+    // reserved bits 0..7 identify L/R Shift, Control, Option, Command (in
+    // that order). sceneID retains the corresponding aggregate modifier bits.
+    // contactID=1 ends this Host's keyboard ownership; 0 updates physical state.
+    // Only the session keyboard proxy consumes it; never an AppKit endpoint.
+    MacWSInputKindModifierSnapshot = 26,
 };
 
-// ABI 6 added only OpenDocuments and ABI 7 adds PerformQuit; the packed record
+// ABI 6 added OpenDocuments, ABI 7 PerformQuit, and ABI 8 a keyboard snapshot.
+// The packed record
 // itself is still the
 // 84-byte ABI introduced by version 5.  During a package upgrade, UIKit Host,
 // macwsinputd and long-lived AppKit/Dock processes cannot all replace their
 // mapped code atomically.  Keep every pre-existing kind on the version-5 wire
 // dialect and let current receivers accept either dialect for those kinds.
 // OpenDocuments stays on version 6 for rolling-upgrade compatibility and
-// accepts v7 as well. PerformQuit remains fail-closed on v7 because older
+// accepts v7/v8 as well. PerformQuit stays on the v7 wire because older
 // endpoints do not implement the AppKit lifecycle transaction.
 static inline int MacWSInputVersionSupportsKind(uint16_t version,
                                                 MacWSInputKind kind) {
     if (kind == MacWSInputKindOpenDocuments)
         return version == MACWS_INPUT_DOCUMENT_VERSION ||
+            version == MACWS_INPUT_QUIT_VERSION ||
             version == MACWS_INPUT_VERSION;
     if (kind == MacWSInputKindPerformQuit)
+        return version == MACWS_INPUT_QUIT_VERSION ||
+            version == MACWS_INPUT_VERSION;
+    if (kind == MacWSInputKindModifierSnapshot)
         return version == MACWS_INPUT_VERSION;
     return kind >= MacWSInputKindTouchDown &&
         kind <= MacWSInputKindPerformPaste &&
         (version == MACWS_INPUT_LEGACY_VERSION ||
          version == MACWS_INPUT_DOCUMENT_VERSION ||
+         version == MACWS_INPUT_QUIT_VERSION ||
          version == MACWS_INPUT_VERSION);
 }
 
@@ -210,6 +223,8 @@ static inline uint16_t MacWSInputWireVersionForKind(MacWSInputKind kind) {
     if (kind == MacWSInputKindOpenDocuments)
         return MACWS_INPUT_DOCUMENT_VERSION;
     if (kind == MacWSInputKindPerformQuit)
+        return MACWS_INPUT_QUIT_VERSION;
+    if (kind == MacWSInputKindModifierSnapshot)
         return MACWS_INPUT_VERSION;
     return MACWS_INPUT_LEGACY_VERSION;
 }

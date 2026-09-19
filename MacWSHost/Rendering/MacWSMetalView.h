@@ -106,6 +106,8 @@ typedef NS_ENUM(NSUInteger, MacWSHostPresentationResolution) {
 - (void)performInteropPasteAtViewPoint:(CGPoint)viewPoint;
 - (BOOL)forwardHardwarePresses:(NSSet<UIPress *> *)presses
                        keyDown:(BOOL)keyDown;
+- (void)observeHardwareModifiersForEvent:(UIEvent *)event;
+- (void)releaseHardwareKeyboardState;
 - (BOOL)restoreHardwareKeyboardFocusWithReason:(NSString *)reason;
 - (void)updatePresentationGeometry;
 - (void)updatePointerVisibility;
