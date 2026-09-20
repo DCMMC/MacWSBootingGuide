@@ -1,6 +1,43 @@
 # Word default-cache acceptance — 2026-09-20
 
-## Result: FAIL in the ordinary shared-cache configuration
+## Current result: PASS after the production v3 cache transition
+
+After the user confirmed there were no unsaved macOS documents, the normal
+macOS GUI stack was stopped. The strict migration verified that no process
+still used the chroot, preserved 28 old derived-cache files, installed schema
+`macws-macabi-image-filter-v3`, and passed its check. The iPad was not rebooted
+or resprung. The ordinary coexistence startup then completed successfully.
+
+Two separate, ordinary Word launches now pass the actual unsaved-document
+alert test: native touch on the Dock icon (owned PID `17807`), then native
+touch on Word on Launchpad page two (owned PID `18644`). Each created a new
+Document1, entered a short acceptance string, and invoked Close. Neither used
+an observer, a private cache override, a temporary injected library, nor a
+diagnostic flag. Both real iPadOS screenshots show the blue Save background
+and complete Don't Save and Cancel buttons; both were visually inspected:
+
+- `/tmp/macws-word-dock-default-alert-20260920.png`
+- `/tmp/macws-word-launchpad-default-alert-20260920.png`
+- `/tmp/macws-word-dock-default-alert-cg-20260920.png` — independent raw
+  260 × 328 macOS window image, owner 17807, window 49; also visually normal.
+
+Live-image inspection of both Word processes confirmed canonical arm64
+library UUID `6B46FD91-A12A-37D9-92F5-EBA1F07F55AA`, text SHA-256
+`8c2ac164642db290c091c5d7940c0610187f0835629240642c909610c0fb5317`.
+Its signed canonical file SHA-256 is
+`2cc2fa505a9b543080a1d60bc29bacc7eeaec9faa25e4aadcf596ccfa75b06c5`.
+Each owned document was discarded using Don't Save, followed by normal
+Command-Q; fresh process checks confirmed both PIDs absent. Terminal 16275
+and WindowServer 15997 remained alive. No acceptance document was saved.
+
+The limited Dock finger-touch checks did not reproduce persistent
+magnification after finger lift. This is **not** evidence that the reported
+intermittent Dock hover/magnification issue is fixed.
+
+The earlier failure below is retained as the pre-migration control, not the
+current deployment result.
+
+## Earlier result: FAIL in the ordinary shared-cache configuration
 
 Runtime-confirmed by the actual unsaved-document alert in owned Word PID
 `2999`, window `799`. Both the direct macOS window image and the full iPadOS
@@ -62,7 +99,7 @@ guarded launcher and cleanup script are respectively
 `/tmp/macws_word_default_alert_launch_20260920.py` and
 `/tmp/macws_word_default_alert_cleanup_20260920.py`.
 
-## Acceptance boundary
+## Earlier acceptance boundary (superseded by the v3 retest above)
 
 The corrected compiler's earlier fresh private-cache Word test genuinely
 passed: owned PID 87884 showed a blue Save button in both raw CG and native

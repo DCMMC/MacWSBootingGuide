@@ -19,13 +19,23 @@ class KeyboardStateTests(unittest.TestCase):
 #include <stdio.h>
 #include <string.h>
 typedef struct {uint16_t code; bool down; uint32_t flags;} Event;
-typedef struct {Event events[128]; unsigned count, calls, fail;} Sink;
+typedef struct {Event events[128]; unsigned count, calls, fail, delivered; uint8_t native;} Sink;
 static bool post(void *p,uint16_t c,bool d,uint32_t f) {
     Sink *s=p;s->calls++;
     if(s->fail==s->calls)return false;
     assert(s->count<128);s->events[s->count++]=(Event){c,d,f};return true;
 }
 static void reset(MacWSKeyboardState *s,Sink *o){memset(s,0,sizeof(*s));memset(o,0,sizeof(*o));}
+// Acceptance and native visibility are separate, ordered boundaries. Reading
+// native before drain intentionally returns a stale state without reordering
+// any accepted event, exactly the contract reconciliation must tolerate.
+static void drain(Sink *o) {
+    while(o->delivered<o->count) {
+        Event e=o->events[o->delivered++];
+        uint8_t bit=MacWSKeyboardSideForKeyCode(e.code);
+        if(e.down)o->native|=bit;else o->native&=(uint8_t)~bit;
+    }
+}
 int main(void) {
     MacWSKeyboardState s;Sink o;reset(&s,&o);
     for(unsigned i=0;i<8;i++)assert(MacWSKeyboardSideForKeyCode(MacWSKeyboardKeyCodeForSide(i))==(1u<<i));
@@ -50,6 +60,86 @@ int main(void) {
     // that queued release lands; a repeated release must not create a down.
     assert(MacWSKeyboardApplySnapshot(&s,0,0,4,true,post,&o));
     assert(o.count==3&&!o.events[2].down&&s.postedSides==0);
+
+    // Old owner releases, new owner acquires while physically still held.
+    // A stale native down cannot replace the required down AFTER queued up.
+    reset(&s,&o);
+    assert(MacWSKeyboardApplySnapshot(&s,4,MacWSKeyboardControl,0,true,post,&o));
+    drain(&o);assert(o.native==4);
+    assert(MacWSKeyboardApplySnapshot(&s,0,0,o.native,true,post,&o));
+    assert(s.postedSides==0&&s.acceptedUpSides==4&&o.native==4);
+    assert(MacWSKeyboardApplySnapshot(&s,4,MacWSKeyboardControl,o.native,true,post,&o));
+    assert(o.count==3&&o.events[2].down&&o.events[2].code==59);
+    assert(s.acceptedUpSides==0);
+    drain(&o);assert(o.native==4&&s.postedSides==4);
+    assert(MacWSKeyboardApplySnapshot(&s,0,0,o.native,true,post,&o));
+    drain(&o);assert(!o.native&&!s.postedSides);
+
+    // A failed re-press retains the accepted-up history and retries exactly
+    // that missing down, even if the old queued release has since landed.
+    reset(&s,&o);
+    assert(MacWSKeyboardApplySnapshot(&s,4,MacWSKeyboardControl,0,true,post,&o));
+    drain(&o);
+    assert(MacWSKeyboardApplySnapshot(&s,0,0,o.native,true,post,&o));
+    o.fail=o.calls+1;
+    assert(!MacWSKeyboardApplySnapshot(&s,4,MacWSKeyboardControl,o.native,true,post,&o));
+    assert(s.postedSides==0&&s.acceptedUpSides==4&&o.count==2);
+    drain(&o);assert(!o.native);
+    o.fail=0;
+    assert(MacWSKeyboardApplySnapshot(&s,4,MacWSKeyboardControl,o.native,true,post,&o));
+    drain(&o);assert(o.native==4&&s.acceptedUpSides==0);
+
+    // Native zero is not an ACK: it can precede both accepted down and up.
+    // It must not erase history before a subsequent stale down observation.
+    reset(&s,&o);
+    assert(MacWSKeyboardApplySnapshot(&s,4,MacWSKeyboardControl,0,true,post,&o));
+    assert(MacWSKeyboardApplySnapshot(&s,0,0,0,true,post,&o));
+    assert(MacWSKeyboardApplySnapshot(&s,0,0,0,true,post,&o));
+    assert(s.acceptedUpSides==4);
+    o.native=4;o.delivered=1; // only the original down has landed
+    assert(MacWSKeyboardApplySnapshot(&s,4,MacWSKeyboardControl,o.native,true,post,&o));
+    drain(&o);assert(o.native==4&&s.postedSides==4);
+
+    // A failed redundant release may import stale native-down knowledge into
+    // postedSides. It is still not a new accepted down, including when the
+    // next reconciliation is an ordinary hardware record (no native read).
+    reset(&s,&o);
+    assert(MacWSKeyboardApplySnapshot(&s,4,MacWSKeyboardControl,0,true,post,&o));
+    drain(&o);
+    assert(MacWSKeyboardApplySnapshot(&s,0,0,o.native,true,post,&o));
+    o.fail=o.calls+1;
+    assert(!MacWSKeyboardApplySnapshot(&s,0,0,o.native,true,post,&o));
+    assert(s.postedSides==4&&s.acceptedUpSides==4);
+    o.fail=0;
+    assert(MacWSKeyboardPostHardwareKey(&s,59,true,4,MacWSKeyboardControl,post,&o));
+    drain(&o);assert(o.native==4&&s.postedSides==4&&s.acceptedUpSides==0);
+
+    // The same imported observation cannot masquerade as an accepted
+    // software re-press, nor leave syntheticSides committed on a post failure.
+    reset(&s,&o);
+    assert(MacWSKeyboardApplySnapshot(&s,0,0,4,true,post,&o));
+    o.fail=o.calls+1;
+    assert(!MacWSKeyboardApplySnapshot(&s,0,0,4,true,post,&o));
+    assert(s.postedSides==4&&s.syntheticSides==4&&s.acceptedUpSides==4);
+    o.fail=o.calls+1;
+    assert(!MacWSKeyboardPostSoftwareKey(&s,0,true,MacWSKeyboardControl,post,&o));
+    assert(!s.postedSides&&!s.syntheticSides&&s.acceptedUpSides==4);
+    o.fail=0;
+    assert(MacWSKeyboardPostSoftwareKey(&s,0,true,MacWSKeyboardControl,post,&o));
+    assert(s.postedSides==4&&s.syntheticSides==4&&s.acceptedUpSides==0);
+    assert(MacWSKeyboardPostSoftwareKey(&s,0,false,MacWSKeyboardControl,post,&o));
+    drain(&o);assert(!o.native&&!s.postedSides&&!s.syntheticSides);
+
+    // Re-pressing left Control must not release independently held right.
+    reset(&s,&o);
+    assert(MacWSKeyboardApplySnapshot(&s,12,MacWSKeyboardControl,0,true,post,&o));
+    drain(&o);
+    assert(MacWSKeyboardApplySnapshot(&s,8,MacWSKeyboardControl,o.native,true,post,&o));
+    assert(MacWSKeyboardApplySnapshot(&s,12,MacWSKeyboardControl,o.native,true,post,&o));
+    assert(o.count==4&&o.events[2].code==59&&!o.events[2].down);
+    assert(o.events[3].code==59&&o.events[3].down);
+    assert(o.events[2].flags==MacWSKeyboardControl&&o.events[3].flags==MacWSKeyboardControl);
+    drain(&o);assert(o.native==12&&s.postedSides==12);
 
     // Independently held sides: releasing one does not release the other.
     reset(&s,&o);
@@ -141,7 +231,22 @@ int main(void) {
         }
         assert(simulated==b);
     }
-    puts("keyboard-state PASS: native divergence, side ownership, failure retry, software restore, 65536 transitions");
+    // Exhaust every old/new owner pair with ALL old releases still pending
+    // and native reads returning the old held sides. No sleep/native ACK is
+    // assumed. Final accepted queue must realize exactly the new snapshot.
+    for(unsigned a=0;a<256;a++)for(unsigned b=0;b<256;b++){
+        reset(&s,&o);
+        assert(MacWSKeyboardApplySnapshot(&s,(uint8_t)a,MacWSKeyboardFlagsForSides((uint8_t)a),0,true,post,&o));
+        drain(&o);assert(o.native==a);
+        assert(MacWSKeyboardApplySnapshot(&s,0,0,o.native,true,post,&o));
+        assert(MacWSKeyboardApplySnapshot(&s,(uint8_t)b,MacWSKeyboardFlagsForSides((uint8_t)b),o.native,true,post,&o));
+        drain(&o);
+        assert(o.native==b&&s.postedSides==b&&s.physicalSides==b&&s.syntheticSides==0);
+        assert(!(s.acceptedUpSides&b));
+        assert(MacWSKeyboardApplySnapshot(&s,0,0,o.native,true,post,&o));
+        drain(&o);assert(!o.native&&!s.postedSides&&!s.physicalSides);
+    }
+    puts("keyboard-state PASS: native divergence, side ownership, failure retry, software restore, 65536 transitions, 65536 async owner handoffs");
     return 0;
 }
 '''
@@ -150,11 +255,12 @@ int main(void) {
             binary = pathlib.Path(tmp) / "test"
             source.write_text(program)
             subprocess.run([compiler, "-std=c11", "-O2", "-Wall", "-Wextra",
-                            "-Werror", "-I", str(ROOT / "include"), str(source),
+                            "-Werror", "-fsanitize=undefined", "-I", str(ROOT / "include"), str(source),
                             "-o", str(binary)], check=True, capture_output=True)
             result = subprocess.run([str(binary)], check=True, text=True,
                                     capture_output=True, timeout=10)
             self.assertIn("65536 transitions", result.stdout)
+            self.assertIn("65536 async owner handoffs", result.stdout)
 
 
 if __name__ == "__main__":

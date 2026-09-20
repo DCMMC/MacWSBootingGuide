@@ -62,6 +62,7 @@ typedef struct {
     uint8_t physicalSides;     // Latest authoritative producer snapshot.
     uint8_t postedSides;       // Last successfully posted or observed state.
     uint8_t syntheticSides;    // Posted sides not physically held.
+    uint8_t acceptedUpSides;   // Last locally accepted edge was up, not down.
     uint32_t physicalExtraFlags;
 } MacWSKeyboardState;
 
@@ -75,6 +76,14 @@ static inline bool MacWSKeyboardReconcile(
         uint8_t observedSides, bool observedValid, uint32_t extraFlags,
         MacWSKeyboardPost post, void *context) {
     if (!state || !post) return false;
+    // A native down can also lag an accepted UP. If a new owner still holds
+    // that side, it needs a new ordered down after our queued up; observing
+    // the old native down must not swallow that transition. Keep submission
+    // history until an actual down is accepted, not until a native read of
+    // zero (which could itself predate earlier queued events). This is an
+    // executable asynchronous-model boundary, not an attributed device fault.
+    uint8_t requiredDowns = state->acceptedUpSides & desiredSides;
+    state->postedSides &= (uint8_t)~requiredDowns;
     if (observedValid) {
         // CGEventPost is asynchronous: an immediate native read may still
         // report up after our accepted down. Native presence adds knowledge;
@@ -82,10 +91,9 @@ static inline bool MacWSKeyboardReconcile(
         // or the following physical release could be swallowed. A redundant
         // release of a still-observed old down is safe and bounded. This also
         // detects local masks=0/native Control=down without assuming equality.
-        state->postedSides |= observedSides;
-        state->syntheticSides = state->postedSides &
-            (uint8_t)~state->physicalSides;
+        state->postedSides |= observedSides & (uint8_t)~requiredDowns;
     }
+    state->syntheticSides = state->postedSides & (uint8_t)~state->physicalSides;
     extraFlags &= ~MacWSKeyboardModifierMask;
     // Release obsolete sides before adding new sides. Releasing left Control
     // while right Control remains held must keep the aggregate Control flag.
@@ -101,6 +109,8 @@ static inline bool MacWSKeyboardReconcile(
                       MacWSKeyboardFlagsForSides(next) | extraFlags))
                 return false;
             state->postedSides = next;
+            if (wantDown) state->acceptedUpSides &= (uint8_t)~bit;
+            else state->acceptedUpSides |= bit;
             state->syntheticSides = next & (uint8_t)~state->physicalSides;
         }
     }

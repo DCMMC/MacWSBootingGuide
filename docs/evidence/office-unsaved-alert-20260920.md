@@ -6,8 +6,12 @@ inspection in a new process with a private diagnostic cache. The earlier
 failures below are retained as investigation history, not the current result.
 Normal shared-cache re-testing subsequently failed in owned Word 2999;
 see [the separate default-cache acceptance](word-default-cache-acceptance-20260920.md).
-Safe cache migration and final default-path acceptance remain outstanding;
-live user applications and their mapped caches have not been disturbed.
+Final update: after the user authorized closing the macOS applications,
+strict v3 cache migration preserved 28 retired derived-cache files. Ordinary
+Dock and Launchpad launches (Word 17807 and 18644) both passed the actual
+unsaved-alert screenshot test with default caches and diagnostics off. The
+separate acceptance report records those final results; the earlier failure
+and private-cache experiment below are investigation history.
 
 ## Real Word reproduction
 

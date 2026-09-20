@@ -9,9 +9,12 @@ assumption; candidate 2 corrected it to the genuine 8-byte producer contract.
 Owned Word 87884 then passed the real fresh-cache Save-alert visual test.
 The subsequent ordinary shared-cache launch, Word 2999, still failed; see
 [the separate default-cache acceptance](word-default-cache-acceptance-20260920.md).
-Safe migration and final default-launch acceptance remain outstanding. Shared
-caches and the user's running applications have deliberately not been migrated
-or restarted.
+Final update: with the user's authorization to close macOS applications,
+strict production v3 migration was completed, preserving the retired caches.
+Ordinary Dock and Launchpad Word launches subsequently passed the real Save
+alert screenshot test with default caches. The separate acceptance report
+records the final result; the observations below retain their original
+pre-migration scope. The iPad was not rebooted or resprung.
 
 ## Discriminating runtime evidence
 

@@ -34,6 +34,7 @@
 #include <execinfo.h>
 #import "macws_host_protocol.h"
 #include "macws_keyboard_state.h"
+#include "macws_atomic_pointer_click.h"
 #import "macws_pointer_activation.h"
 #import "macws_control_protocol.h"
 #import "macws_steam_mach_rendezvous_protocol.h"
@@ -7882,6 +7883,23 @@ static BOOL macws_vnc_proxy_scroll(MacWSInputRecord record, CGPoint point) {
     return YES;
 }
 
+typedef struct {
+    MacWSVNCPostLegacyMouseEvent postMouse;
+    CGPoint point;
+} MacWSVNCAtomicPointerContext;
+
+static int32_t macws_vnc_atomic_pointer_post(void *opaque, bool left,
+                                            bool right) {
+    const MacWSVNCAtomicPointerContext *context = opaque;
+    return context->postMouse(context->point, true, 3, left, right, false);
+}
+
+static void macws_vnc_atomic_pointer_pause(void *opaque,
+                                          uint32_t microseconds) {
+    (void)opaque;
+    usleep(microseconds);
+}
+
 static void *macws_vnc_pointer_proxy_listener(void *unused) {
     (void)unused;
     int socketFD = socket(AF_UNIX, SOCK_DGRAM, 0);
@@ -8030,19 +8048,16 @@ static void *macws_vnc_pointer_proxy_listener(void *unused) {
                                         leftDown, false, false);
                 break;
             case MacWSInputKindTap:
-                firstResult = postMouse(point, true, 3,
-                                        true, false, false);
-                usleep(2000);
-                secondResult = postMouse(point, true, 3,
-                                         false, false, false);
+            case MacWSInputKindSecondaryTap: {
+                MacWSVNCAtomicPointerContext context = {postMouse, point};
+                MacWSAtomicPointerClickResult click = MacWSPostAtomicPointerClick(
+                    record.kind == MacWSInputKindSecondaryTap, leftDown,
+                    macws_vnc_atomic_pointer_post,
+                    macws_vnc_atomic_pointer_pause, &context);
+                firstResult = click.downResult;
+                secondResult = click.upResult;
                 break;
-            case MacWSInputKindSecondaryTap:
-                firstResult = postMouse(point, true, 3,
-                                        false, true, false);
-                usleep(2000);
-                secondResult = postMouse(point, true, 3,
-                                         false, false, false);
-                break;
+            }
             default:
                 continue;
         }

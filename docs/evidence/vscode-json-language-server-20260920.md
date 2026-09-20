@@ -1,8 +1,9 @@
 # VS Code JSON language-server reservation failure
 
-Status: root cause and isolated production-shape adapter are runtime-confirmed.
-The running VS Code profile has not yet been restarted with the integrated
-library; do not equate the protocol probe with final editor UI acceptance.
+Status: PASS for the reported built-in JSON language-server failure, including
+the normal production VS Code profile, actual editor diagnostics, and the
+language-server process's mapped production library. Other language extensions
+are not claimed exhaustively tested.
 
 ## Failure and preservation
 
@@ -128,3 +129,56 @@ LSP_RESULT initialized=1 invalid-json-diagnosed=1 shutdown=1 exit=0
 This validates the actual bundled server and JSON protocol rather than mere
 process uptime. Canonical library deployment and fresh normal editor-profile
 acceptance remain separate required steps.
+
+## Normal editor child-launch contract
+
+The installed built-in JSON client, not just the isolated test launcher,
+sets `ELECTRON_RUN_AS_NODE=1`. Read-only source receipt:
+`/tmp/macws-vscode-json-child-launch-source-20260920.log`.
+`extensions/json-language-features/client/dist/node/jsonClientMain.js`
+is 660,635 bytes, SHA-256
+`2b2230a90070d6ea93472e0b8340bcbc7618262a41c8678f5af7ace8bd7e83fa`.
+Its actual default server configuration uses the module plus IPC transport;
+byte offset 438673 applies `E.env=n(E.env,!0)`, the helper at 435408 sets
+`ELECTRON_RUN_AS_NODE="1"` and `ELECTRON_NO_ASAR="1"`, and offset 438772
+calls the real `child_process.fork(g.module,v||[],E)`. Thus the integrated
+adapter's process-mode guard matches the ordinary JSON service route.
+This source witness was followed by the visible-editor acceptance below.
+
+## Normal production editor acceptance
+
+After the controlled GUI lifecycle and final integrated-library publication,
+the normal Host `open-documents` operation opened the self-owned fixture
+`/private/tmp/macws-json-editor-acceptance-20260920.json` in the existing
+production profile. No observer, custom DYLD library, diagnostic flag, alternate
+profile, or manual `ELECTRON_RUN_AS_NODE` setting was added for this test.
+
+The actual process chain was main 20753, extension host 20809, JSON Plugin
+20840. The Plugin command line points at the installed
+`json-language-features/server/dist/node/jsonServerMain --node-ipc
+--clientProcessId=20809`. Read-only mapped identity confirms
+`libmachook_arm64.dylib` UUID `6B46FD91-A12A-37D9-92F5-EBA1F07F55AA`,
+648,460-byte `__text` SHA-256
+`8c2ac164642db290c091c5d7940c0610187f0835629240642c909610c0fb5317`.
+The helper did not attach, suspend, or inspect document/heap data.
+
+The native iPadOS screenshot
+`/tmp/macws-json-editor-problems-20260920.png` visibly shows the fixture,
+its red syntax underline, and the real Problems entry:
+
+```text
+Value expected json(516) [Ln 4, Col 1]
+```
+
+The ordinary profile session `20260919T135046` records built-in JSON extension
+activation; the JSON server log remains empty, with no fatal/restart loop in
+this bounded test and the same child PID present at the final check. Logs were
+copied read-only to `/tmp/macws-vscode-json-editor-logs-20260920`, and mapped
+identity/activation receipts are in
+`/tmp/macws-vscode-json-editor-runtime-20260920.log`.
+
+Only the self-owned fixture tab was closed afterward. The original `.bashrc`
+tab and user settings were not modified. The cleanup screenshot
+`/tmp/macws-json-editor-cleanup-20260920.png` shows that the fixture tab is gone
+and Problems is clear; the Problems panel was then closed. The scratch fixture
+remains only in the temporary directory. VS Code stays running for the user.

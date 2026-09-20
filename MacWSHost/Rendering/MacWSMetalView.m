@@ -4827,6 +4827,12 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
 }
 
 - (void)touchesBegan:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
+    // A new physical contact supersedes deceleration at the OLD scroll point.
+    // Close that stream before focus/routing or any finger, pointer or Pencil
+    // contact is emitted. Waiting for a new scroll threshold leaves a simple
+    // outside tap interleaved with the previous gesture's momentum tail.
+    if (touches.count != 0)
+        [self stopScrollMomentumWithTerminalPhase:YES];
     // The hidden UITextField owns the software keyboard. Taking first
     // responder here used to dismiss it on the very first touch inside the
     // macOS surface. Hardware-key focus remains on the Metal view whenever
