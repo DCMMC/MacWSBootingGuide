@@ -80,31 +80,39 @@ RUNTIME_BASE_FINGERPRINT="$RUNTIME_SCHEMA|$RUNTIME_HOOK_HASH|$RUNTIME_SUBSTRATE_
 
 $LDID -e "$BASE_CARRIER_EXECUTABLE" > "$CARRIER_ENTITLEMENTS" 2>/dev/null
 [ ! -x "$UICACHE" ] || UICACHE_LIST=$($UICACHE -l 2>/dev/null || true)
-TRUSTCACHE_INFO=$($JBCTL trustcache info 2>/dev/null || true)
+# Normalize the live dump once. The dependency repair visits 49 panes and
+# checks five hashes each; spawning grep for every membership query made a
+# no-op reconciliation expensive even when all images were already trusted.
+TRUSTCACHE_INFO=$($JBCTL trustcache info 2>/dev/null |
+    tr '[:lower:]' '[:upper:]' || true)
 trap 'rm -f "$CARRIER_ENTITLEMENTS"' EXIT
 
 ensure_trust_hash() {
-    local hash="$1"
+    local hash="$1" normalized
     [ -n "$hash" ] || return 0
-    if printf '%s\n' "$TRUSTCACHE_INFO" | grep -Fiq "$hash"; then
+    [[ "$hash" =~ ^[0-9A-Fa-f]{40}$ ]] || return 1
+    normalized=${hash^^}
+    if [[ "$TRUSTCACHE_INFO" == *"$normalized"* ]]; then
         return 0
     fi
     $JBCTL trustcache add "$hash" >/dev/null 2>&1 || return 1
     TRUSTCACHE_INFO="${TRUSTCACHE_INFO}
-$hash"
+$normalized"
 }
 
 restore_runtime_trust_manifest() {
-    local manifest_fingerprint hash restored=0
+    local manifest_fingerprint hash normalized restored=0
     [ -f "$TRUST_MANIFEST" ] || return 0
     manifest_fingerprint=$(sed -n '1p' "$TRUST_MANIFEST" 2>/dev/null)
     [ "$manifest_fingerprint" = "$RUNTIME_BASE_FINGERPRINT" ] || return 0
     while IFS= read -r hash; do
         [ -n "$hash" ] || continue
-        if ! printf '%s\n' "$TRUSTCACHE_INFO" | grep -Fiq "$hash"; then
+        [[ "$hash" =~ ^[0-9A-Fa-f]{40}$ ]] || return 1
+        normalized=${hash^^}
+        if [[ "$TRUSTCACHE_INFO" != *"$normalized"* ]]; then
             $JBCTL trustcache add "$hash" >/dev/null 2>&1 || return 1
             TRUSTCACHE_INFO="${TRUSTCACHE_INFO}
-$hash"
+$normalized"
             restored=$((restored + 1))
         fi
     done < <(sed -n '2,$p' "$TRUST_MANIFEST" 2>/dev/null)
@@ -156,8 +164,14 @@ fresh_copy_if_changed() {
     fi
     temporary="${destination}.new-$$"
     rm -f "$temporary"
-    cp "$source" "$temporary"
-    chmod 755 "$temporary"
+    cp "$source" "$temporary" || return 1
+    # Verify the replacement before its atomic rename. The caller no longer
+    # needs a second full-file cmp for every already-identical pane copy.
+    cmp -s "$source" "$temporary" || {
+        rm -f "$temporary"
+        return 1
+    }
+    chmod 755 "$temporary" || return 1
     chown root:wheel "$temporary" 2>/dev/null || true
     mv -f "$temporary" "$destination"
 }
@@ -476,8 +490,7 @@ repair_dependency_runtime() {
                 "$carrier_app/Info.plist" 2>/dev/null)" = \
             "com.macwsguide.settings-extension-carrier.$identifier" ] ||
             return 1
-        printf '%s\n' "$UICACHE_LIST" | grep -Fq \
-            "com.macwsguide.settings-extension-carrier.$identifier : " ||
+        [[ "$UICACHE_LIST" == *"com.macwsguide.settings-extension-carrier.$identifier : "* ]] ||
             return 1
         IFS='|' read -r marker_schema marker_base_hook \
             marker_base_substrate marker_base_tramp marker_executable \
@@ -492,9 +505,6 @@ repair_dependency_runtime() {
             "$LIBMACHOOK" "$frameworks/libmachook.dylib" || return 1
         fresh_copy_if_changed \
             "$TRAMPOLINES" "$frameworks/libobjc-trampolines.dylib" || return 1
-        cmp -s "$LIBMACHOOK" "$frameworks/libmachook.dylib" &&
-            cmp -s "$TRAMPOLINES" \
-                "$frameworks/libobjc-trampolines.dylib" || return 1
 
         if [ "$marker_base_substrate" != "$RUNTIME_SUBSTRATE_HASH" ] ||
            ! $OTOOL -l "$substrate_local" 2>/dev/null |

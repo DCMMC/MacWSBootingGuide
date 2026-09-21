@@ -77,6 +77,9 @@ typedef NS_ENUM(NSUInteger, MacWSHostPresentationResolution) {
 - (void)requestStreamWindowList;
 - (void)noteValidatedFullscreenCanvasForPID:(int32_t)ownerPID
                                    windowID:(uint32_t)windowID;
+// A passive AppKit catalog refresh must not replace an explicitly activated
+// fullscreen producer while its exact canvas and completed drawable are live.
+- (BOOL)hasCompletedFullscreenDrawableForPID:(int32_t)ownerPID;
 - (void)refreshPresentationPolicy;
 - (void)resetViewportZoom;
 - (void)geometryDidChange;

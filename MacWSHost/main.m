@@ -6870,7 +6870,29 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
             visualPID != previousPID && previousPID > 1 &&
             MacWSAppInputEndpointReady(previousPID) &&
             ![eligiblePIDs containsObject:@(previousPID)];
-        if (retainedPreviousTarget) {
+        BOOL activatedFullscreenCanvasPresent = NO;
+        if (visualPID != previousPID && previousPID > 1 &&
+            _fullscreenActivatedInputOwnerPID == previousPID &&
+            MacWSAppInputEndpointReady(previousPID)) {
+            for (MacWSStreamWindow *window in windows) {
+                MacWSStreamWindowDescriptor descriptor = window.descriptor;
+                MacWSStreamWindowFlags required =
+                    MacWSStreamWindowFocused |
+                    MacWSStreamWindowFullscreenCanvas;
+                if (descriptor.ownerPID == previousPID &&
+                    descriptor.windowID != 0 &&
+                    (descriptor.flags & required) == required) {
+                    activatedFullscreenCanvasPresent = YES;
+                    break;
+                }
+            }
+        }
+        BOOL retainedCompletedFullscreen =
+            visualPID != previousPID && previousPID > 1 &&
+            _fullscreenActivatedInputOwnerPID == previousPID &&
+            [_metalView hasCompletedFullscreenDrawableForPID:previousPID];
+        if (retainedPreviousTarget || activatedFullscreenCanvasPresent ||
+            retainedCompletedFullscreen) {
             // A fullscreen Metal application may stop publishing its AppKit
             // catalog window while its process-local input endpoint and the
             // full-display stream remain live.  The next ordinary overlay in
@@ -6882,11 +6904,20 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
             // 1787255929.503, then the old callback incorrectly selected
             // Terminal pid=15404 at 1787255930.463 even though Stray's input
             // socket and display presentation continued.
+            // The same ordinary launcher can become OnScreenOnly-frontmost
+            // between explicit fullscreen activation and the first completed
+            // game drawable. Preserve the exact focused fullscreen canvas at
+            // that boundary as well, otherwise a first-frame-only witness is
+            // too late: changing targetPID erases the activation and direct
+            // presentation state before the drawable arrives. A real user
+            // switch still changes targetPID at its input/activation boundary.
             visualPID = previousPID;
             frontmost = nil;
             if (_fullscreenCatalogRetainedInputPID != previousPID) {
                 _fullscreenCatalogRetainedInputPID = previousPID;
-                MacWSLog(@"fullscreen-input-target retained-live-endpoint pid=%d rejected-catalog-fallback-pid=%d",
+                MacWSLog(@"fullscreen-input-target retained-%@ pid=%d rejected-catalog-fallback-pid=%d",
+                         activatedFullscreenCanvasPresent ? @"activated-fullscreen-canvas" :
+                            (retainedCompletedFullscreen ? @"completed-fullscreen-drawable" : @"live-endpoint"),
                          previousPID, catalogFallbackPID);
             }
         } else {
@@ -7537,8 +7568,14 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
                       record.kind == MacWSInputKindMagnify ||
                       record.kind == MacWSInputKindRotate ||
                       record.kind == MacWSInputKindSystemGesture;
+    BOOL traceTouchEdge =
+        (record.kind == MacWSInputKindTouchDown ||
+         record.kind == MacWSInputKindTouchUp ||
+         record.kind == MacWSInputKindTouchCancel) &&
+        MacWSHostTouchDiagnosticsEnabled();
     if (record.kind == MacWSInputKindPerformPaste ||
         record.kind == MacWSInputKindActivateTarget ||
+        traceTouchEdge ||
         (MacWSHostDiagnosticsEnabled() &&
          (!continuous || (_inputLogSequence % 60) == 0))) {
         MacWSLog(@"input transport=%@ errno=%d wire=%u scene=%llx target=%d kind=%@ source=%u point=(%.2f,%.2f) frame=%ux%u pressure=%.3f contact=%u sample=%u seq=%llu",

@@ -19505,9 +19505,18 @@ static unsigned macws_translate_agx_segment_list_records(
         direct_subtype3_resource_mode >= 1 &&
         direct_subtype3_resource_mode <= 0x10 &&
         *(uint32_t *)(commands + 0x1fc) == 0x15;
+    // Stray PID 23491 / submit 11 (2026-09-20) retained one macOS
+    // subtype-3 record: span=0x228, resources=5/0x12, mode=2, +0x08=0.
+    // The opcode-4-only extension for Geekbench had excluded this previously
+    // admitted Stray producer member (fixed=6/7, then error 0x103). Restore
+    // only zero under the existing Stray contract; unknown opcodes and all
+    // independent family/resource-list checks remain unchanged. The batched
+    // record predicate below uses the identical admission rule.
     BOOL direct_subtype3_all_ones_resource_family =
         direct_subtype3_all_ones_resource_family_without_opcode &&
-        *(uint32_t *)(commands + 0x08) == 4;
+        (*(uint32_t *)(commands + 0x08) == 4 ||
+         (macws_stray_agx_compat_enabled() &&
+          *(uint32_t *)(commands + 0x08) == 0));
     if (macws_kcmd_stray_subtype3_diag_enabled() &&
         direct_subtype3_all_ones_resource_family_without_opcode &&
         !direct_subtype3_all_ones_resource_family) {
@@ -20050,7 +20059,9 @@ static unsigned macws_translate_agx_segment_list_records(
             *(uint32_t *)(record + 0x1fc) == 0x15;
         BOOL subtype3_all_ones_resource_family =
             subtype3_all_ones_resource_family_without_opcode &&
-            *(uint32_t *)(record + 0x08) == 4;
+            (*(uint32_t *)(record + 0x08) == 4 ||
+             (macws_stray_agx_compat_enabled() &&
+              *(uint32_t *)(record + 0x08) == 0));
         if (macws_kcmd_stray_subtype3_diag_enabled() &&
             subtype3_all_ones_resource_family_without_opcode &&
             !subtype3_all_ones_resource_family) {

@@ -385,11 +385,8 @@ state	/tmp/macws_graphics_ready	transient	startup	PID witness written after firs
 state	/tmp/.macos_gui.transaction	transient	GUI lifecycle transaction	Boot-local atomic mkdir lock with exact owner PID; overlapping start, restart, and stop operations return 75, while an ownerless stale lock is recoverable.
 state	/tmp/.macws-autosignd-restart.lock	transient	autosignd lifecycle	Boot-local owner-PID lock serializing daemon replacement and endpoint verification; stale owners are recovered automatically.
 state	/tmp/macos_gui_start.state	transient	GUI lifecycle transaction	Boot-local schema, PID, operation, mode, phase, timestamps, and detail consumed by the Host UI without parsing logs.
-state	/tmp/macws-settings-runtime.boot-ready	auto	System Settings cold start	Current-bootsession and dependency-hash witness; never sufficient without the unchanged deep verifier.
 state	/tmp/macws_type82_test_start	off	standalone layout diagnostic	Timestamp written only by the manual type-82 layout test, never consumed by production startup.
 state	/var/jb/var/mobile/macws-settings-runtime.trust-hashes	auto	System Settings cold start	Persistent verified CDHash manifest used to restore only the reboot-volatile dynamic trustcache entries before 48-pane verification.
-state	/tmp/macws-launchservices-catalog.ready	auto	LaunchServices cold start	Boot-local schema and rootfs source fingerprint marker accepted only after live application and 48-pane record verification.
-state	/tmp/com.macwsguide.dense-grid.loaded	transient	SpringBoard windowing	Boot-local loaded-code witness. Production Host checks its protocol version before sending private layout requests.
 request	/tmp/com.macwsguide.windowing.fullscreen-request.<UUID>.plist	transient	MacWSHost to SpringBoard	15-second exact-FBS-scene fullscreen request; SpringBoard deletes it after performing or rejecting system keyboard action 11.
 request	/tmp/com.macwsguide.windowing.resize-request.<UUID>.plist	transient	MacWSHost to SpringBoard	15-second exact-FBS-scene preferred-size request; SpringBoard deletes it after the immutable app-layout transaction succeeds or fails.
 notification	com.macwsguide.windowing.request-fullscreen	transient	MacWSHost to SpringBoard	Wakeup only; authority and exact target are read from the bounded fullscreen request plist.

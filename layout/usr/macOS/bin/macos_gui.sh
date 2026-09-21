@@ -251,8 +251,6 @@ CFPREFSD_BIN=/usr/local/libexec/macws-cfprefsd
 DEFAULTS_BIN=/usr/bin/defaults
 LSREGISTER_BIN=/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister
 WORKSPACECTL_BIN=/usr/local/bin/macwsworkspacectl
-LAUNCHSERVICES_CATALOG_SCHEMA=macws-launchservices-catalog-v4
-LAUNCHSERVICES_CATALOG_MARKER=/tmp/macws-launchservices-catalog.ready
 LSD_SESSION_USER_DIR=/var/folders/zz/zyxvpxvq6csfxvn_n0000000000000/0/macws-lsd-session/
 LAUNCHSERVICES_VERIFY_LOG="$LOGDIR/launchservices-catalog-verify.log"
 SETTINGS_EXTENSION_REGISTER_LOG="$LOGDIR/settings-extension-register.log"
@@ -1449,8 +1447,6 @@ run_watchdog() {
 # the SkyLight session port, leaving Dock and every AppKit client hung in
 # get_session_port. This bounded restore changes no binary or signature.
 BOOT_TRUSTCACHE_INFO=""
-BASE_TRUST_BOOT_MARKER=/tmp/macws-base-trust.boot-ready
-BASE_TRUST_CLOSURE_VERSION=7
 BASE_TRUST_READY=0
 WINDOWING_STATUS_PROBE=/var/jb/usr/macOS/bin/macws_control_probe
 WINDOWING_TWEAK=/var/jb/Library/MobileSubstrate/DynamicLibraries/MacWSWindowing.dylib
@@ -1550,61 +1546,11 @@ application_trust_thermally_safe() {
     return 0
 }
 
-boot_session_identifier() {
-    local session_uuid=""
-    session_uuid=$(/var/jb/usr/sbin/sysctl -n kern.bootsessionuuid \
-        2>/dev/null | /var/jb/usr/bin/tr -d '[:space:]')
-    case "$session_uuid" in
-        ''|*[!0-9A-Fa-f-]*) ;;
-        *) printf 'uuid=%s\n' "$session_uuid"; return 0 ;;
-    esac
-    # Older kernels may not publish a boot-session UUID.  Keep a fallback,
-    # but use only the integer second: this device's formatted kern.boottime
-    # includes a derived microsecond value that moved across repeated reads
-    # during one live boot and invalidated the expensive trust-closure cache.
-    /var/jb/usr/sbin/sysctl -n kern.boottime 2>/dev/null |
-        /var/jb/usr/bin/sed -n 's/.*sec = \([0-9][0-9]*\).*/sec=\1/p'
-}
-
-# The dynamic trustcache is monotonic for one iPad boot: project code can add
-# entries, but an existing entry disappears only when XNU creates the next
-# boot session.  Re-reading the complete jbctl dump and re-hashing roughly 50
-# unchanged binaries cost 23 seconds on the 2026-09-02 warm-start trace.  Bind
-# a reusable success witness to both the boot ID and the four project-owned
-# images that can actually change between package/FAST deployments.  A changed
-# dylib invalidates the witness naturally; a reboot changes the first field.
-base_trust_marker_value() {
-    local boot_id="" path="" arch="" hash="" value=""
-    boot_id=$(boot_session_identifier) || return 1
-    [ -n "$boot_id" ] || return 1
-    value="v${BASE_TRUST_CLOSURE_VERSION}:${boot_id}"
-    for path in \
-        /var/jb/usr/macOS/bin/launchdchrootexec \
-        /var/jb/usr/macOS/bin/macwsaudiooutd \
-        /var/jb/usr/macOS/lib/libmachook.dylib \
-        /var/jb/usr/macOS/lib/libmachook_arm64.dylib \
-        "$ROOTFS/usr/lib/libobjc-trampolines.dylib" \
-        "$ROOTFS$CFPREFSD_BIN" \
-        "$VSCODE_TRUST_SENTINEL"; do
-        [ -f "$path" ] || { value="$value|absent"; continue; }
-        hash=""
-        for arch in arm64 arm64e; do
-            hash=$(/var/jb/usr/bin/ldid -arch "$arch" -h "$path" 2>/dev/null |
-                /var/jb/usr/bin/grep 'CDHash=' | /var/jb/usr/bin/cut -c8-)
-            [ -z "$hash" ] || break
-        done
-        [ -n "$hash" ] || return 1
-        value="$value|$hash"
-    done
-    printf '%s' "$value"
-}
-
 restore_cold_boot_trust() {
-    local path="" marker_expected="" marker_tmp=""
+    local path=""
     local boot_trust_helper=/var/jb/usr/macOS/bin/macws_boot_trust.py
     local boot_trust_cache="$ROOTFS/var/db/macws/boot-trust"
     BASE_TRUST_READY=0
-    marker_expected=$(base_trust_marker_value 2>/dev/null || true)
     [ -f "$boot_trust_helper" ] || {
         log "ERROR: packaged CodeDirectory trust reader is missing."
         return 1
@@ -1727,12 +1673,6 @@ restore_cold_boot_trust() {
         --hash b5da39409492ac85e5a8e8ab618fe77e2d7a2980 \
         --hash bbb765988e2677b98d47a549d612fa0d4af25f69 \
         "$@" || return 1
-    if [ -n "$marker_expected" ]; then
-        marker_tmp="${BASE_TRUST_BOOT_MARKER}.new.$$"
-        printf '%s\n' "$marker_expected" > "$marker_tmp" || return 1
-        chmod 0644 "$marker_tmp" || return 1
-        mv -f "$marker_tmp" "$BASE_TRUST_BOOT_MARKER" || return 1
-    fi
     BASE_TRUST_READY=1
     log "Cold-boot trust closure ready (complete dependency closure; live membership verified)."
 }
@@ -3028,11 +2968,16 @@ diagnostic_flag_paths() {
 
 clear_diagnostic_state() {
     local path
-    diagnostic_flag_paths | while IFS= read -r path; do
-        # The same exact debug token can be consumed in iOS or in the macOS
-        # chroot. Clear both namespaces; never include IPC payloads/caches.
-        rm -f "$ROOTFS$path" "$path"
-    done
+    diagnostic_flag_paths | {
+        # Batch the same exact operands in this pipeline's subshell, avoiding
+        # one rm process per flag even when every flag is already absent.
+        # Keep both namespace spellings and both startup cleanup calls.
+        set --
+        while IFS= read -r path; do
+            set -- "$@" "$ROOTFS$path" "$path"
+        done
+        [ "$#" -eq 0 ] || rm -f "$@"
+    }
     rm -f "$MTLCOMPILER_DIAGNOSTICS" "$MTLCOMPILER_HOLD" \
         "$STEAM_ANGLE_ASSET_BUILD" \
         "$CATALYST_LAUNCH_TRACE" \
@@ -3062,7 +3007,9 @@ clear_diagnostic_state() {
         "$LOGDIR/macws_catalyst_launch.trace" \
         "$LOGDIR/macws-runningboard-settings-bridge.ready" \
         /tmp/macws-runningboard-settings-bridge.ready \
-        /tmp/macws-settings-runtime.boot-ready
+        /tmp/macws-settings-runtime.boot-ready \
+        /tmp/macws-base-trust.boot-ready \
+        /tmp/macws-launchservices-catalog.ready
     # Request/reply captures are created only by the compiler diagnostic
     # sentinel.  Remove these exact project-owned directories before an
     # ordinary session so neither stale evidence nor bounded binary dumps add
@@ -3503,64 +3450,7 @@ mode_exclusive() {
     launchctl unload "$BACKBOARDD"  2>/dev/null
 }
 
-launchservices_source_fingerprint() {
-    # The v2 implementation spawned one `cksum` process for every discovered
-    # Info.plist. On the target's 193 applications plus 48 Settings extensions,
-    # the process-creation overhead consumed a large part of the 29-second
-    # catalog stage even though the files are small. One bounded Python walk
-    # preserves the stronger content fingerprint while hashing every record in
-    # one process. App/appex directories are pruned exactly like `find -prune`,
-    # so embedded bundles cannot change the catalog membership accidentally.
-    /var/jb/usr/bin/python3 -c '
-import hashlib, os, sys
-
-rootfs, schema = sys.argv[1:3]
-roots = [
-    ("/System/Applications", ".app"),
-    ("/Applications", ".app"),
-    ("/Users/root/Applications", ".app"),
-    ("/System/Library/CoreServices", ".app"),
-    ("/System/Library/ExtensionKit/Extensions", ".appex"),
-]
-records = []
-for visible_root, suffix in roots:
-    host_root = rootfs + visible_root
-    if not os.path.isdir(host_root):
-        continue
-    for base, directories, _ in os.walk(host_root):
-        matches = [name for name in directories if name.endswith(suffix)]
-        for name in matches:
-            bundle = os.path.join(base, name)
-            records.append((bundle[len(rootfs):],
-                            os.path.join(bundle, "Contents", "Info.plist")))
-        directories[:] = [name for name in directories
-                          if not name.endswith(suffix)]
-
-for visible in (
-    "/System/Library/Frameworks/QuickLook.framework/Resources/Info.plist",
-    "/System/Library/Frameworks/QuickLookThumbnailing.framework/Resources/Info.plist",
-    "/System/Library/Frameworks/QuickLookThumbnailing.framework/PlugIns/ThumbnailExtension_macOS.appex/Contents/Info.plist",
-    "/System/Library/Frameworks/QuickLookUI.framework/PlugIns/QLPreviewGenerationExtension.appex/Contents/Info.plist",
-):
-    records.append((visible, rootfs + visible))
-
-system_version = rootfs + "/System/Library/CoreServices/SystemVersion.plist"
-records.append(("@SystemVersion", system_version))
-digest = hashlib.sha256(schema.encode("utf-8") + b"\0")
-for visible, info in sorted(records):
-    digest.update(os.fsencode(visible) + b"\0")
-    try:
-        with open(info, "rb") as stream:
-            payload = stream.read()
-    except OSError:
-        payload = b"<missing>"
-    digest.update(str(len(payload)).encode("ascii") + b"\0" + payload + b"\n")
-print(digest.hexdigest())
-' "$ROOTFS" "$LAUNCHSERVICES_CATALOG_SCHEMA"
-}
-
 seed_launchservices_database() {
-    local fingerprint="" marker_value="" marker_tmp="" catalog_current=0
     if [ ! -x "$ROOTFS$LSREGISTER_BIN" ]; then
         log "ERROR: stock macOS lsregister is missing at $LSREGISTER_BIN"
         return 1
@@ -3569,49 +3459,17 @@ seed_launchservices_database() {
         log "ERROR: native workspace controller is missing at $WORKSPACECTL_BIN"
         return 1
     fi
-    fingerprint=$(launchservices_source_fingerprint) || {
-        log "ERROR: LaunchServices source fingerprint could not be computed."
-        return 1
-    }
-    marker_value="$LAUNCHSERVICES_CATALOG_SCHEMA|$fingerprint"
     rm -f "$LOGDIR/lsregister.log"
-    if [ -f "$LAUNCHSERVICES_CATALOG_MARKER" ] &&
-       [ "$(sed -n '1p' "$LAUNCHSERVICES_CATALOG_MARKER" 2>/dev/null)" = \
-         "$marker_value" ]; then
-        catalog_current=1
-        rm -f "$LAUNCHSERVICES_VERIFY_LOG"
-        # Runtime-confirmed on 2026-09-02 by MacWSStartup.log: after a fresh
-        # private system/session lsd pair, the persisted-record path spent 20
-        # seconds in bounded `lsregister -f`, then failed both ExtensionKit
-        # commit-boundary verifications.  The authoritative stock `-kill
-        # -seed` transaction immediately following it succeeded and passed the
-        # complete typed application/ExtensionKit witness; the LaunchServices
-        # stage took 44 seconds in total.  Earlier retained A/Bs also showed
-        # the targeted call can idle for more than 110 seconds.  A bind-mounted
-        # root never receives macOS's root-volume mount activation, so make the
-        # already-proven clean transaction the cold-session authority instead
-        # of speculatively mutating every persisted record first.  Repair
-        # Desktop retains its separate live-session fast verifier below.
-        # Runtime-confirmed on the 2026-09-03 true cold start: the newly
-        # loaded private session lsd resolved Terminal to nil before the seed,
-        # even though the source marker matched and the previous generation
-        # had passed the complete catalog witness. This private bootstrap does
-        # not retain an on-disk session csstore, so probing for reuse cannot
-        # make progress. Go directly to the measured 7-8 second clean seed.
-        log "Refreshing the LaunchServices catalog for the new private lsd generation..."
-    fi
-
-    # A changed rootfs/catalog schema needs one authoritative rebuild.  The
-    # previous `-f -apps system,local,user` path repeatedly appended records:
+    # Each private lsd generation needs an authoritative rebuild: the session
+    # store is not retained across generations even when a source fingerprint
+    # is unchanged. The previous `-f -apps system,local,user` path appended
+    # records repeatedly:
     # runtime evidence found a 148,717,568-byte store and a 50-60 second
     # `_LSDatabaseClean` on every lsd launch.  Ventura's stock `-kill -seed`
     # transaction produced a clean 6-10 MB store in 6 seconds on this device
-    # and immediately passed every application/ExtensionKit witness.
-    if [ "$catalog_current" -eq 1 ]; then
-        log "Rebuilding the real macOS application catalog for this lsd generation..."
-    else
-        log "Building the real macOS application catalog for this rootfs generation..."
-    fi
+    # and immediately passed every application/ExtensionKit witness. Never
+    # substitute a stale marker for the real catalog verification below.
+    log "Rebuilding the real macOS application catalog for this lsd generation..."
     if ! "$CHROOTEXEC" 0 0 "$ROOTFS" "$LSREGISTER_BIN" \
             -kill -seed > "$LOGDIR/lsregister.log" 2>&1; then
         log "ERROR: LaunchServices clean seed failed."
@@ -3641,30 +3499,20 @@ seed_launchservices_database() {
             return 1
         fi
     fi
-    mkdir -p "$(dirname "$LAUNCHSERVICES_CATALOG_MARKER")" || return 1
-    marker_tmp="$LAUNCHSERVICES_CATALOG_MARKER.new.$$"
-    printf '%s\n' "$marker_value" > "$marker_tmp" || return 1
-    chmod 0644 "$marker_tmp" || return 1
-    mv -f "$marker_tmp" "$LAUNCHSERVICES_CATALOG_MARKER" || return 1
     log "LaunchServices application catalog ready."
 }
 
 verify_launchservices_database_for_desktop_repair() {
-    # Repair Desktop runs inside one live GUI transaction: it neither installs
-    # applications nor replaces the mounted rootfs. Recomputing the complete
-    # 193-bundle source fingerprint here cost 15 seconds on the target while
-    # the typed catalog verification itself completed in 0.21 seconds. Keep
-    # the full fingerprint/seed path for cold start and package changes; for an
-    # online repair, accept the existing catalog only after its real records
-    # pass the same workspacectl protocol witness.
-    if [ -f "$LAUNCHSERVICES_CATALOG_MARKER" ] &&
-       "$CHROOTEXEC" 0 0 "$ROOTFS" "$WORKSPACECTL_BIN" \
+    # A live repair accepts the current catalog only after the typed stock
+    # application/ExtensionKit records pass verification. A missing /tmp
+    # marker cannot invalidate working records or force a needless rebuild.
+    if "$CHROOTEXEC" 0 0 "$ROOTFS" "$WORKSPACECTL_BIN" \
             verify-launchservices-catalog \
             > "$LAUNCHSERVICES_VERIFY_LOG" 2>&1; then
-        log "LaunchServices live catalog verified without a redundant source-tree rescan."
+        log "LaunchServices live catalog verified without rebuilding."
         return 0
     fi
-    log "Live LaunchServices catalog verification failed; running the full fingerprint/seed transaction."
+    log "Live LaunchServices catalog verification failed; running the clean seed transaction."
     seed_launchservices_database
 }
 

@@ -1161,6 +1161,23 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
     [self setNeedsDisplay];
 }
 
+- (BOOL)hasCompletedFullscreenDrawableForPID:(int32_t)ownerPID {
+    if (ownerPID <= 1 || ownerPID != self.targetPID ||
+        ![_fullscreenCanvasPIDs containsObject:@(ownerPID)] ||
+        !MacWSAppInputEndpointReady(ownerPID)) return NO;
+    MacWSCatalystDrawableFrame *frame =
+        [_catalystDrawableCompositor frameForOwnerPID:ownerPID];
+    if (!frame.texture) return NO;
+    for (MacWSStreamWindow *window in _latestWindows) {
+        MacWSStreamWindowDescriptor descriptor = window.descriptor;
+        MacWSStreamWindowFlags required = MacWSStreamWindowFocused |
+            MacWSStreamWindowFullscreenCanvas;
+        if (descriptor.ownerPID == ownerPID && descriptor.windowID != 0 &&
+            (descriptor.flags & required) == required) return YES;
+    }
+    return NO;
+}
+
 - (void)setDisplayDensity:(MacWSHostDisplayDensity)displayDensity {
     _displayDensity = MacWSNormalizedDisplayDensity(displayDensity);
     _lastRequestedWindowSize = CGSizeZero;
@@ -4176,6 +4193,15 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
             record->sceneID = MacWSInputSceneForWindow(
                 diagnosticWindowID, modifiers);
             record->flags |= MacWSInputFlagGlobalSystemSurface;
+            if ((record->kind == MacWSInputKindTouchDown ||
+                 record->kind == MacWSInputKindTouchUp ||
+                 record->kind == MacWSInputKindTouchCancel) &&
+                MacWSHostTouchDiagnosticsEnabled()) {
+                MacWSLog(@"fullscreen-global-pointer kind=%u contact=%u dock=%d visual=%d visual-window=%u point=(%.1f,%.1f) frame=%ux%u",
+                         record->kind, record->contactID, dockPID,
+                         visualPID, visualWindowID, record->x, record->y,
+                         record->frameWidth, record->frameHeight);
+            }
             if ((record->kind == MacWSInputKindTouchUp ||
                  record->kind == MacWSInputKindTouchCancel) &&
                 record->contactID ==
