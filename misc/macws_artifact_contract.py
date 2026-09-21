@@ -42,6 +42,7 @@ PACKAGE_PATHS = (
     'var/jb/usr/macOS/lib/libmachook.dylib',
     'var/jb/Library/MobileSubstrate/DynamicLibraries/MTLCompilerBypassOSCheck.dylib',
     'var/jb/usr/macOS/gui-launchd/com.macwsguide.vscode.plist',
+    'var/jb/usr/macOS/gui-launchd/com.macwsguide.geekbench.plist',
 )
 WINDOWING_PATH = PACKAGE_PATHS[2]
 CATALYST_PATH = PACKAGE_PATHS[3]

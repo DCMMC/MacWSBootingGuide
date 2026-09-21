@@ -132,6 +132,12 @@ static const char *const kVSCodeBundleExecutable =
     "/Applications/Visual Studio Code.app/Contents/MacOS/Code";
 static const char *const kGeekbenchExecutable =
     "/Applications/Geekbench 6.app/Contents/MacOS/Geekbench 6";
+static const char *const kGeekbenchBackendExecutable =
+    "/Applications/Geekbench 6.app/Contents/Resources/geekbench_aarch64";
+static const char *const kGeekbenchLabel =
+    "UIKitApplication:com.macwsguide.geekbench";
+static const char *const kGeekbenchPlist =
+    "/var/jb/usr/macOS/gui-launchd/com.macwsguide.geekbench.plist";
 static const char *const kUIKitSystemPlist =
     "/var/jb/usr/macOS/LaunchDaemons/com.apple.uikitsystemapp.plist";
 static const char *const kUIKitSystemExecutable =
@@ -3635,7 +3641,6 @@ static BOOL LaunchRootExecutable(const char *identifier,
         additions[additionCount++] = "MACWS_APP_DISPLAY_SETTLE_MS=750";
     }
     if (strcmp(identifier, "glassdemo") == 0 ||
-        [rootPath isEqualToString:@(kGeekbenchExecutable)] ||
         strcmp(identifier, "activity-monitor") == 0 ||
                strcmp(identifier, "finder") == 0 ||
                strcmp(identifier, "custom-path") == 0 ||
@@ -3669,21 +3674,9 @@ static BOOL LaunchRootExecutable(const char *identifier,
         }
         childEnvironment = ownedEnvironment;
     }
-    // Runtime-confirmed on iPad13,6 / iOS 16.3.1 with the exact Geekbench
-    // 6.7.1 binary: APP_DEFAULT made its backend inherit
-    // PROC_FLAG_APPLICATION while remaining TASK_UNSPECIFIED, and three GUI
-    // runs measured 2.06 GHz. Launching the otherwise identical transaction
-    // without that process type removed only that flag; result 19170292 then
-    // measured 3.196 GHz and scored 2277/8093. Keep the AppKit work-interval
-    // contract for normal GUI applications, but do not classify this detached
-    // benchmark worker tree as an iOS application without a RunningBoard
-    // lifecycle. This changes scheduling provenance, never the workload,
-    // timer, validation, or score.
-    BOOL applicationProcessType =
-        ![rootPath isEqualToString:@(kGeekbenchExecutable)];
     int error = SpawnMacOSApplication(
         &pid, kChrootExec, &actions, (char *const *)argv, childEnvironment,
-        applicationProcessType);
+        YES);
     FreeCopiedEnvironment(ownedEnvironment);
     posix_spawn_file_actions_destroy(&actions);
     if (logFD >= 0) close(logFD);
@@ -3850,6 +3843,88 @@ static NSString *ResolveExecutableRootPath(const char *requestedPath,
 
 static BOOL LaunchAllowedApp(const char *identifier, NSString **message);
 
+static BOOL LaunchGeekbench(NSString **message) {
+    NSString *rootPath = @(kGeekbenchExecutable);
+    NSString *hostPath = [@(kRootFS) stringByAppendingString:rootPath];
+    if (access(kGeekbenchPlist, R_OK) != 0 ||
+        !HasExecutableFileMode(hostPath.fileSystemRepresentation)) {
+        *message = @"Geekbench 6 或独立启动任务不存在";
+        return NO;
+    }
+    if (!JobHasPID(kWindowServerLabel, NULL) ||
+        !JobHasPID(kDisplayLabel, NULL)) {
+        *message = @"请先启动 macOS GUI 与 DisplayStream";
+        return NO;
+    }
+
+    int jobPID = 0;
+    BOOL jobLoaded = NO;
+    (void)InspectJob(kGeekbenchLabel, &jobPID, &jobLoaded);
+    pid_t legacyPID = FindRunningRootExecutable(rootPath);
+    if (legacyPID > 1 && legacyPID != jobPID) {
+        // A pre-upgrade direct spawn still belongs to hostd's coalition.
+        // Never silently reuse that process and claim the CPU fix is active.
+        // Do not interrupt a benchmark already running in the old session.
+        if (FindRunningRootExecutable(@(kGeekbenchBackendExecutable)) > 1) {
+            *message = @"旧 Geekbench 会话正在跑分；请等本轮结束后再打开";
+            return NO;
+        }
+        HostLog(@"launch-app geekbench retire-legacy pid=%d signal=TERM",
+                legacyPID);
+        if (kill(legacyPID, SIGTERM) != 0 && errno != ESRCH) {
+            *message = @"旧 Geekbench 会话无法退出";
+            return NO;
+        }
+        NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:2.0];
+        while (deadline.timeIntervalSinceNow > 0 &&
+               kill(legacyPID, 0) == 0) usleep(50000);
+        if (kill(legacyPID, 0) == 0) {
+            *message = @"旧 Geekbench 会话仍在退出，请稍后重试";
+            return NO;
+        }
+    }
+
+    if (jobPID <= 1) {
+        const char *startArgv[] = {kLaunchctl, "start", kGeekbenchLabel, NULL};
+        const char *loadArgv[] = {kLaunchctl, "load", kGeekbenchPlist, NULL};
+        int result = RunCommand(jobLoaded ? startArgv : loadArgv, YES);
+        if (result != 0 || !WaitForJobPID(kGeekbenchLabel, 8.0, &jobPID)) {
+            *message = [NSString stringWithFormat:
+                @"Geekbench 独立任务启动失败（状态 %d）", result];
+            return NO;
+        }
+    }
+    // launchctl can briefly expose launchdchrootexec before its final exec.
+    // The live job PID must become the exact benchmark GUI, not merely exist.
+    NSDate *execDeadline = [NSDate dateWithTimeIntervalSinceNow:5.0];
+    while (execDeadline.timeIntervalSinceNow > 0 &&
+           ![RootExecutablePathForPID(jobPID) isEqualToString:rootPath]) {
+        if (kill(jobPID, 0) != 0) break;
+        usleep(50000);
+    }
+    if (![RootExecutablePathForPID(jobPID) isEqualToString:rootPath]) {
+        *message = @"Geekbench 独立任务没有进入实际 GUI 程序";
+        return NO;
+    }
+    int exitStatus = -1;
+    BOOL windowReady = WaitForWindowMetrics(jobPID, 8.0, &exitStatus);
+    if (!windowReady)
+        windowReady = RequestApplicationReopen(jobPID, 3.0);
+    if (!windowReady) {
+        *message = @"Geekbench 已启动，但没有发布可显示的窗口";
+        return NO;
+    }
+    os_unfair_lock_lock(&gStateLock);
+    gActiveAppPID = jobPID;
+    gActiveAppID = @"geekbench";
+    os_unfair_lock_unlock(&gStateLock);
+    TrackApplicationSession(@"geekbench", rootPath, jobPID);
+    HostLog(@"launch-app geekbench pid=%d job=%s path=dedicated-launchd-job",
+            jobPID, kGeekbenchLabel);
+    *message = @"Geekbench 窗口已就绪";
+    return YES;
+}
+
 static BOOL LaunchRequestedPath(const char *requestedPath,
                                 BOOL documentOpenPending,
                                 NSString **message) {
@@ -3866,6 +3941,8 @@ static BOOL LaunchRequestedPath(const char *requestedPath,
     if ([rootPath isEqualToString:@(kVSCodeExecutable)] ||
         [rootPath isEqualToString:@(kVSCodeBundleExecutable)])
         return LaunchAllowedApp("vscode", message);
+    if ([rootPath isEqualToString:@(kGeekbenchExecutable)])
+        return LaunchGeekbench(message);
     if ([rootPath isEqualToString:@(kAsphaltExecutable)])
         return LaunchAllowedApp("asphalt", message);
     if ([rootPath isEqualToString:@(kWeatherExecutable)])

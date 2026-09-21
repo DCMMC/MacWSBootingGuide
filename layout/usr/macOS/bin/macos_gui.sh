@@ -152,6 +152,7 @@ MACOS_DISKARBITRATIOND_LABEL=com.macwsguide.macos-diskarbitrationd
 FILECOORDINATION_LABEL=com.macwsguide.filecoordination
 WATCHDOG_LABEL=com.macwsguide.watchdog
 VSCODE_PLIST="$GUI_LAUNCHD_DIR/com.macwsguide.vscode.plist"
+GEEKBENCH_PLIST="$GUI_LAUNCHD_DIR/com.macwsguide.geekbench.plist"
 VSCODE_LABEL=UIKitApplication:com.macwsguide.vscode
 STEAM_PLIST="$GUI_LAUNCHD_DIR/com.macwsguide.steam.runtime.plist"
 STEAM_LABEL=UIKitApplication:com.macwsguide.steam
@@ -786,6 +787,8 @@ stop_ws_dependents() {
     launchctl remove "$VIEWBRIDGE_LABEL" 2>/dev/null
     launchctl unload "$VSCODE_PLIST" 2>/dev/null
     launchctl remove "$VSCODE_LABEL" 2>/dev/null
+    launchctl unload "$GEEKBENCH_PLIST" 2>/dev/null
+    launchctl remove "UIKitApplication:com.macwsguide.geekbench" 2>/dev/null
     launchctl unload "$STEAM_PLIST" 2>/dev/null
     launchctl remove "$STEAM_LABEL" 2>/dev/null
     launchctl remove "$STEAM_LEGACY_LABEL" 2>/dev/null
@@ -845,6 +848,8 @@ stop_ws_dependents() {
     # disposable browser jobs in that actual domain as well.
     launchctl asuser 501 launchctl unload "$VSCODE_PLIST" 2>/dev/null
     launchctl asuser 501 launchctl remove "$VSCODE_LABEL" 2>/dev/null
+    launchctl asuser 501 launchctl unload "$GEEKBENCH_PLIST" 2>/dev/null
+    launchctl asuser 501 launchctl remove "UIKitApplication:com.macwsguide.geekbench" 2>/dev/null
     launchctl asuser 501 launchctl unload "$STEAM_PLIST" 2>/dev/null
     launchctl asuser 501 launchctl remove "$STEAM_LABEL" 2>/dev/null
     launchctl asuser 501 launchctl remove "$STEAM_LEGACY_LABEL" 2>/dev/null

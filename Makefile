@@ -25,6 +25,8 @@ after-stage::
 	@mkdir -p $(THEOS_STAGING_DIR)/usr/macOS/share/vscode/macwsguide.macws-aquarium-runner-0.0.2
 	@install -m 0644 misc/com.macwsguide.vscode.plist \
 		$(THEOS_STAGING_DIR)/usr/macOS/gui-launchd/com.macwsguide.vscode.plist
+	@install -m 0644 misc/com.macwsguide.geekbench.plist \
+		$(THEOS_STAGING_DIR)/usr/macOS/gui-launchd/com.macwsguide.geekbench.plist
 	@install -m 0644 misc/com.macwsguide.coreaudiod.plist \
 		$(THEOS_STAGING_DIR)/usr/macOS/gui-launchd/com.macwsguide.coreaudiod.plist
 	@install -m 0644 misc/com.macwsguide.audiocomponentregistrar.plist \
