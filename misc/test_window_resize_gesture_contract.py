@@ -62,8 +62,11 @@ class NativeResizeGestureContract(unittest.TestCase):
         self.assertIn('CACurrentMediaTime() <= _sceneResizeFollowDeadline', block)
         self.assertIn('if (!preserveSceneFollow)', block)
         suspend = METAL[METAL.index('- (void)suspendStream {'):]
-        self.assertIn('[self cancelSceneResizeFollowingTargetWindow];',
-                      suspend.split('\n', 3)[1])
+        self.assertIn('[self cancelSceneResizeFollowingTargetWindow];', suspend)
+        self.assertLess(suspend.index('_acceptsCatalystDrawables = NO;'),
+                        suspend.index('[self cancelSceneResizeFollowingTargetWindow];'))
+        self.assertLess(suspend.index('[self cancelSceneResizeFollowingTargetWindow];'),
+                        suspend.index('[_streamClient unsubscribe]'))
 
     def test_animation_successor_is_bound_to_owner_and_native_input_wins(self):
         block = APP[APP.index('- (void)updateNativeSceneSizeForAppliedLogicalSize:'):

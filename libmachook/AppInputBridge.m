@@ -24,8 +24,10 @@
 #import <sys/stat.h>
 #import <sys/un.h>
 #import <xpc/xpc.h>
+#import <notify.h>
 
 #import "macws_control_protocol.h"
+#import "macws_dock_expose_notify.h"
 #import "macws_host_protocol.h"
 #import "macws_menu_protocol.h"
 #import "macws_stream_protocol.h"
@@ -261,6 +263,8 @@ static IMP MacWSOriginalDockGesturesInit;
 // top layer. Retain that tuple at the native routing boundary instead of
 // searching the heap or reconstructing Dock's private object graph.
 static IMP MacWSOriginalDockModalEventRouter;
+static void (*MacWSOriginalDockModalAddHandler)(id, SEL, id, BOOL, BOOL);
+static void (*MacWSOriginalDockModalRemoveHandler)(id, SEL, id);
 static id MacWSDockModalWindow;
 static id MacWSDockModalTopLayer;
 static MacWSCGEventRef MacWSDockModalTemplateEvent;
@@ -271,6 +275,8 @@ static BOOL MacWSDockModalTemplatePointValid;
 // as a completion fence after posting a real global hover at a new point; it
 // never reuses a template captured at an older Mission Control card.
 static _Atomic uint64_t MacWSDockModalContextRevision;
+static int MacWSDockExposeStateToken = -1;
+static BOOL MacWSDockExposePublishedActive;
 // The physical trackpad path never leaves an unbounded list of stale Changed
 // samples on Dock's main queue.  UIKit can produce at 120 Hz while a native
 // Mission Control frame is temporarily more expensive; enqueueing one block
@@ -2665,6 +2671,62 @@ static BOOL MacWSAppInputIsDockEndpoint(void) {
     return program && strcmp(program, "Dock") == 0;
 }
 
+static void MacWSPublishDockExposeState(BOOL active) {
+    if (!MacWSAppInputIsDockEndpoint()) return;
+    if (MacWSDockExposeStateToken < 0) {
+        int candidate = -1;
+        if (notify_register_check(MACWS_DOCK_EXPOSE_STATE_NAME,
+                                  &candidate) != NOTIFY_STATUS_OK) return;
+        MacWSDockExposeStateToken = candidate;
+        // A fresh Dock must overwrite a stale state left by an older process,
+        // even if its first observed modal handler is inactive.
+        MacWSDockExposePublishedActive = !active;
+    }
+    if (MacWSDockExposePublishedActive == active) return;
+    uint32_t status = notify_set_state(MacWSDockExposeStateToken,
+        MacWSDockExposeState((uint32_t)getpid(), active));
+    if (status == NOTIFY_STATUS_OK)
+        status = notify_post(MACWS_DOCK_EXPOSE_STATE_NAME);
+    if (status == NOTIFY_STATUS_OK) {
+        MacWSDockExposePublishedActive = active;
+    } else if (status == NOTIFY_STATUS_INVALID_TOKEN ||
+               status == NOTIFY_STATUS_SERVER_NOT_FOUND) {
+        notify_cancel(MacWSDockExposeStateToken);
+        MacWSDockExposeStateToken = -1;
+    }
+}
+
+static void MacWSPublishDockCurrentModalHandler(id controller) {
+    id handler = [controller respondsToSelector:
+        sel_registerName("currentHandler")]
+        ? ((id (*)(id, SEL))objc_msgSend)(
+            controller, sel_registerName("currentHandler")) : nil;
+    Class exposeClass = objc_getClass("_TtC4Dock21ExposeEventController");
+    MacWSPublishDockExposeState(handler && exposeClass &&
+        [handler isKindOfClass:exposeClass]);
+}
+
+static void MacWSDockModalAddHandlerWitness(
+        id self, SEL selector, id handler, BOOL externalEventSource,
+        BOOL usingMouseHysteresis) {
+    MacWSOriginalDockModalAddHandler(self, selector, handler,
+                                    externalEventSource,
+                                    usingMouseHysteresis);
+    // RE-confirmed via the installed Ventura 13.4 Dock arm64e method list:
+    // addHandler:externalEventSource:usingMouseHysteresis: is
+    // v32@0:8@16B24B28. Publish only the controller's resulting real owner;
+    // the argument can be queued beneath an existing modal handler.
+    MacWSPublishDockCurrentModalHandler(self);
+}
+
+static void MacWSDockModalRemoveHandlerWitness(
+        id self, SEL selector, id handler) {
+    MacWSOriginalDockModalRemoveHandler(self, selector, handler);
+    // RE-confirmed selector ABI v24@0:8@16. This edge clears Expose ownership
+    // immediately, even when no further native pointer event reaches Dock.
+    MacWSPublishDockCurrentModalHandler(self);
+}
+
 static id MacWSDockGesturesInitWitness(id self, SEL selector) {
     id result = MacWSOriginalDockGesturesInit
         ? ((id (*)(id, SEL))MacWSOriginalDockGesturesInit)(self, selector)
@@ -2741,6 +2803,7 @@ static BOOL MacWSDockFileActionWitness(id self, SEL selector,
 }
 
 static void MacWSClearDockModalContext(void) {
+    MacWSPublishDockExposeState(NO);
     [MacWSDockModalWindow release];
     [MacWSDockModalTopLayer release];
     MacWSDockModalWindow = nil;
@@ -2762,9 +2825,11 @@ static void MacWSDockModalEventRouterWitness(
         ? ((id (*)(id, SEL))objc_msgSend)(
             self, sel_registerName("currentHandler")) : nil;
     Class exposeClass = objc_getClass("_TtC4Dock21ExposeEventController");
+    BOOL exposeActive = currentHandler && exposeClass &&
+        [currentHandler isKindOfClass:exposeClass];
+    MacWSPublishDockExposeState(exposeActive);
     if (windowCount > 0 && windows && topLayers && windows[0] &&
-        topLayers[0] && currentHandler && exposeClass &&
-        [currentHandler isKindOfClass:exposeClass]) {
+        topLayers[0] && exposeActive) {
         static MacWSCopyCGEvent copyEvent;
         static MacWSGetCGEventType getEventType;
         static MacWSGetCGEventLocation getEventLocation;
@@ -2809,8 +2874,7 @@ static void MacWSDockModalEventRouterWitness(
             atomic_fetch_add_explicit(&MacWSDockModalContextRevision, 1,
                                       memory_order_release);
         }
-    } else if (!currentHandler || !exposeClass ||
-               ![currentHandler isKindOfClass:exposeClass]) {
+    } else if (!exposeActive) {
         MacWSClearDockModalContext();
     }
     if (MacWSOriginalDockModalEventRouter)
@@ -2822,6 +2886,35 @@ static void MacWSDockModalEventRouterWitness(
 static BOOL MacWSInstallDockModalEventWitness(void) {
     Class modalClass = objc_getClass("ECModalEventController");
     if (!modalClass) return NO;
+    SEL addSelector = sel_registerName(
+        "addHandler:externalEventSource:usingMouseHysteresis:");
+    Method addMethod = class_getInstanceMethod(modalClass, addSelector);
+    const char *addTypes = addMethod
+        ? method_getTypeEncoding(addMethod) : NULL;
+    if (addTypes && strcmp(addTypes, "v32@0:8@16B24B28") == 0 &&
+        !MacWSOriginalDockModalAddHandler) {
+        IMP current = method_getImplementation(addMethod);
+        if (current != (IMP)MacWSDockModalAddHandlerWitness) {
+            MacWSOriginalDockModalAddHandler =
+                (void (*)(id, SEL, id, BOOL, BOOL))current;
+            method_setImplementation(addMethod,
+                (IMP)MacWSDockModalAddHandlerWitness);
+        }
+    }
+    SEL removeSelector = sel_registerName("removeHandler:");
+    Method removeMethod = class_getInstanceMethod(modalClass, removeSelector);
+    const char *removeTypes = removeMethod
+        ? method_getTypeEncoding(removeMethod) : NULL;
+    if (removeTypes && strcmp(removeTypes, "v24@0:8@16") == 0 &&
+        !MacWSOriginalDockModalRemoveHandler) {
+        IMP current = method_getImplementation(removeMethod);
+        if (current != (IMP)MacWSDockModalRemoveHandlerWitness) {
+            MacWSOriginalDockModalRemoveHandler =
+                (void (*)(id, SEL, id))current;
+            method_setImplementation(removeMethod,
+                (IMP)MacWSDockModalRemoveHandlerWitness);
+        }
+    }
     SEL routeSelector = sel_registerName(
         "handleEvent:windows:topLayers:windowCount:");
     Method routeMethod = class_getInstanceMethod(modalClass, routeSelector);
@@ -11109,6 +11202,7 @@ static void MacWSInstallAppInputBridgeNow(void) {
                               memory_order_release);
         return;
     }
+    if (dockEndpoint) MacWSPublishDockExposeState(NO);
     if (!dockEndpoint) {
         MacWSInstallWorkspaceOpenWitness();
         MacWSInstallApplicationKeyWitness();
@@ -11224,7 +11318,13 @@ __attribute__((destructor)) static void MacWSRemoveAppInputBridge(void) {
     MacWSSetAppInputGestureWindow(nil);
     MacWSSetAppInputGestureHitView(nil);
     MacWSSetLastSystemActivationEvent(nil);
-    if (MacWSAppInputIsDockEndpoint()) MacWSClearDockModalContext();
+    if (MacWSAppInputIsDockEndpoint()) {
+        MacWSClearDockModalContext();
+        if (MacWSDockExposeStateToken >= 0) {
+            notify_cancel(MacWSDockExposeStateToken);
+            MacWSDockExposeStateToken = -1;
+        }
+    }
     if (MacWSAppInputSocket >= 0) close(MacWSAppInputSocket);
     if (MacWSAppInputPath[0]) unlink(MacWSAppInputPath);
     if (MacWSWindowMetricsPath[0]) unlink(MacWSWindowMetricsPath);

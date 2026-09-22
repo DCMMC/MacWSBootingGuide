@@ -245,6 +245,31 @@ static NSItemProvider *MacWSFileDragItemProvider(NSURL *url,
                 return nil;
             }];
     }
+
+    UTType *uniformType = [UTType typeWithIdentifier:contentType];
+    if ([uniformType conformsToType:UTTypeImage]) {
+        // Runtime-confirmed in MacWSHost.log at 1789963603.927: the Finder
+        // source offered Photos only file-backed public.png/public.content;
+        // Photos rejected the drag before invoking either file loader
+        // (UIDropOperationCancel, with no provider-file-request).  Offer an
+        // abstract public.image data representation for Photos to negotiate
+        // before requesting bytes, without replacing
+        // the concrete file-backed type used by Files and Notes, so those
+        // destinations retain the original filename and byte stream.
+        [provider registerDataRepresentationForTypeIdentifier:
+            UTTypeImage.identifier
+            visibility:NSItemProviderRepresentationVisibilityAll
+            loadHandler:^NSProgress *(void (^handler)(NSData *, NSError *)) {
+                NSError *readError = nil;
+                NSData *data = [NSData dataWithContentsOfURL:url
+                    options:NSDataReadingMappedIfSafe error:&readError];
+                MacWSLog(@"interop-provider-image-request file=%@ bytes=%lu error=%@",
+                    url.lastPathComponent, (unsigned long)data.length,
+                    readError ?: @"nil");
+                handler(data, readError);
+                return nil;
+            }];
+    }
     return provider;
 }
 
@@ -1206,6 +1231,34 @@ static NSURL *MacWSResolvedProviderFileURL(id item) {
             scheduledRepresentations++;
         }
         NSString *materializationType = MacWSPreferredMaterializationType(types);
+        UTType *materializationUniformType = materializationType.length
+            ? [UTType typeWithIdentifier:materializationType] : nil;
+        BOOL namedSingleImageDataFirst = provider.suggestedName.length &&
+            types.count == 1 &&
+            [materializationUniformType conformsToType:UTTypeImage] &&
+            ![provider hasItemConformingToTypeIdentifier:
+                UTTypeFileURL.identifier];
+        if (namedSingleImageDataFirst &&
+            scheduledRepresentations < MACWS_INTEROP_MAX_REPRESENTATIONS) {
+            // Runtime-confirmed twice for Photos (MacWSHost.log
+            // 1789909109.945 and 1789963595.607): its named, single-image
+            // drag provider's generic loadItem endpoint returned a missing
+            // /var/tmp/com.apple.DragUI.druid URL and invalidated the
+            // one-shot endpoint before the later data request.  Notes' working
+            // provider in the same log was unnamed and returned a real
+            // callback-scoped container URL.  Consume the declared image data
+            // first only for the observed Photos provider shape; keep Notes'
+            // proven direct-item ordering unchanged.
+            [jobs addObject:@{
+                @"provider": provider,
+                @"item_index": @(itemIndex),
+                @"order": @(-3.5),
+                MacWSArchiveTypeKey: materializationType,
+                @"kind": @"primary-data",
+                @"materialize_data": @YES
+            }];
+            scheduledRepresentations++;
+        }
         if (materializationType &&
             scheduledRepresentations < MACWS_INTEROP_MAX_REPRESENTATIONS) {
             // Request the provider's primary payload while performDrop: still
@@ -1223,7 +1276,7 @@ static NSURL *MacWSResolvedProviderFileURL(id item) {
             }];
             scheduledRepresentations++;
         }
-        if (materializationType &&
+        if (!namedSingleImageDataFirst && materializationType &&
             scheduledRepresentations < MACWS_INTEROP_MAX_REPRESENTATIONS) {
             // Keep the provider's declared data loader as a fallback when
             // loadItem returns an object that cannot be materialized.
@@ -1248,8 +1301,6 @@ static NSURL *MacWSResolvedProviderFileURL(id item) {
             }];
             scheduledRepresentations++;
         }
-        UTType *materializationUniformType = materializationType.length
-            ? [UTType typeWithIdentifier:materializationType] : nil;
         if ([materializationUniformType conformsToType:UTTypeImage] &&
             scheduledRepresentations < MACWS_INTEROP_MAX_REPRESENTATIONS) {
             [jobs addObject:@{

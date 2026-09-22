@@ -1828,8 +1828,14 @@ def parse_metrics(payload: bytes):
         return []
     magic, version, header_size, entry_size, count, generation = \
         struct.unpack_from("<IHHIIQ", payload)
-    if (magic != 0x4D57474D or version != 2 or header_size != 24 or
-            entry_size != 20 or count < 1 or generation == 0 or
+    # The v3 producer appends window maxima and configure acknowledgements
+    # after the unchanged v2 20-byte prefix. Rejecting the new version made
+    # a visibly loaded Steam window look absent and exhausted both UI-start
+    # attempts before the benchmark ever reached Stray (device 2026-09-21).
+    known_shape = (version == 2 and entry_size == 20) or \
+        (version == 3 and entry_size == 56)
+    if (magic != 0x4D57474D or not known_shape or header_size != 24 or
+            count < 1 or generation == 0 or
             len(payload) != header_size + count * entry_size):
         return []
     result = []
@@ -3168,22 +3174,19 @@ def select_stray_in_steam(remote: Remote):
     window = largest_window(remote, pid, 45, minimum_area=500000)
     width, height = exact_window_geometry(remote, window, "steam_select")
     actions = []
-    # Runtime-confirmed on 2026-08-28: the Host broker accepted the Retina
-    # top-bar tap, but repeated exact-window captures remained on
-    # store.steampowered.com for the full 60-second postcondition.  Ask the
-    # already-running Steam client to navigate via its registered URL scheme;
-    # this does not start the game and the visible HOME/ALL postcondition
-    # below remains authoritative.
-    if remote.input_agent is not None:
-        navigation = remote.input_agent.open_url("steam://open/games")
-    else:
-        remote.run("uiopen --url steam://open/games", timeout=15)
-        navigation = "uiopen"
-    actions.append({
-        "action": "library-navigation",
-        "url": "steam://open/games",
-        "transport": navigation,
-    })
+    # Runtime-confirmed on 2026-09-21: the prearmed iOS LaunchServices agent
+    # returned opened=false for Steam's *macOS* steam:// URL, although the
+    # 1010x600 Steam client was visibly ready. Exact-window input at
+    # (409,125) on its 2116x1324 Retina capture opened the LIBRARY menu;
+    # (405,174) selected Home and the next iPadOS capture showed HOME/ALL
+    # with Stray in the left list. Use that real UI route, and keep the
+    # following visible HOME/ALL postcondition authoritative.
+    actions.append({"action": "open-library-menu", **tap_window(
+        remote, pid, window, width, height, 0.193, 0.094,
+        activate_first=True)})
+    time.sleep(0.35)
+    actions.append({"action": "select-library-home", **tap_window(
+        remote, pid, window, width, height, 0.191, 0.131)})
     actions.append({
         "action": "library-visible-postcondition",
         **wait_for_steam_library_surface(remote, pid, 60.0),
@@ -4485,7 +4488,7 @@ def verify_no_overlay_injection(remote: Remote, game_process: int,
 
 
 def ios_console_locked(remote: Remote):
-    """Return SpringBoard's lock state, with stale IOKit as a fallback."""
+    """Return SpringBoard's lock state, or unknown without its direct probe."""
     probe = remote.run(
         f"{LOCK_STATE_PROBE} 2>/dev/null", check=False, timeout=10
     )
@@ -4493,15 +4496,16 @@ def ios_console_locked(remote: Remote):
     if match:
         return match.group(1) == "1", probe.strip()
     # IOConsoleLocked can remain Yes after SpringBoard unlocks in the dual-
-    # WindowServer setup.  It is useful only when the direct SpringBoard probe
-    # is unavailable, and the returned witness makes that fallback explicit.
+    # WindowServer setup. It is only a diagnostic witness, not a lock verdict:
+    # treating a stale Yes as authoritative blocked an unlocked iPad on
+    # 2026-09-21. Let the real FrontBoard/Scene transaction decide instead.
     output = remote.run(
         "ioreg -l 2>/dev/null | "
         "awk '/\"IOConsoleLocked\" =/ {print; exit}'",
         check=False, timeout=10,
     )
     if "= Yes" in output:
-        return True, "fallback-ioreg " + output.strip()
+        return None, "stale-prone-ioreg " + output.strip()
     if "= No" in output:
         return False, "fallback-ioreg " + output.strip()
     return None, "lock-state-unavailable " + output.strip()

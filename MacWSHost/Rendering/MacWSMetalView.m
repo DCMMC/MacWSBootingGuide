@@ -21,6 +21,7 @@
 #import "MacWSMappedFrame.h"
 #import "MacWSPerformanceGestureScenario.h"
 #include "macws_catalyst_drawable_protocol.h"
+#include "macws_dock_expose_notify.h"
 #include "macws_touch_policy.h"
 #include "macws_viewport_math.h"
 #include "macws_window_configuration.h"
@@ -357,6 +358,9 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
     MacWSStreamFrameDescriptor _fullscreenLastTapRouteDescriptor;
     int32_t _fullscreenGlobalPointerPresentationPID;
     uint32_t _fullscreenGlobalPointerPresentationContactID;
+    BOOL _acceptsCatalystDrawables;
+    int _dockExposeStateToken;
+    BOOL _scrollSuppressedByDockExpose;
 }
 
 - (instancetype)initWithFrame:(CGRect)frameRect {
@@ -407,6 +411,7 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
     _viewportZoom = 1.0;
     _viewportCenter = CGPointMake(0.5, 0.5);
     _directTouchState = MacWSDirectTouchStateIdle;
+    _dockExposeStateToken = -1;
     _directTouchFeedback = [[UIImpactFeedbackGenerator alloc]
         initWithStyle:UIImpactFeedbackStyleMedium];
     MacWSStartCatalystDrawableReceiver();
@@ -686,6 +691,7 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
 
 - (void)dealloc {
     if (_nativeResizeGestureRegistered) notify_cancel(_nativeResizeGestureToken);
+    if (_dockExposeStateToken >= 0) notify_cancel(_dockExposeStateToken);
     [NSNotificationCenter.defaultCenter removeObserver:self
         name:MacWSCatalystDrawableDidPresentNotification object:nil];
     [_framePollDisplayLink invalidate];
@@ -752,6 +758,10 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
 }
 
 - (void)catalystDrawableDidPresent:(NSNotification *)notification {
+    // The receiver is process-global, while a MacWSHost process can retain
+    // several UIWindowScenes.  Only a foreground Scene with an active stream
+    // may claim the producer's single transferred IOSurface use count.
+    if (!_acceptsCatalystDrawables) return;
     __weak typeof(self) weakSelf = self;
     MacWSCatalystDrawableFrame *accepted =
         [_catalystDrawableCompositor consumeDeliveryObject:notification.object
@@ -967,6 +977,8 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
     _reportedDirectDrawableExactLayerSuppression = NO;
     _reportedDirectDrawableBaseElision = NO;
     [_catalystDrawableCompositor removeAllFrames];
+    _acceptsCatalystDrawables = YES;
+    _scrollSuppressedByDockExpose = NO;
     self.targetWindowID = mode == MacWSStreamModeWindow ? windowID : 0;
     // A window Scene must only display the IOSurface exported for that window.
     // The mmap framebuffer is a full-desktop compatibility path and would show
@@ -994,6 +1006,11 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
 }
 
 - (void)suspendStream {
+    // Close admission before unsubscribing. A completed game command buffer
+    // can publish concurrently with Scene backgrounding; allowing that frame
+    // through would immediately recreate the lease we are about to retire.
+    _acceptsCatalystDrawables = NO;
+    _scrollSuppressedByDockExpose = NO;
     [self cancelSceneResizeFollowingTargetWindow];
     [self releaseHardwareKeyboardState];
     _constrainedWindowSettlementSerial++;
@@ -1020,6 +1037,11 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
     [_overlayFrames removeAllObjects];
     [_overlayTextures removeAllObjects];
     [_submittedOverlayLeaseTokens removeAllObjects];
+    // Direct-drawable frames are not owned by MacWSStreamClient, but each one
+    // holds the producer-transferred IOSurface use count until deallocation.
+    // A suspended Scene has no consuming GPU submissions, so release its
+    // current frame here instead of retaining it until Scene destruction.
+    [_catalystDrawableCompositor removeAllFrames];
     _submittedSurfaceLeaseToken = 0;
     _sortedOverlayKeys = nil;
     _catalogRevalidationRequestedForPresentation = NO;
@@ -2772,6 +2794,35 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
     CGDataProviderRelease(provider);
 }
 
+- (MacWSCatalystDrawableFrame *)authoritativeFullscreenDrawableFrame {
+    // This is the same pixel authority used by both the renderer and the
+    // fullscreen hit test. A live desktop catalog may describe a window
+    // *behind* this opaque drawable; it cannot be consulted for visible hits.
+    if (_streamClient.mode != MacWSStreamModeFullscreen ||
+        self.targetWindowID != 0 || !_surfaceFrame || !_surfaceTexture ||
+        !_opaquePipeline || self.targetPID <= 1 ||
+        ![_fullscreenCanvasPIDs containsObject:@(self.targetPID)] ||
+        _directDrawableHeartbeatPID != self.targetPID ||
+        _reportedFullscreenCanvasPID != self.targetPID ||
+        _reportedFullscreenCanvasWindowID == 0 ||
+        _reportedFullscreenCanvasWindowID !=
+            _directDrawableHeartbeatLayerID ||
+        CGRectIsEmpty(_reportedFullscreenCanvasPixels) ||
+        !MacWSAppInputEndpointReady(self.targetPID) ||
+        _lastDirectDrawableHeartbeatTime <= 0.0) return nil;
+    CFTimeInterval age =
+        CACurrentMediaTime() - _lastDirectDrawableHeartbeatTime;
+    if (age < 0.0 || age > 3.0) return nil;
+    MacWSSurfaceFrame *layer =
+        _overlayFrames[@(_directDrawableHeartbeatLayerID)];
+    if (layer && (layer.descriptor.layerOwnerPID != self.targetPID ||
+                  layer.descriptor.layerWindowID !=
+                      _directDrawableHeartbeatLayerID)) return nil;
+    MacWSCatalystDrawableFrame *frame =
+        [_catalystDrawableCompositor frameForOwnerPID:self.targetPID];
+    return frame.texture ? frame : nil;
+}
+
 - (void)drawInMTKView:(MTKView *)view {
     if (!_pipeline || !_commandQueue) return;
     BOOL drewCatalystDrawable = NO;
@@ -2790,42 +2841,10 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
     CFTimeInterval directHeartbeatAge =
         CACurrentMediaTime() - _lastDirectDrawableHeartbeatTime;
     MacWSSurfaceFrame *fullscreenDirectLayer =
-        _directDrawableHeartbeatLayerID != 0
-            ? _overlayFrames[@(_directDrawableHeartbeatLayerID)] : nil;
+        _overlayFrames[@(_directDrawableHeartbeatLayerID)];
     MacWSCatalystDrawableFrame *fullscreenDirectFrame =
-        [_catalystDrawableCompositor frameForOwnerPID:self.targetPID];
-    MacWSStreamFrameDescriptor fullscreenDirectDescriptor =
-        fullscreenDirectLayer
-            ? fullscreenDirectLayer.descriptor
-            : (MacWSStreamFrameDescriptor){0};
-    BOOL retainedFullscreenDirectIdentity = !fullscreenDirectLayer &&
-        self.targetPID > 1 &&
-        _reportedFullscreenCanvasPID == self.targetPID &&
-        _reportedFullscreenCanvasWindowID != 0 &&
-        _directDrawableHeartbeatLayerID ==
-            _reportedFullscreenCanvasWindowID &&
-        !CGRectIsEmpty(_reportedFullscreenCanvasPixels) &&
-        [_fullscreenCanvasPIDs containsObject:@(self.targetPID)] &&
-        MacWSAppInputEndpointReady(self.targetPID);
-    BOOL controllerValidatedFullscreenIdentity =
-        _reportedFullscreenCanvasPID == self.targetPID &&
-        _reportedFullscreenCanvasWindowID != 0 &&
-        _reportedFullscreenCanvasWindowID ==
-            _directDrawableHeartbeatLayerID &&
-        !CGRectIsEmpty(_reportedFullscreenCanvasPixels) &&
-        MacWSAppInputEndpointReady(self.targetPID);
-    BOOL fullscreenDirectAuthoritative =
-        _opaquePipeline && fullscreenDirectFrame.texture &&
-        self.targetPID > 1 &&
-        [_fullscreenCanvasPIDs containsObject:@(self.targetPID)] &&
-        _directDrawableHeartbeatPID == self.targetPID &&
-        controllerValidatedFullscreenIdentity &&
-        ((fullscreenDirectDescriptor.layerOwnerPID == self.targetPID &&
-          fullscreenDirectDescriptor.layerWindowID ==
-              _directDrawableHeartbeatLayerID) ||
-         retainedFullscreenDirectIdentity) &&
-        _lastDirectDrawableHeartbeatTime > 0.0 &&
-        directHeartbeatAge >= 0.0 && directHeartbeatAge <= 3.0;
+        [self authoritativeFullscreenDrawableFrame];
+    BOOL fullscreenDirectAuthoritative = fullscreenDirectFrame != nil;
     if (directSurface) {
         _sourceTexture = _surfaceTexture;
     } else {
@@ -3306,9 +3325,19 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
                  finalComposite ? @"YES" : @"NO",
                  [_fullscreenCanvasPIDs containsObject:@(self.targetPID)]
                     ? @"YES" : @"NO",
-                 controllerValidatedFullscreenIdentity ? @"YES" : @"NO",
+                 (_reportedFullscreenCanvasPID == self.targetPID &&
+                  _reportedFullscreenCanvasWindowID != 0 &&
+                  _reportedFullscreenCanvasWindowID ==
+                      _directDrawableHeartbeatLayerID &&
+                  !CGRectIsEmpty(_reportedFullscreenCanvasPixels) &&
+                  MacWSAppInputEndpointReady(self.targetPID))
+                    ? @"YES" : @"NO",
                  fullscreenDirectLayer ? @"YES" : @"NO",
-                 retainedFullscreenDirectIdentity ? @"YES" : @"NO",
+                 (!fullscreenDirectLayer &&
+                  _reportedFullscreenCanvasPID == self.targetPID &&
+                  _reportedFullscreenCanvasWindowID ==
+                      _directDrawableHeartbeatLayerID)
+                    ? @"YES" : @"NO",
                  _directDrawableHeartbeatPID,
                  _directDrawableHeartbeatLayerID,
                  directHeartbeatAge * 1000.0,
@@ -3919,6 +3948,45 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
             .destinationWidth = candidate.pixelWidth,
             .destinationHeight = candidate.pixelHeight,
         };
+        return YES;
+    }
+    MacWSCatalystDrawableFrame *fullscreenDrawable =
+        [self authoritativeFullscreenDrawableFrame];
+    if (fullscreenDrawable) {
+        CGRect desktop = CGRectMake(0, 0, [self currentFrameWidth],
+                                    [self currentFrameHeight]);
+        CGRect canvas = CGRectIntersection(
+            _reportedFullscreenCanvasPixels, desktop);
+        // drawInMTKView clears the space outside this exact canvas instead of
+        // painting the retained desktop. Never activate a hidden catalog
+        // window by hitting that letterbox. System input-only surfaces above
+        // the drawable were already considered by the loop above.
+        if (CGRectIsNull(canvas) || !CGRectContainsPoint(canvas, point))
+            return NO;
+        MacWSSurfaceFrame *layer =
+            _overlayFrames[@(_reportedFullscreenCanvasWindowID)];
+        MacWSStreamFrameDescriptor descriptor = layer
+            ? layer.descriptor : (MacWSStreamFrameDescriptor){0};
+        if (!layer) {
+            uint32_t width = (uint32_t)llround(canvas.size.width);
+            uint32_t height = (uint32_t)llround(canvas.size.height);
+            descriptor = (MacWSStreamFrameDescriptor){
+                .magic = MACWS_STREAM_MAGIC,
+                .version = MACWS_STREAM_VERSION,
+                .size = sizeof(MacWSStreamFrameDescriptor),
+                .width = width, .height = height,
+                .contentWidth = width, .contentHeight = height,
+                .layerWindowID = _reportedFullscreenCanvasWindowID,
+                .layerOwnerPID = self.targetPID,
+                .destinationX = (int32_t)llround(canvas.origin.x),
+                .destinationY = (int32_t)llround(canvas.origin.y),
+                .destinationWidth = width, .destinationHeight = height,
+            };
+        }
+        if (pidOut) *pidOut = self.targetPID;
+        if (windowIDOut) *windowIDOut =
+            _reportedFullscreenCanvasWindowID;
+        if (descriptorOut) *descriptorOut = descriptor;
         return YES;
     }
     // A live FinalComposite is the surface drawInMTKView actually presents.
@@ -5661,6 +5729,33 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
                directionMultiplier:direction];
 }
 
+- (BOOL)dockExposeOwnsScroll {
+    if (_streamClient.mode != MacWSStreamModeFullscreen) return NO;
+    if (_dockExposeStateToken < 0) {
+        int candidate = -1;
+        if (notify_register_check(MACWS_DOCK_EXPOSE_STATE_NAME,
+                                  &candidate) != NOTIFY_STATUS_OK) return NO;
+        _dockExposeStateToken = candidate;
+    }
+    uint64_t state = 0;
+    uint32_t status = notify_get_state(_dockExposeStateToken, &state);
+    if (status == NOTIFY_STATUS_INVALID_TOKEN ||
+        status == NOTIFY_STATUS_SERVER_NOT_FOUND) {
+        notify_cancel(_dockExposeStateToken);
+        _dockExposeStateToken = -1;
+        return NO;
+    }
+    if (status != NOTIFY_STATUS_OK ||
+        !MacWSDockExposeIsActive(state)) return NO;
+    int32_t writerPID = (int32_t)MacWSDockExposeWriter(state);
+    // A crashed/relaunched Dock must not leave its old notify state blocking
+    // application scrolling. Match the live Dock endpoint already selected
+    // by the fullscreen system-gesture route, not a process-name guess.
+    return writerPID > 1 &&
+        writerPID == [self dockSystemGestureTargetPID] &&
+        MacWSAppInputEndpointReady(writerPID);
+}
+
 - (void)emitScrollAtFramePoint:(CGPoint)framePoint
                     translation:(CGPoint)translation
                           flags:(uint16_t)flags
@@ -5668,6 +5763,34 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
                          source:(MacWSInputSource)source
             directionMultiplier:(CGFloat)direction {
     if (!self.isMacWSInputEnabled) return;
+    BOOL startsGesture = (flags & MacWSInputFlagScrollBegan) != 0 &&
+        (flags & MacWSInputFlagScrollMomentum) == 0;
+    BOOL exposeOwnsScroll = [self dockExposeOwnsScroll];
+    if (startsGesture) {
+        _scrollSuppressedByDockExpose = exposeOwnsScroll;
+        if (_scrollSuppressedByDockExpose) {
+            MacWSLog(@"dock-expose-scroll-suppressed dock=%d source=%u",
+                [self dockSystemGestureTargetPID], source);
+        }
+    } else if (exposeOwnsScroll && !_scrollSuppressedByDockExpose) {
+        // Expose can claim the desktop between Begin and Changed, or while a
+        // pre-existing app scroll is decelerating. Retire that momentum loop
+        // and transfer ownership at the first subsequent sample too.
+        _scrollSuppressedByDockExpose = YES;
+        [self stopScrollMomentumWithTerminalPhase:NO];
+        MacWSLog(@"dock-expose-scroll-takeover dock=%d source=%u",
+            [self dockSystemGestureTargetPID], source);
+    }
+    // Mission Control cards are compositor transforms, not live application
+    // hit targets. Keep the entire Begin/Changed/End transaction (including
+    // the optional momentum tail) away from the app until the next gesture
+    // begins. Dock's independent one-finger global pointer route is untouched.
+    if (_scrollSuppressedByDockExpose) {
+        if (flags & (MacWSInputFlagScrollEnded |
+                     MacWSInputFlagScrollCancelled))
+            _scrollEmissionResidual = CGPointZero;
+        return;
+    }
     // UIKit translation is measured in Host points, while AppKit precise
     // scrollingDelta is measured in target logical points. The old fixed 2x
     // multiplier made a Retina 1770px/885pt Terminal move roughly twice the
@@ -5950,6 +6073,7 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
                              framePoint:(CGPoint)framePoint
                                  source:(MacWSInputSource)source
                     directionMultiplier:(CGFloat)directionMultiplier {
+    if (_scrollSuppressedByDockExpose) return;
     BOOL indirect = source == MacWSInputSourceIndirectPointer;
     BOOL shouldStart = indirect
         ? MacWSShouldStartIndirectScrollMomentum(velocity.x, velocity.y)

@@ -164,6 +164,28 @@ int main(int argc, char **argv) {
         self.assertIn('completion(NO,', watchdog)
         self.assertNotIn('sendLoadedProviderSlots', watchdog)
 
+    def test_photos_provider_routes_do_not_regress_notes_or_files(self):
+        source = (ROOT / 'MacWSHost/MacWSInteropClient.m').read_text()
+        provider = source.split(
+            'static NSItemProvider *MacWSFileDragItemProvider', 1)[1].split(
+            'static NSURL *MacWSHostDataContainerURL', 1)[0]
+        # Photos gets the abstract data representation it checks before it
+        # asks for bytes; the concrete file registrations remain present for
+        # Files/Notes and preserve the original filename.
+        self.assertIn('registerFileRepresentationForTypeIdentifier:type', provider)
+        self.assertIn('UTTypeImage.identifier', provider)
+        self.assertIn('registerDataRepresentationForTypeIdentifier:', provider)
+
+        schedule = source.split(
+            '- (void)publishItemProviders:', 1)[1].split(
+            'dispatch_queue_t loadQueue', 1)[0]
+        self.assertIn('namedSingleImageDataFirst', schedule)
+        data_first = schedule.index('@"order": @(-3.5)')
+        direct = schedule.index('@"kind": @"direct-item"')
+        self.assertLess(data_first, direct)
+        self.assertIn('!namedSingleImageDataFirst && materializationType',
+                      schedule)
+
     def test_registration_imports_copy_without_claiming_type_ownership(self):
         info = plistlib.loads((ROOT / 'MacWSHost/Resources/Info.plist').read_bytes())
         self.assertFalse(info['LSSupportsOpeningDocumentsInPlace'])

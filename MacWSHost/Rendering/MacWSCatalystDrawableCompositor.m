@@ -66,6 +66,13 @@
     shouldAcceptOwner:(BOOL (^)(int32_t))shouldAcceptOwner {
     NSDictionary *delivery = [object isKindOfClass:NSDictionary.class]
         ? (NSDictionary *)object : nil;
+    // One producer message transfers exactly one IOSurface use count. The
+    // process-global notification can have several Scene observers, so the
+    // first eligible consumer owns the delivery and every later observer must
+    // reject it. NotificationCenter invokes these observers synchronously on
+    // the receiver's main queue, making the mutable envelope the serialization
+    // boundary rather than an advisory success flag.
+    if ([delivery[@"accepted"] boolValue]) return nil;
     NSData *payload = [delivery[@"record"] isKindOfClass:NSData.class]
         ? delivery[@"record"] : nil;
     IOSurfaceRef surface = delivery[@"surface"]
