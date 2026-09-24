@@ -127,7 +127,8 @@ env	MACWS_IOKIT_COMPAT_DIAGNOSTICS	off	diagnostic	Logs the exact IOMatchCategory
 env	MACWS_IOSURF_TRACE	off	diagnostic	Per-IOSurface creation trace.
 env	MACWS_JIT_MPROTECT_COMPAT	on	VS Code,Chrome,Steam	Chromium MAP_JIT/W^X compatibility without verbose trace.
 env	MACWS_JIT_FAULT_WRITE_COMPAT	on	VS Code,Steam	Page-granular V8/CEF W^X adapter; only faulted 16-KiB writer pages become RW before RX restore.
-env	MACWS_JIT_MPROTECT_TRACE	off	diagnostic	Per-mprotect JIT trace.
+env	MACWS_JIT_MPROTECT_TRACE	off	diagnostic	Per-mprotect JIT trace; pre-opens /tmp/macws_jit_forwarded.bin and records any SIGBUS that the W^X adapter cannot handle using one fixed-size async-signal-safe write.
+env	MACWS_MONO_INTERPRETER	off	7DTD arm64 rehost diagnostic	Calls Unity 2022.3.62f2 Mono's public mono_jit_set_aot_mode with MONO_AOT_MODE_INTERP_ONLY (8) before runtime initialization and rebinds that exact UUID's late pthread_jit_write_protect_np import to the existing W^X adapter. This opt-in experiment currently reaches MonoManager ReloadAssembly but then faults in mono_gc_memmove_aligned reading an uncommitted reservation; it is not a production fix.
 env	MACWS_LAUNCHPAD_TRACE	off	diagnostic	Dock-only Launchpad source validation/bring-up/rescan trace; never enable in production.
 env	MACWS_LOCATIOND_MIG_TRACE	off	diagnostic	Bounded 256-record locationd dispatch-MIG receive/demux trace; production leaves the native callback unchanged.
 env	MACWS_LSD_ROLE	auto	private LaunchServices daemons	Explicitly selects the system-store or session-catalog endpoint family; ordinary GUI clients leave it unset and use the session family.
@@ -160,7 +161,7 @@ env	MACWS_STEAM_EXIT_DIAGNOSTICS	off	Steam diagnostic	Installs bounded top-level
 env	MACWS_STEAM_EXIT_STOP	off	Steam diagnostic	Stops the top-level Helper at an observed exit for LLDB attachment.
 env	MACWS_STEAM_LAUNCH_EPOCH	transient	Steam launch transaction	Identifies one outer bootstrap/live-client family so hostd resets its semaphore namespace exactly once.
 env	MACWS_STEAM_NATIVE_BROWSER_LAUNCH	off	removed Steam diagnostic	Native top-level WebUI fork crashes in the Network/XPC atfork child; production uses the atomic spawn adapter.
-env	MACWS_STEAM_NATIVE_EXCEPTION_DIAGNOSTICS	off	Steam diagnostic	Leaves the top-level Helper's native fault visible to CrashReporter/LLDB during an explicit diagnostic.
+env	MACWS_STEAM_NATIVE_EXCEPTION_DIAGNOSTICS	off	Steam diagnostic	Leaves the top-level Helper or separately signed macws-runtime game shadow's native fault visible to CrashReporter/LLDB during an explicit diagnostic.
 env	MACWS_STEAM_PIPE_DIAGNOSTICS	off	Steam diagnostic	Records bounded steam.pipe syscalls without changing results.
 env	MACWS_STEAM_SYSVSEM_DIAGNOSTICS	off	Steam diagnostic	Records bounded System V semaphore keys, flags, results and callers during global-instance election without changing results.
 env	MACWS_STEAM_PROCESS_DIAGNOSTICS	off	Steam diagnostic	Records exact Valve process-adapter decisions and child argv.
@@ -270,6 +271,7 @@ env	MACWS_XPC_DEBUG	off	diagnostic	XPC connection trace; no process enables it i
 env	MACWS_XPC_NAME_TRACE	off	diagnostic	Bounded allocation-free cold-start recorder for XPC/bootstrap service names; writes at most 512 records to stderr and never changes requests or results.
 env	MACWS_XPC_NAME_TRACE_FILTER	off	diagnostic	Optional substring filter for MACWS_XPC_NAME_TRACE; absent in production and launcher-cleared before every Catalyst child.
 env	MACWS_RANDOM_DIAGNOSTICS	off	Asphalt diagnostic	Read-only entropy/file-access witnesses enabled only by the matching rootfs sentinel; production preflight removes the sentinel.
+env	MACWS_ROSETTA_AMFI_PUBLIC_KEY_HASH	off	Rosetta diagnostic	Supplies the exact 32-byte host-captured AMFI public-key hash only to oahd operation 0x5c after iOS returns ENOSYS; this is a diagnostic scaffold and does not implement the missing translated-task kernel ABI.
 env	MACWS_IDENTITY_DIAGNOSTICS	off	Asphalt diagnostic	Read-only identifierForVendor and SecItem status witnesses; never records UUID or Keychain value, and production preflight removes its sentinel.
 env	MACWS_SDR_SCANOUT	on	macOS virtual screen	Defaults on: reports actual 8-bit BGRA transport via NSScreen so HDR content is tone-mapped to representable output; native iPadOS display capabilities remain unchanged. Explicit zero is a diagnostic opt-out.
 env	MACWS_CATALYST_LOCAL_KEYCHAIN	on	Asphalt compatibility	After the stock Ventura SecItem client returns errSecNotAvailable/errSecMDSError, routes only Asphalt generic-password requests through the authenticated mobile-session iOS Security helper with the original Gameloft access groups.
