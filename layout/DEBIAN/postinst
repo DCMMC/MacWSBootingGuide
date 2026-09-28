@@ -3,6 +3,7 @@
 
 HOSTD=/var/jb/usr/macOS/bin/macwshostd
 HOSTD_PLIST=/var/jb/Library/LaunchDaemons/com.macwsguide.hostd.plist
+HOST_APP=/var/jb/Applications/MacWSHost.app/MacWSHost
 KEYCHAIND=/var/jb/usr/macOS/bin/macwskeychaind
 KEYCHAIND_PLIST=/var/jb/Library/LaunchDaemons/com.macwsguide.keychain.plist
 VIEWBRIDGE_PROXY=/var/jb/usr/macOS/Frameworks/ViewBridge.framework/Versions/A/XPCServices/ViewBridgeAuxiliary.xpc/ViewBridgeAuxiliary
@@ -272,6 +273,15 @@ trust_installed_macho "$LOCATIOND_PROXY"
 trust_installed_macho "$SETTINGS_EXTENSION_PROXY"
 trust_installed_macho "$LOCATION_BRIDGE"
 trust_installed_macho /var/jb/usr/macOS/bin/launchdchrootexec
+# Runtime-confirmed on iPad14,5/iPadOS 16.0 after ending a resident Host:
+# uicache still resolved com.macwsguide.host, but uiopen could not create a new
+# UIKit process and this exact executable's CDHash was absent from
+# `jbctl trustcache info`. device_pipeline happened to register the development
+# build, which hid the missing package-install invariant until the Host first
+# needed to relaunch. Restore the already-signed package image here, before the
+# uicache publication near the end of this maintainer script. This is
+# iOS-native and exact-path scoped; no macOS rootfs or third-party app changes.
+trust_installed_macho "$HOST_APP"
 # Ventura 13.4's split arm64e shared cache has two fixed CodeDirectories.
 # Runtime-confirmed on a cold 2026-09-09 boot: after the executable loader
 # closure below was admitted, dyld rejected the codesign probe with

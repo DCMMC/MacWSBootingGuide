@@ -57,6 +57,18 @@ class RestoreBootContract(unittest.TestCase):
             'NathanLR cannot admit the macOS shared-cache closure',
             PACKAGE_POSTINST)
 
+    def test_package_restores_native_host_trust_before_publishing_it(self):
+        declaration = (
+            'HOST_APP=/var/jb/Applications/MacWSHost.app/MacWSHost')
+        trust = 'trust_installed_macho "$HOST_APP"'
+        publish = (
+            '/var/jb/usr/bin/uicache -p '
+            '/var/jb/Applications/MacWSHost.app')
+        self.assertIn(declaration, PACKAGE_POSTINST)
+        self.assertEqual(PACKAGE_POSTINST.count(trust), 1)
+        self.assertLess(PACKAGE_POSTINST.index(trust),
+                        PACKAGE_POSTINST.index(publish))
+
 
 if __name__ == "__main__":
     unittest.main()
