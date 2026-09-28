@@ -1567,6 +1567,7 @@ restore_cold_boot_trust() {
     set --
     for path in \
         /var/jb/usr/macOS/bin/launchdchrootexec \
+        /var/jb/usr/macOS/bin/launchservicesd \
         /var/jb/usr/macOS/bin/macwsaudiooutd \
         /var/jb/usr/macOS/lib/libmachook.dylib \
         /var/jb/usr/macOS/lib/libmachook_arm64.dylib \
@@ -1578,6 +1579,7 @@ restore_cold_boot_trust() {
         "$ROOTFS/System/Library/Frameworks/CydiaSubstrate.framework/CydiaSubstrate" \
         /var/jb/Library/Frameworks/CydiaSubstrate.framework/CydiaSubstrate \
         "$ROOTFS/bin/bash" \
+        "$ROOTFS/usr/sbin/filecoordinationd" \
         "$ROOTFS/System/Library/CoreServices/launchservicesd" \
         "$ROOTFS/System/Library/CoreServices/launchservicesd.dylib" \
         "$ROOTFS/System/Library/PrivateFrameworks/SkyLight.framework/Versions/A/Resources/CursorAsset" \
