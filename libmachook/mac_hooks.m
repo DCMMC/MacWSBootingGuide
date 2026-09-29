@@ -4581,6 +4581,143 @@ static void macws_install_filecache_diagnostic(
             target, macws_filecache_finalize_original);
 }
 
+// Diagnostic only.  A runtime sample of Finder on the iPad13,6 target showed
+// its TNode::SynchronizeChildren worker repeatedly waiting on
+// sharedfilelistd's synchronous bookmark resolution.  RE of the exact
+// Ventura 13.4 sharedfilelistd binary at __TEXT+0x1a3ec..+0x1a560 shows that
+// -[ListManager resolveItemWithIdentifier:onList:options:reply:] calls
+// +[NSURL URLByResolvingBookmarkData:options:relativeToURL:
+// bookmarkDataIsStale:error:], and only when the returned stale byte is set
+// does it call -bookmarkDataWithOptions:... followed by -[Item setBookmark:]
+// and -[ListController updateItem:originatorToken:].  Observe those public
+// Foundation boundaries so the offending stored URL can be repaired at its
+// source.  This hook preserves both calls, their out parameters, and their
+// return values; it is never installed without MACWS_SFL_DIAG=1.
+typedef id (*MacWSResolveBookmarkURLFn)(
+    id, SEL, id, NSUInteger, id, BOOL *, id *);
+typedef id (*MacWSCreateBookmarkDataFn)(
+    id, SEL, NSUInteger, id, id, id *);
+static MacWSResolveBookmarkURLFn macws_resolve_bookmark_url_original = NULL;
+static MacWSCreateBookmarkDataFn macws_create_bookmark_data_original = NULL;
+static _Atomic unsigned macws_sfl_diagnostic_lines = 0;
+
+static const char *macws_sfl_url_path(id value, char path[PATH_MAX]) {
+    path[0] = '\0';
+    if (!value || ![value isKindOfClass:NSURL.class]) return "(nil)";
+    NSURL *url = (NSURL *)value;
+    if (url.isFileURL && [url getFileSystemRepresentation:path
+                                                     maxLength:PATH_MAX])
+        return path;
+    const char *absolute = url.absoluteString.UTF8String;
+    if (!absolute) return "(unprintable)";
+    strlcpy(path, absolute, PATH_MAX);
+    return path;
+}
+
+static const char *macws_sfl_data_digest(id value, char digest[17]) {
+    digest[0] = '\0';
+    if (![value isKindOfClass:NSData.class]) return "none";
+    NSData *data = (NSData *)value;
+    unsigned char bytes[CC_SHA256_DIGEST_LENGTH];
+    CC_SHA256(data.bytes, (CC_LONG)data.length, bytes);
+    for (size_t index = 0; index < 8; index++)
+        snprintf(digest + index * 2, 3, "%02x", bytes[index]);
+    return digest;
+}
+
+static id macws_sfl_resolve_bookmark_url_diagnostic(
+    id receiver, SEL selector, id data, NSUInteger options, id relativeURL,
+    BOOL *stale, id *error) {
+    id result = macws_resolve_bookmark_url_original
+        ? macws_resolve_bookmark_url_original(
+              receiver, selector, data, options, relativeURL, stale, error)
+        : nil;
+    unsigned line = atomic_fetch_add_explicit(
+        &macws_sfl_diagnostic_lines, 1, memory_order_relaxed);
+    if (line < 512) {
+        char resultPath[PATH_MAX];
+        char relativePath[PATH_MAX];
+        char digest[17];
+        dprintf(STDERR_FILENO,
+                "MACWS-SFL resolve caller=%p options=%#lx bytes=%lu sha=%s "
+                "stale=%d result=%s relative=%s error=%s\n",
+                __builtin_return_address(0), (unsigned long)options,
+                (unsigned long)[data length],
+                macws_sfl_data_digest(data, digest), stale ? !!*stale : -1,
+                macws_sfl_url_path(result, resultPath),
+                macws_sfl_url_path(relativeURL, relativePath),
+                error && *error
+                    ? [[*error description] UTF8String] ?: "(unprintable)"
+                    : "none");
+    }
+    return result;
+}
+
+static id macws_sfl_create_bookmark_data_diagnostic(
+    id url, SEL selector, NSUInteger options, id resourceKeys,
+    id relativeURL, id *error) {
+    id result = macws_create_bookmark_data_original
+        ? macws_create_bookmark_data_original(
+              url, selector, options, resourceKeys, relativeURL, error)
+        : nil;
+    unsigned line = atomic_fetch_add_explicit(
+        &macws_sfl_diagnostic_lines, 1, memory_order_relaxed);
+    if (line < 512) {
+        char urlPath[PATH_MAX];
+        char relativePath[PATH_MAX];
+        char digest[17];
+        dprintf(STDERR_FILENO,
+                "MACWS-SFL create caller=%p options=%#lx url=%s "
+                "relative=%s bytes=%lu sha=%s error=%s\n",
+                __builtin_return_address(0), (unsigned long)options,
+                macws_sfl_url_path(url, urlPath),
+                macws_sfl_url_path(relativeURL, relativePath),
+                (unsigned long)[result length],
+                macws_sfl_data_digest(result, digest),
+                error && *error
+                    ? [[*error description] UTF8String] ?: "(unprintable)"
+                    : "none");
+    }
+    return result;
+}
+
+static void macws_install_shared_file_list_diagnostic(void) {
+    const char *program = getprogname();
+    const char *enabled = getenv("MACWS_SFL_DIAG");
+    if (!program || strcmp(program, "sharedfilelistd") != 0 || !enabled ||
+        strcmp(enabled, "1") != 0)
+        return;
+
+    Class urlClass = objc_getClass("NSURL");
+    SEL resolveSelector = sel_registerName(
+        "URLByResolvingBookmarkData:options:relativeToURL:"
+        "bookmarkDataIsStale:error:");
+    Method resolveMethod = urlClass
+        ? class_getClassMethod(urlClass, resolveSelector) : NULL;
+    SEL createSelector = sel_registerName(
+        "bookmarkDataWithOptions:includingResourceValuesForKeys:"
+        "relativeToURL:error:");
+    Method createMethod = urlClass
+        ? class_getInstanceMethod(urlClass, createSelector) : NULL;
+    if (resolveMethod) {
+        IMP implementation = method_getImplementation(resolveMethod);
+        macws_resolve_bookmark_url_original =
+            (MacWSResolveBookmarkURLFn)implementation;
+        method_setImplementation(
+            resolveMethod, (IMP)macws_sfl_resolve_bookmark_url_diagnostic);
+    }
+    if (createMethod) {
+        IMP implementation = method_getImplementation(createMethod);
+        macws_create_bookmark_data_original =
+            (MacWSCreateBookmarkDataFn)implementation;
+        method_setImplementation(
+            createMethod, (IMP)macws_sfl_create_bookmark_data_diagnostic);
+    }
+    dprintf(STDERR_FILENO,
+            "MACWS-SFL diagnostic installed resolve=%p create=%p\n",
+            resolveMethod, createMethod);
+}
+
 // Diagnostic-only probe for Finder's DesktopServices volume registry.  The
 // actual Ventura 13.4 crash at DesktopServicesPriv+0xe8f50 dereferences
 // `this+0x200` with x0 == NULL.  RE of the caller at +0xe8374 shows that x0 is
@@ -11060,6 +11197,7 @@ __attribute__((constructor)) void InitStuff() {
     }
     macws_schedule_preview_coreimage_renderer_adapter();
     macws_install_steam_volume_compatibility();
+    macws_install_shared_file_list_diagnostic();
     MacWSInstallOfficeMultiplyFilterCompatibility();
     // Settings extensions carry libmachook through a bundle-local load command.
     // Retry their ExtensionFoundation/LaunchServices boundary only after the

@@ -2075,6 +2075,17 @@ PY
     <key>RunAtLoad</key><true/>
     <key>KeepAlive</key><false/>
     <key>ThrottleInterval</key><integer>5</integer>
+    <!-- RE-confirmed in Ventura 13.4 CoreServicesInternal and
+         runtime-confirmed on iPad13,6: uid 0's /var/root home candidate is
+         rejected against Finder's canonical /private/var/root bookmark,
+         leaving the stale bit set even after the canonical fallback resolves.
+         CoreFoundation's supported fixed-home input makes the first candidate
+         canonical and stops sharedfilelistd's resolve/update notification
+         loop without bypassing bookmark validation. -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>CFFIXED_USER_HOME</key><string>/private/var/root</string>
+    </dict>
     <key>StandardOutPath</key><string>${LOGDIR}/sharedfilelistd.out</string>
     <key>StandardErrorPath</key><string>${LOGDIR}/sharedfilelistd.err</string>
 </dict>

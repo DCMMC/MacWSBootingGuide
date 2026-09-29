@@ -20,6 +20,9 @@ extern char **environ;
 typedef CFTypeRef (*MacWSLSSharedFileListCreateFn)(
     CFAllocatorRef, CFStringRef, CFTypeRef);
 typedef CFArrayRef (*MacWSLSSharedFileListCopySnapshotFn)(CFTypeRef, UInt32 *);
+typedef CFStringRef (*MacWSLSSharedFileListItemCopyDisplayNameFn)(CFTypeRef);
+typedef CFURLRef (*MacWSLSSharedFileListItemCopyResolvedURLFn)(
+    CFTypeRef, UInt32, CFErrorRef *);
 
 static int ConfigureAirPlayPowerDefaults(void) {
     typedef int32_t (*APSSettingsSetUseXPCHelperFn)(bool);
@@ -132,6 +135,173 @@ static int SharedFileListReady(void) {
             (long)count, seed);
     CFRelease(snapshot);
     CFRelease(list);
+    return 0;
+}
+
+static int InspectSharedFileLists(void) {
+    MacWSLSSharedFileListCreateFn createList =
+        (MacWSLSSharedFileListCreateFn)dlsym(
+            RTLD_DEFAULT, "LSSharedFileListCreate");
+    MacWSLSSharedFileListCopySnapshotFn copySnapshot =
+        (MacWSLSSharedFileListCopySnapshotFn)dlsym(
+            RTLD_DEFAULT, "LSSharedFileListCopySnapshot");
+    MacWSLSSharedFileListItemCopyDisplayNameFn copyDisplayName =
+        (MacWSLSSharedFileListItemCopyDisplayNameFn)dlsym(
+            RTLD_DEFAULT, "LSSharedFileListItemCopyDisplayName");
+    MacWSLSSharedFileListItemCopyResolvedURLFn copyResolvedURL =
+        (MacWSLSSharedFileListItemCopyResolvedURLFn)dlsym(
+            RTLD_DEFAULT, "LSSharedFileListItemCopyResolvedURL");
+    if (!createList || !copySnapshot || !copyDisplayName ||
+        !copyResolvedURL) {
+        fprintf(stderr,
+                "macwsworkspacectl: SharedFileList inspection SPI "
+                "unavailable\n");
+        return 69;
+    }
+
+    static const struct {
+        const char *label;
+        const char *symbol;
+    } listTypes[] = {
+        {"favorite-items", "kLSSharedFileListFavoriteItems"},
+        {"favorite-volumes", "kLSSharedFileListFavoriteVolumes"},
+        {"recent-applications", "kLSSharedFileListRecentApplicationItems"},
+        {"recent-documents", "kLSSharedFileListRecentDocumentItems"},
+    };
+    int failures = 0;
+    for (size_t listIndex = 0;
+         listIndex < sizeof(listTypes) / sizeof(listTypes[0]); listIndex++) {
+        CFStringRef *type = (CFStringRef *)dlsym(
+            RTLD_DEFAULT, listTypes[listIndex].symbol);
+        if (!type || !*type) {
+            fprintf(stdout, "shared-file-list-inspect list=%s unavailable\n",
+                    listTypes[listIndex].label);
+            continue;
+        }
+        CFTypeRef list = createList(kCFAllocatorDefault, *type, NULL);
+        UInt32 seed = 0;
+        CFArrayRef items = list ? copySnapshot(list, &seed) : NULL;
+        if (!items) {
+            fprintf(stdout,
+                    "shared-file-list-inspect list=%s snapshot=nil\n",
+                    listTypes[listIndex].label);
+            if (list) CFRelease(list);
+            failures++;
+            continue;
+        }
+        fprintf(stdout,
+                "shared-file-list-inspect list=%s items=%ld seed=%u\n",
+                listTypes[listIndex].label,
+                (long)CFArrayGetCount(items), seed);
+        for (CFIndex itemIndex = 0;
+             itemIndex < CFArrayGetCount(items); itemIndex++) {
+            CFTypeRef item = CFArrayGetValueAtIndex(items, itemIndex);
+            CFStringRef name = copyDisplayName(item);
+            CFErrorRef error = NULL;
+            CFAbsoluteTime started = CFAbsoluteTimeGetCurrent();
+            // These are the least invasive flags Finder can use: resolution
+            // may read an already-mounted path but cannot show UI or mount a
+            // missing volume merely for this evidence probe.
+            CFURLRef url = copyResolvedURL(item, 3, &error);
+            CFAbsoluteTime elapsed = CFAbsoluteTimeGetCurrent() - started;
+            char nameBytes[PATH_MAX] = "(unnamed)";
+            char urlBytes[PATH_MAX] = "(nil)";
+            char errorDomain[256] = "none";
+            CFIndex errorCode = 0;
+            if (name) {
+                (void)CFStringGetCString(name, nameBytes, sizeof(nameBytes),
+                                         kCFStringEncodingUTF8);
+            }
+            if (url) {
+                (void)CFURLGetFileSystemRepresentation(
+                    url, true, (UInt8 *)urlBytes, sizeof(urlBytes));
+            }
+            if (error) {
+                CFStringRef domain = CFErrorGetDomain(error);
+                errorCode = CFErrorGetCode(error);
+                if (domain) {
+                    (void)CFStringGetCString(domain, errorDomain,
+                                             sizeof(errorDomain),
+                                             kCFStringEncodingUTF8);
+                }
+            }
+            fprintf(stdout,
+                    "shared-file-list-item list=%s index=%ld name=%s "
+                    "url=%s error-domain=%s error-code=%ld elapsed-ms=%.3f\n",
+                    listTypes[listIndex].label, (long)itemIndex, nameBytes,
+                    urlBytes, errorDomain, (long)errorCode,
+                    elapsed * 1000.0);
+            if (!url) failures++;
+            if (error) CFRelease(error);
+            if (url) CFRelease(url);
+            if (name) CFRelease(name);
+        }
+        CFRelease(items);
+        CFRelease(list);
+    }
+    return failures == 0 ? 0 : 1;
+}
+
+static int InspectBookmarkPaths(void) {
+    NSArray<NSString *> *paths = @[
+        @"/Applications",
+        @"/private/var",
+        @"/private/var/root",
+        @"/private/var/root/Desktop",
+        @"/private/var/root/Documents",
+        @"/private/var/root/Downloads",
+        @"/Users/root",
+    ];
+    NSArray<NSURLResourceKey> *keys = @[
+        NSURLVolumeURLKey,
+        NSURLVolumeIdentifierKey,
+        NSURLVolumeUUIDStringKey,
+        NSURLVolumeNameKey,
+        NSURLVolumeIsRootFileSystemKey,
+        NSURLFileResourceIdentifierKey,
+        NSURLDocumentIdentifierKey,
+        NSURLCreationDateKey,
+        NSURLContentModificationDateKey,
+    ];
+    for (NSString *path in paths) {
+        NSURL *url = [NSURL fileURLWithPath:path];
+        NSError *resourceError = nil;
+        NSDictionary *values = [url resourceValuesForKeys:keys
+                                                     error:&resourceError];
+        fprintf(stdout, "bookmark-path path=%s resources-error=%s\n",
+                path.fileSystemRepresentation,
+                resourceError.description.UTF8String ?: "none");
+        for (NSURLResourceKey key in keys) {
+            id value = values[key];
+            fprintf(stdout, "bookmark-resource path=%s key=%s class=%s "
+                            "value=%s\n",
+                    path.fileSystemRepresentation, key.UTF8String,
+                    value ? object_getClassName(value) : "nil",
+                    value ? [[value description] UTF8String] : "nil");
+        }
+
+        NSError *creationError = nil;
+        NSData *bookmark = [url bookmarkDataWithOptions:0x20000000UL
+                       includingResourceValuesForKeys:nil
+                                        relativeToURL:nil
+                                                error:&creationError];
+        BOOL stale = NO;
+        NSError *resolutionError = nil;
+        NSURL *resolved = bookmark
+            ? [NSURL URLByResolvingBookmarkData:bookmark
+                                        options:0x300UL
+                                  relativeToURL:nil
+                            bookmarkDataIsStale:&stale
+                                          error:&resolutionError]
+            : nil;
+        fprintf(stdout,
+                "bookmark-roundtrip path=%s bytes=%lu stale=%d resolved=%s "
+                "create-error=%s resolve-error=%s\n",
+                path.fileSystemRepresentation, (unsigned long)bookmark.length,
+                stale, resolved.path.fileSystemRepresentation ?: "(nil)",
+                creationError.description.UTF8String ?: "none",
+                resolutionError.description.UTF8String ?: "none");
+    }
     return 0;
 }
 
@@ -1321,6 +1491,12 @@ int main(int argc, const char *argv[]) {
         if (argc == 2 && strcmp(argv[1], "shared-file-list-ready") == 0) {
             return SharedFileListReady();
         }
+        if (argc == 2 && strcmp(argv[1], "shared-file-list-inspect") == 0) {
+            return InspectSharedFileLists();
+        }
+        if (argc == 2 && strcmp(argv[1], "bookmark-path-inspect") == 0) {
+            return InspectBookmarkPaths();
+        }
         if (argc == 3 && strcmp(argv[1], "activate-process") == 0) {
             return ActivateProcess(argv[2]);
         }
@@ -1350,6 +1526,8 @@ int main(int argc, const char *argv[]) {
                 "register-settings-extensions | "
                 "verify-launchservices-catalog | "
                 "shared-file-list-ready | "
+                "shared-file-list-inspect | "
+                "bookmark-path-inspect | "
                 "configure-airplay-power | "
                 "open-application /absolute/App.app | "
                 "session-status | activate-process PID | list-windows PID | "
