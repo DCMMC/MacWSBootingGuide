@@ -7522,6 +7522,11 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
 
 - (void)suspendSceneStream {
     [self dismissSemanticMenu];
+    // viewWillDisappear is not guaranteed for a connected UIKit Scene that
+    // merely enters the background. Stop the per-Scene status poll here so a
+    // resident Host does not keep waking every three seconds while locked.
+    [_statusTimer invalidate];
+    _statusTimer = nil;
     [_metalView suspendStream];
 }
 
@@ -7532,6 +7537,11 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
     [_metalView requestStreamWindowList];
     [_interopClient connect];
     if (_windowID != 0) [self refreshSemanticMenuWithCompletion:nil];
+    [self refreshStatus];
+    if (!_statusTimer) {
+        _statusTimer = [NSTimer scheduledTimerWithTimeInterval:3.0 target:self
+            selector:@selector(refreshStatus) userInfo:nil repeats:YES];
+    }
 }
 
 - (void)requestWindowLifetimeReconciliation {
@@ -8091,13 +8101,12 @@ static void MacWSDeduplicateWindowScenes(void) {
 
 - (void)sceneWillEnterForeground:(UIScene *)scene {
     (void)scene;
-    // A fullscreen macOS workspace is an interactive display session.  Keep
-    // iPadOS from auto-locking while that Scene is in the foreground; once
-    // locked, FrontBoard only prewarms a relaunched Host (ActivePrewarm=1)
-    // and cannot reconnect its UIWindowScene until the user authenticates.
-    // Restore the ordinary system policy as soon as the Scene backgrounds so
-    // this does not turn a dormant Host process into a permanent wake lock.
-    UIApplication.sharedApplication.idleTimerDisabled = YES;
+    // Respect iPadOS Auto-Lock. RE-confirmed in the previous MacWSHost arm64
+    // build at +0x27f4c: sceneWillEnterForeground passed w2=1 to
+    // setIdleTimerDisabled:. UIKit input naturally postpones Auto-Lock while
+    // the workspace is in active use; an actual lock edge is handled by the
+    // workspace sleep coordinator.
+    UIApplication.sharedApplication.idleTimerDisabled = NO;
     [(MacWSViewController *)self.window.rootViewController resumeSceneStream];
 }
 
@@ -8105,7 +8114,7 @@ static void MacWSDeduplicateWindowScenes(void) {
     MacWSLog(@"scene-became-active id=%@ state=%ld",
              scene.session.persistentIdentifier,
              (long)scene.activationState);
-    UIApplication.sharedApplication.idleTimerDisabled = YES;
+    UIApplication.sharedApplication.idleTimerDisabled = NO;
     MacWSViewController *controller =
         (MacWSViewController *)self.window.rootViewController;
     [controller reassertFullscreenScenePresentation];

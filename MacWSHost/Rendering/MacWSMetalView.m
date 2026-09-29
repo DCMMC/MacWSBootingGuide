@@ -359,6 +359,7 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
     int32_t _fullscreenGlobalPointerPresentationPID;
     uint32_t _fullscreenGlobalPointerPresentationContactID;
     BOOL _acceptsCatalystDrawables;
+    BOOL _streamSuspended;
     int _dockExposeStateToken;
     BOOL _scrollSuppressedByDockExpose;
 }
@@ -371,6 +372,14 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
     self.delegate = self;
     self.colorPixelFormat = MTLPixelFormatBGRA8Unorm;
     self.framebufferOnly = YES;
+    // Runtime-confirmed via /var/jb/var/mobile/macws-power-before.log on
+    // iPad13,6: MacWSHost's dominant category is IOSurface (65 MiB), while
+    // one 2388x1668 BGRA drawable is 15.2 MiB. CAMetalLayer defaults to a
+    // three-drawable swap queue and the
+    // Host's event-driven compositor does not encode a later frame until the
+    // current surface/geometry update. Use the API-supported two-drawable
+    // queue to bound each visible Scene without reducing its resolution.
+    ((CAMetalLayer *)self.layer).maximumDrawableCount = 2;
     // The producer publishes acknowledged snapshots, not a live 20-fps pixel
     // stream.  Continuous MTKView drawing uploaded the unchanged 15.2-MiB
     // frame 20 times per second and runtime-measured as 13-15% App CPU.  Poll
@@ -917,6 +926,7 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
 }
 
 - (void)configureStreamMode:(MacWSStreamMode)mode windowID:(uint32_t)windowID {
+    _streamSuspended = NO;
     // Subscription setup can run in viewDidAppear/sceneWillEnterForeground
     // after willConnect has already issued the native Scene transaction. It
     // does not change that transaction's owner when its exact target is the
@@ -1010,6 +1020,7 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
     // can publish concurrently with Scene backgrounding; allowing that frame
     // through would immediately recreate the lease we are about to retire.
     _acceptsCatalystDrawables = NO;
+    _streamSuspended = YES;
     _scrollSuppressedByDockExpose = NO;
     [self cancelSceneResizeFollowingTargetWindow];
     [self releaseHardwareKeyboardState];
@@ -1049,6 +1060,12 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
     _textureWidth = 0;
     _textureHeight = 0;
     _contentRect = CGRectZero;
+    // CAMetalLayer otherwise keeps its full-resolution drawable pool while
+    // the Scene is resident in the background. The app-switcher snapshot is
+    // already owned by UIKit at this lifecycle edge; collapse the invisible
+    // pool to one pixel and let configureStreamMode restore the live policy
+    // before the first foreground frame arrives.
+    self.drawableSize = CGSizeMake(1.0, 1.0);
     // A UIWindow/Stage Manager maximization animation can rescale the last
     // CAMetalDrawable before the replacement DisplayStream generation lands.
     // Rendering a deterministic clear frame prevents that stale exact-window
@@ -1610,6 +1627,12 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
 }
 
 - (void)updateDrawableResolution {
+    if (_streamSuspended) {
+        if (self.drawableSize.width != 1.0 ||
+            self.drawableSize.height != 1.0)
+            self.drawableSize = CGSizeMake(1.0, 1.0);
+        return;
+    }
     CGFloat logicalWidth = self.bounds.size.width;
     CGFloat logicalHeight = self.bounds.size.height;
     if (!isfinite(logicalWidth) || !isfinite(logicalHeight) ||

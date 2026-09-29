@@ -21,6 +21,78 @@ typedef CFTypeRef (*MacWSLSSharedFileListCreateFn)(
     CFAllocatorRef, CFStringRef, CFTypeRef);
 typedef CFArrayRef (*MacWSLSSharedFileListCopySnapshotFn)(CFTypeRef, UInt32 *);
 
+static int ConfigureAirPlayPowerDefaults(void) {
+    typedef int32_t (*APSSettingsSetUseXPCHelperFn)(bool);
+    typedef int64_t (*APSSettingsGetInt64Fn)(CFStringRef, int32_t *);
+    typedef int32_t (*APSSettingsSetInt64Fn)(CFStringRef, int64_t);
+    static const char *const framework =
+        "/System/Library/PrivateFrameworks/"
+        "AirPlaySupport.framework/AirPlaySupport";
+    void *image = dlopen(framework, RTLD_NOW | RTLD_LOCAL);
+    APSSettingsSetUseXPCHelperFn setUseXPCHelper = image
+        ? (APSSettingsSetUseXPCHelperFn)dlsym(
+              image, "APSSettingsSetUseXPCHelper") : NULL;
+    APSSettingsGetInt64Fn getSetting = image
+        ? (APSSettingsGetInt64Fn)dlsym(image, "APSSettingsGetInt64") : NULL;
+    APSSettingsSetInt64Fn setSetting = image
+        ? (APSSettingsSetInt64Fn)dlsym(image, "APSSettingsSetInt64") : NULL;
+    if (!setUseXPCHelper || !getSetting || !setSetting) {
+        fprintf(stderr,
+                "macwsworkspacectl: AirPlay settings SPI unavailable "
+                "(image=%s route=%s get=%s set=%s)\n",
+                image ? "yes" : "no", setUseXPCHelper ? "yes" : "no",
+                getSetting ? "yes" : "no",
+                setSetting ? "yes" : "no");
+        if (image) dlclose(image);
+        return 69;
+    }
+
+    // RE-confirmed in the iPad13,6 Ventura/iPadOS-16.3 runtime:
+    // -[APAdvertiserBTLEManager updateSupportsSoloAndForceReadFromPrefs:]
+    // reads this public AirPlay setting first. When absent it asks IO80211 for
+    // AWDL Solo support; that unsupported query returns an error and leaves
+    // the manager's initialized byte clear, so its timer retries forever.
+    // Persisting the supported preference path lets Apple's own method finish
+    // initialization and cancel its timer. The chroot cannot provide AWDL, so
+    // false is the truthful capability value rather than a check bypass.
+    // RE-confirmed via the actual AirPlaySupport image: the supported
+    // APSSettingsSetUseXPCHelper(false) entry point selects the same
+    // com.apple.airplay CFPreferences backend used by showInMenuBar keys.
+    // The outer iPadOS launchd cannot host Ventura's incompatible helper, so
+    // choose this Apple-provided backend before the first settings read.
+    int32_t routeStatus = setUseXPCHelper(false);
+    if (routeStatus != 0) {
+        fprintf(stderr,
+                "macwsworkspacectl: AirPlay preferences route failed: %d\n",
+                routeStatus);
+        dlclose(image);
+        return 1;
+    }
+    CFStringRef key = CFSTR("p2pSolo");
+    int32_t readStatus = 0;
+    int64_t oldValue = getSetting(key, &readStatus);
+    int32_t setStatus = 0;
+    if (readStatus != 0 || oldValue != 0)
+        setStatus = setSetting(key, 0);
+    int32_t verifyStatus = 0;
+    int64_t value = getSetting(key, &verifyStatus);
+    if (setStatus != 0 || verifyStatus != 0 || value != 0) {
+        fprintf(stderr,
+                "macwsworkspacectl: AirPlay p2pSolo configuration failed "
+                "route=%d read=%d old=%lld set=%d verify=%d value=%lld\n",
+                routeStatus, readStatus, (long long)oldValue, setStatus,
+                verifyStatus, (long long)value);
+        dlclose(image);
+        return 1;
+    }
+    fprintf(stdout,
+            "airplay-power-ready key=p2pSolo value=0 previous=%lld "
+            "route-status=%d read-status=%d\n",
+            (long long)oldValue, routeStatus, readStatus);
+    dlclose(image);
+    return 0;
+}
+
 static int SharedFileListReady(void) {
     MacWSLSSharedFileListCreateFn createList =
         (MacWSLSSharedFileListCreateFn)dlsym(
@@ -1199,6 +1271,10 @@ static int ResolveDocumentApplication(const char *path, const char *output) {
 
 int main(int argc, const char *argv[]) {
     @autoreleasepool {
+        if (argc == 2 &&
+            strcmp(argv[1], "configure-airplay-power") == 0) {
+            return ConfigureAirPlayPowerDefaults();
+        }
         if (argc == 4 && strcmp(argv[1], "resolve-document") == 0)
             return ResolveDocumentApplication(argv[2], argv[3]);
         if (argc >= 2 && strcmp(argv[1], "set-wallpaper") == 0) {
@@ -1274,6 +1350,7 @@ int main(int argc, const char *argv[]) {
                 "register-settings-extensions | "
                 "verify-launchservices-catalog | "
                 "shared-file-list-ready | "
+                "configure-airplay-power | "
                 "open-application /absolute/App.app | "
                 "session-status | activate-process PID | list-windows PID | "
                 "reopen-process PID | inspect-appkit-reopen | "

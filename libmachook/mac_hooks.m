@@ -34,6 +34,7 @@
 #import <pwd.h>
 #include <execinfo.h>
 #import "macws_host_protocol.h"
+#import "macws_power_lifecycle.h"
 #include "macws_keyboard_state.h"
 #include "macws_atomic_pointer_click.h"
 #import "macws_pointer_activation.h"
@@ -5389,9 +5390,54 @@ static void macws_configure_mono_interpreter_if_requested(void) {
 
 extern void MacWSInstallAudioRenderBridge(void);
 
+static _Atomic bool g_macws_controlcenter_airplay_route_configured = false;
+
+static void macws_configure_controlcenter_airplay_settings_route(void) {
+    const char *program = getprogname();
+    char executable[PATH_MAX] = {0};
+    BOOL isControlCenter =
+        program && strcmp(program, "ControlCenter") == 0;
+    if (!isControlCenter &&
+        proc_pidpath(getpid(), executable, sizeof(executable)) > 0) {
+        const char *suffix =
+            "/ControlCenter.app/Contents/MacOS/ControlCenter";
+        size_t pathLength = strlen(executable);
+        size_t suffixLength = strlen(suffix);
+        isControlCenter = pathLength >= suffixLength &&
+            strcmp(executable + pathLength - suffixLength, suffix) == 0;
+    }
+    if (!isControlCenter || atomic_exchange_explicit(
+            &g_macws_controlcenter_airplay_route_configured, true,
+            memory_order_acq_rel)) {
+        return;
+    }
+
+    typedef int32_t (*APSSettingsSetUseXPCHelperFn)(bool);
+    APSSettingsSetUseXPCHelperFn setUseXPCHelper =
+        (APSSettingsSetUseXPCHelperFn)dlsym(
+            RTLD_DEFAULT, "APSSettingsSetUseXPCHelper");
+    int32_t status = setUseXPCHelper ? setUseXPCHelper(false) : -1;
+
+    // RE-confirmed via the Ventura AirPlaySupport image loaded in the
+    // running M1 ControlCenter: APSSettingsSetUseXPCHelper stores the route
+    // byte consumed by _ShouldUseXPCHelper's dispatch_once block. Configure
+    // that supported route only after dyld has mapped AirPlaySupport: an
+    // eager dlopen from a Logos constructor runtime-confirmed as SIGTRAP
+    // (launchd exit -5) before ControlCenter reached main.
+    fprintf(stderr,
+            "#### CONTROL-CENTER-POWER AirPlay preferences route=%s "
+            "status=%d\n",
+            setUseXPCHelper ? "cfpreferences" : "unavailable", status);
+    fflush(stderr);
+}
+
 void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) {
     Dl_info info = {};
     (void)dladdr(header, &info);
+    if (info.dli_fname &&
+        strstr(info.dli_fname, "/AirPlaySupport.framework/") != NULL) {
+        macws_configure_controlcenter_airplay_settings_route();
+    }
     if (info.dli_fname &&
         (strstr(info.dli_fname, "/AudioToolbox.framework/") != NULL ||
          strstr(info.dli_fname, "/AudioUnit.framework/") != NULL)) {
@@ -23348,12 +23394,15 @@ static uint32_t macws_coexist_completion_pace_us(void) {
     enum {
         kDefaultPaceUS = 100000,
         kMinimumPaceUS = 8333,
-        // Static macOS desktops still kept the iPad AGX at 27% device
-        // utilization with the previous 100-ms ceiling.  Permit a slower
-        // idle-only A/B; macws_coexist_activity_pace_us() continues to select
-        // the independently bounded interactive/render cadence as soon as a
-        // real input or versioned render-activity record arrives.
-        kMaximumPaceUS = 500000,
+        // Runtime-confirmed on the M1 iPad baseline: WindowServer's sampled
+        // work was the synthetic non-coalesced display timer even on an
+        // unchanged desktop. Keep the previously validated 100-ms production
+        // ceiling here: the current render-activity producer is deliberately
+        // limited to known game processes, so a slower generic ceiling could
+        // throttle an ordinary AppKit animation after its input window ends.
+        // Lock-screen power saving is handled separately by the durable sleep
+        // marker, which stops synthetic completions entirely.
+        kMaximumPaceUS = 100000,
     };
     static dispatch_once_t once;
     static uint32_t pace_us = kDefaultPaceUS;
@@ -23588,12 +23637,40 @@ static void macws_coexist_drain_interaction_wake(int socket_fd) {
     }
 }
 
+static void macws_coexist_wait_while_workspace_sleeping(int socket_fd) {
+    // hostd creates this marker at the lock transition, posts the AppKit
+    // NSWorkspaceWillSleepNotification bridge, then gives applications a
+    // bounded notification interval before suspending them. Do not manufacture
+    // display completions while the screen is locked: a real sleeping Mac
+    // does not keep asking WindowServer to compose invisible frames. A
+    // one-second bounded poll is only a recovery path if the wake datagram is
+    // lost.
+    while (access(MACWS_WORKSPACE_SLEEP_MARKER, F_OK) == 0) {
+        if (socket_fd >= 0) {
+            struct pollfd descriptor = {
+                .fd = socket_fd,
+                .events = POLLIN,
+            };
+            int result;
+            do {
+                result = poll(&descriptor, 1, 1000);
+            } while (result < 0 && errno == EINTR);
+            if (result > 0 && (descriptor.revents & POLLIN))
+                macws_coexist_drain_interaction_wake(socket_fd);
+        } else {
+            usleep(1000 * 1000);
+        }
+    }
+}
+
 static uint32_t macws_coexist_wait_for_completion_slot(uint32_t interval_us) {
     static pthread_mutex_t pace_lock = PTHREAD_MUTEX_INITIALIZER;
     static uint64_t last_completion_ns = 0;
     uint32_t slept_us = 0;
 
     pthread_mutex_lock(&pace_lock);
+    int wake_fd = macws_coexist_interaction_wake_socket();
+    macws_coexist_wait_while_workspace_sleeping(wake_fd);
     struct timespec now_ts = {0};
     if (clock_gettime(CLOCK_MONOTONIC, &now_ts) == 0) {
         uint64_t start_ns = (uint64_t)now_ts.tv_sec * NSEC_PER_SEC +
@@ -23603,8 +23680,6 @@ static uint32_t macws_coexist_wait_for_completion_slot(uint32_t interval_us) {
         uint64_t target_ns = base_ns +
             (uint64_t)effective_interval_us * 1000u;
         uint64_t now_ns = start_ns;
-        int wake_fd = macws_coexist_interaction_wake_socket();
-
         while (target_ns > now_ns) {
             uint64_t remaining_ns = target_ns - now_ns;
             uint64_t remaining_ms = (remaining_ns + NSEC_PER_MSEC - 1) /
