@@ -7,6 +7,7 @@
 #import <xpc/xpc.h>
 #import <dlfcn.h>
 #import <execinfo.h>
+#import <float.h>
 #import <math.h>
 #import <stdatomic.h>
 #import <stdarg.h>
@@ -12856,8 +12857,100 @@ static void macws_log_plain_texture_surface_layout(
         static uint64_t leaseHitCount = 0;
         static uint64_t leaseNewCount = 0;
         static uint64_t leaseEvictCount = 0;
+        static dispatch_source_t leaseReaper = nil;
         dispatch_once(&leasePoolOnce, ^{
             leasePool = [NSMutableDictionary new];
+            // The compatibility pool is process-global because equal-shaped
+            // SkyLight intermediates genuinely overlap.  The allocation-time
+            // 256-MiB cap below protects live overlap, but it cannot reclaim an
+            // entry whose caller releases it after the final allocation.  The
+            // 2026-09-29 stress run runtime-confirmed this exact state in
+            // WindowServer.err: the pool reached 257 MiB/181 shapes and then
+            // remained resident while WindowServer was idle.  Reap only
+            // retain-count-proven idle entries after a reuse window; live Metal
+            // textures are never destroyed or aliased.
+            dispatch_queue_t queue = dispatch_get_global_queue(
+                QOS_CLASS_UTILITY, 0);
+            leaseReaper = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER,
+                0, 0, queue);
+            dispatch_source_set_timer(leaseReaper,
+                dispatch_time(DISPATCH_TIME_NOW, 15 * NSEC_PER_SEC),
+                15 * NSEC_PER_SEC, 5 * NSEC_PER_SEC);
+            dispatch_source_set_event_handler(leaseReaper, ^{
+                @autoreleasepool {
+                    const NSUInteger idleBudget = 64U * 1024U * 1024U;
+                    const CFTimeInterval minimumIdleAge = 15.0;
+                    NSUInteger before = 0;
+                    NSUInteger after = 0;
+                    NSUInteger freed = 0;
+                    NSUInteger evictedEntries = 0;
+                    CFTimeInterval now = (CFTimeInterval)
+                        clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) / 1.0e9;
+                    @synchronized(leasePool) {
+                        before = leasePoolBytes;
+                        while (leasePoolBytes > idleBudget) {
+                            NSString *oldestKey = nil;
+                            NSMutableArray *oldestArray = nil;
+                            NSMutableDictionary *oldestEntry = nil;
+                            CFTimeInterval oldestTime = DBL_MAX;
+                            for (NSString *candidateKey in leasePool) {
+                                NSMutableArray *candidateArray =
+                                    leasePool[candidateKey];
+                                for (NSMutableDictionary *candidateEntry in
+                                         candidateArray) {
+                                    id candidateTexture =
+                                        candidateEntry[@"texture"];
+                                    CFIndex baseline =
+                                        [candidateEntry[@"baseline"]
+                                            longLongValue];
+                                    CFIndex current = candidateTexture
+                                        ? CFGetRetainCount((__bridge CFTypeRef)
+                                              candidateTexture) : 0;
+                                    CFTimeInterval lastTime =
+                                        [candidateEntry[@"last_time"]
+                                            doubleValue];
+                                    if (candidateTexture &&
+                                        current <= baseline && lastTime > 0.0 &&
+                                        now - lastTime >= minimumIdleAge &&
+                                        lastTime < oldestTime) {
+                                        oldestTime = lastTime;
+                                        oldestKey = candidateKey;
+                                        oldestArray = candidateArray;
+                                        oldestEntry = candidateEntry;
+                                    }
+                                }
+                            }
+                            if (!oldestEntry) break;
+                            IOSurfaceRef evictedSurface = (IOSurfaceRef)
+                                [oldestEntry[@"surface"] pointerValue];
+                            NSUInteger evictedBytes =
+                                [oldestEntry[@"bytes"] unsignedIntegerValue];
+                            [oldestArray removeObjectIdenticalTo:oldestEntry];
+                            if ([oldestArray count] == 0)
+                                [leasePool removeObjectForKey:oldestKey];
+                            leasePoolBytes = evictedBytes > leasePoolBytes
+                                ? 0 : leasePoolBytes - evictedBytes;
+                            freed += evictedBytes;
+                            evictedEntries++;
+                            leaseEvictCount++;
+                            if (evictedSurface) CFRelease(evictedSurface);
+                        }
+                        after = leasePoolBytes;
+                    }
+                    if (freed != 0) {
+                        dprintf(STDERR_FILENO,
+                            "#### MACWS-MEMORY-REAP pool=plain-texture "
+                            "entries=%lu freed=%luMB before=%luMB after=%luMB "
+                            "idle-age=%.0fs\n",
+                            (unsigned long)evictedEntries,
+                            (unsigned long)(freed / (1024U * 1024U)),
+                            (unsigned long)(before / (1024U * 1024U)),
+                            (unsigned long)(after / (1024U * 1024U)),
+                            minimumIdleAge);
+                    }
+                }
+            });
+            dispatch_resume(leaseReaper);
         });
 
         IOSurfaceRef surf = NULL;
@@ -12875,6 +12968,8 @@ static void macws_log_plain_texture_surface_layout(
                     // method family before another thread can inspect it.
                     CFRetain((__bridge CFTypeRef)candidate);
                     entry[@"last"] = @(leaseClock);
+                    entry[@"last_time"] = @((CFTimeInterval)
+                        clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) / 1.0e9);
                     tex = candidate;
                     surf = (IOSurfaceRef)[entry[@"surface"] pointerValue];
                     if (macws_runtime_diagnostics_enabled()) leaseHitCount++;
@@ -12949,6 +13044,8 @@ static void macws_log_plain_texture_surface_layout(
                     entry[@"baseline"] = @(baseline);
                     entry[@"bytes"] = @(allocation);
                     entry[@"last"] = @(leaseClock);
+                    entry[@"last_time"] = @((CFTimeInterval)
+                        clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) / 1.0e9);
                     [shapeEntries addObject:entry];
                     leasePoolBytes += allocation;
                     static NSUInteger lastPlainWitnessBucket = 0;

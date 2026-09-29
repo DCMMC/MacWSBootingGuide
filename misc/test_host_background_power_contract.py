@@ -9,6 +9,7 @@ INTEROP = (ROOT / "MacWSHost" / "MacWSInteropClient.m").read_text()
 METAL_VIEW = (ROOT / "MacWSHost" / "Rendering" / "MacWSMetalView.m").read_text()
 HOSTD = (ROOT / "macwshostd" / "main.m").read_text()
 MACHOOK = (ROOT / "libmachook" / "mac_hooks.m").read_text()
+METAL_HOOKS = (ROOT / "libmachook" / "Metal_hooks.x").read_text()
 APP_INPUT = (ROOT / "libmachook" / "AppInputBridge.m").read_text()
 WORKSPACECTL = (ROOT / "macwsworkspacectl" / "main.m").read_text()
 GUI_SCRIPT = (ROOT / "layout" / "usr" / "macOS" / "bin" / "macos_gui.sh").read_text()
@@ -53,6 +54,29 @@ def test_background_scene_releases_full_resolution_drawable_pool() -> None:
 
 def test_visible_scene_uses_bounded_drawable_pool() -> None:
     assert "maximumDrawableCount = 2" in METAL_VIEW
+
+
+def test_fully_occluded_stage_manager_scene_releases_its_stream() -> None:
+    section = body(
+        HOST,
+        "- (void)synchronizeSceneOcclusionWithReason:",
+        "- (void)synchronizeMacWindowFocusWithReason:",
+    )
+    assert "MacWSReadEffectiveSceneLifecycle" in section
+    assert "occluded || backgrounded" in section
+    assert "[self suspendSceneStream]" in section
+    assert "[self resumeSceneStream]" in section
+    assert "applicationKey" not in section
+    assert "runtime-confirmed scene-occlusion" in section
+
+
+def test_plain_texture_pool_reaps_only_retain_count_proven_idle_entries() -> None:
+    assert "MACWS-MEMORY-REAP pool=plain-texture" in METAL_HOOKS
+    assert "const NSUInteger idleBudget = 64U * 1024U * 1024U" in METAL_HOOKS
+    assert "current <= baseline" in METAL_HOOKS
+    assert "now - lastTime >= minimumIdleAge" in METAL_HOOKS
+    assert 'entry[@"last_time"]' in METAL_HOOKS
+    assert "clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW)" in METAL_HOOKS
 
 
 def test_foreground_scene_respects_system_auto_lock() -> None:
