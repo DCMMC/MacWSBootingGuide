@@ -17,6 +17,97 @@ PASS. Input transport and process stability passed, while visible fluidity and
 tail latency did not yet meet the project targets. This gives subsequent work
 an exact optimization boundary.
 
+## Frame, power, thermal, and memory gate (2026-09-30)
+
+`misc/macws_frame_power_profile.py` is the representative sustained-workload
+gate for 120 Hz and power work. It aligns six witnesses in one bounded JSON
+interval:
+
+- unique producer sequence and producer completion time;
+- authenticated Host receipt, Metal submission, and real drawable-presented
+  callback for that exact sequence;
+- the MTK panel-clock callback rate and empty-tick rate;
+- one finite `powermetrics --samplers cpu_power,gpu_power,thermal` process;
+- process RSS plus `footprint`/IOSurface snapshots only at the two interval
+  boundaries, followed by an optional rendered-drawable PNG; and
+- cumulative process CPU-time deltas for the target application tree,
+  MacWSHost, WindowServer, and macwsdisplayd. In this report, 100% means one
+  fully occupied CPU core.
+
+The harness deliberately does not poll `footprint` during the scored interval.
+That walk is too invasive to run per frame, and would contaminate the power
+and cadence result it is intended to measure.
+
+Example for a 120 Hz autonomous WebGL/game workload:
+
+```bash
+python3 misc/macws_frame_power_profile.py \
+  --host 192.168.1.2 --user root --port 2222 \
+  --control-path /tmp/macpad-power-lan-ssh.sock \
+  --label aquarium-1k --seconds 30 --target-pid 12345 \
+  --require-nominal --screenshot \
+  --output /tmp/macws-aquarium-1k.json
+```
+
+Compare an A/B pair with explicit FPS and energy-per-visible-frame gates:
+
+```bash
+python3 misc/macws_compare_profiles.py \
+  /tmp/baseline.json /tmp/candidate.json \
+  --minimum-fps-gain-percent 0 \
+  --maximum-energy-regression-percent 3 \
+  --output /tmp/comparison.json
+```
+
+The comparison also reports producer FPS, delivery retention, every direct
+pipeline latency distribution, and scheduler counters. Re-presenting a stale
+IOSurface cannot improve the score: cadence counts only new producer sequences
+that reached a real Host drawable presentation callback. A valid screenshot,
+zero command errors, and a non-serious thermal state remain required witnesses.
+
+Use two scene classes rather than mixing unlike runs:
+
+- sustained animation: compare visible FPS, frame p95/p99/max, producer p99,
+  empty-tick rate, power, and mJ per unique visible frame;
+- static desktop: compare mean power and temperature, while requiring Host,
+  WindowServer, and displayd IOSurface bytes to remain flat. Static FPS and
+  energy/frame are intentionally not meaningful.
+
+The first stable 1000-fish/1024-square run on the iPad13,6 M2 path measured
+117.75 Host-visible FPS from 117.94 producer FPS, 99.79% delivery retention,
+8.34 ms p50/p95 frame intervals, and 14.91 mJ per unique visible frame. The
+same interval attributed 96.52% of one CPU core to the VSCode/Electron target
+tree, 11.30% to MacWSHost, 3.10% to WindowServer, and 0.66% to macwsdisplayd.
+These are runtime-confirmed by profile
+`aquarium-1k-target-retire-v35`; the screenshot showed intact 1000-fish
+output and the page's own 119 FPS counter.
+
+A separate Host `vmmap` witness found eight retained 1822x1468 producer
+IOSurfaces after repeated VSCode relaunches. The ownership root was the
+per-owner `_frames`/`_pendingFrames` dictionaries surviving a target PID
+change. `setTargetPID:` now retires those dictionaries and its scheduled
+frame, while already-submitted frames remain fenced by their Metal completion
+blocks. After two more VSCode relaunches the Host remained at the active
+three-surface producer pool, and a 30-second interval reported zero Host,
+WindowServer, and displayd IOSurface growth. This is the memory-stability
+gate for future transport changes.
+
+For an idle-platform control, the same Terminal scene was measured twice with
+the still-visible Aquarium first running and then temporarily stopped. With
+Aquarium running, its non-target GPU helper and renderer still consumed
+62.40% and 32.65% of one CPU core and system power was 1256 mW even though the
+Host direct scheduler correctly reported zero ticks. With that process tree
+paused, system power fell to 94.35 mW (GPU 1.2 mW), temperature fell from
+35.09 C to 35.00 C, MacWSHost used 0.23% of one core, and all measured
+IOSurface deltas stayed zero. These runtime-confirmed profiles distinguish
+real visible application work from an idle-platform regression instead of
+misattributing all device heat to WindowServer or MacWSHost.
+
+`--target-pid` is not restricted to known application names: the profiler
+always captures the selected PID and its complete descendant tree in addition
+to its standard MacWS/process roles. This matters for Terminal, native games,
+and launchers whose executable names are not predictable in advance.
+
 ## Why CAPerfHUD alone is insufficient
 
 CAPerfHUD commit `4a40c9253fc11a948fae57ec96d5d2c8dc028481`

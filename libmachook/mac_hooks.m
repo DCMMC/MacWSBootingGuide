@@ -34,6 +34,7 @@
 #import <pwd.h>
 #include <execinfo.h>
 #import "macws_host_protocol.h"
+#import "macws_process_ancestry.h"
 #import "macws_power_lifecycle.h"
 #include "macws_keyboard_state.h"
 #include "macws_atomic_pointer_click.h"
@@ -23593,6 +23594,50 @@ static uint32_t macws_coexist_completion_pace_us(void) {
     return pace_us;
 }
 
+static BOOL macws_process_descends_from_pid(pid_t process, pid_t ancestor) {
+    return MacWSProcessDescendsFrom(process, ancestor);
+}
+
+static BOOL macws_render_activity_is_authorized(
+        const MacWSRenderActivityRecord *activity, uint64_t nowNS) {
+    if (!activity || !nowNS) return NO;
+    // Rolling upgrades can leave an already-running Stray/7DTD process on the
+    // timestamp-only v1 producer until the next launch. Preserve that exact
+    // established signal; every generic producer uses v2 with an exact PID.
+    if (activity->version == MACWS_RENDER_ACTIVITY_LEGACY_VERSION)
+        return activity->producerPID == 0;
+    if ((activity->version != MACWS_RENDER_ACTIVITY_AUTHORITY_VERSION &&
+         activity->version != MACWS_RENDER_ACTIVITY_VERSION) ||
+        activity->producerPID <= 1) return NO;
+
+    static int authorityFD = -1;
+    if (authorityFD < 0) {
+        authorityFD = open(MACWS_RENDER_AUTHORITY_PATH,
+                           O_RDONLY | O_CLOEXEC);
+    }
+    if (authorityFD < 0) return NO;
+    MacWSRenderAuthorityRecord authority = {0};
+    ssize_t count = pread(authorityFD, &authority, sizeof(authority), 0);
+    static const uint64_t authorityFreshnessNS = 2 * NSEC_PER_SEC;
+    BOOL valid = count == sizeof(authority) &&
+        authority.magic == MACWS_RENDER_AUTHORITY_MAGIC &&
+        authority.version == MACWS_RENDER_AUTHORITY_VERSION &&
+        authority.size == sizeof(authority) && authority.ownerPID > 1 &&
+        authority.layerWindowID != 0 && authority.width != 0 &&
+        authority.height != 0 && nowNS >= authority.timestampNS &&
+        nowNS - authority.timestampNS <= authorityFreshnessNS &&
+        macws_process_descends_from_pid(activity->producerPID,
+                                        authority.ownerPID);
+    if (!valid) {
+        // displayd unlinks the old inode when no focused window exists. Drop
+        // our descriptor on any invalid/stale observation so a later focused
+        // generation at the same path is discoverable immediately.
+        close(authorityFD);
+        authorityFD = -1;
+    }
+    return valid;
+}
+
 static uint32_t macws_coexist_activity_pace_us(uint32_t idle_pace_us) {
     enum {
         // Drive the virtual compositor at the iPad's native 120-Hz interaction
@@ -23652,12 +23697,25 @@ static uint32_t macws_coexist_activity_pace_us(uint32_t idle_pace_us) {
         MacWSRenderActivityRecord record = {0};
         ssize_t count = pread(render_activity_fd, &record,
                               sizeof(record), 0);
-        if (count == sizeof(record) &&
+        BOOL currentRecord = count == sizeof(record) &&
+            (record.version == MACWS_RENDER_ACTIVITY_VERSION ||
+             record.version == MACWS_RENDER_ACTIVITY_LEGACY_VERSION) &&
+            record.size == sizeof(record);
+        BOOL priorRecord = count == sizeof(MacWSRenderActivityRecordV2) &&
+            (record.version == MACWS_RENDER_ACTIVITY_LEGACY_VERSION ||
+             record.version == MACWS_RENDER_ACTIVITY_AUTHORITY_VERSION) &&
+            record.size == sizeof(MacWSRenderActivityRecordV2);
+        if (priorRecord) {
+            // The v3 fields are appended, so the already-read prefix is
+            // complete. Normalize only the in-process size before applying
+            // the same authorization and cadence checks below.
+            record.size = sizeof(record);
+        }
+        if ((currentRecord || priorRecord) &&
             record.magic == MACWS_RENDER_ACTIVITY_MAGIC &&
-            record.version == MACWS_RENDER_ACTIVITY_VERSION &&
-            record.size == sizeof(record) &&
             record.targetPaceUS >= kMinimumRenderPaceUS &&
-            record.targetPaceUS <= kMaximumRenderPaceUS) {
+            record.targetPaceUS <= kMaximumRenderPaceUS &&
+            macws_render_activity_is_authorized(&record, now_ns)) {
             render_ns = record.timestampNS;
             render_pace_us = record.targetPaceUS;
             render_record_valid = YES;

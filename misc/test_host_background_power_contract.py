@@ -56,6 +56,25 @@ def test_visible_scene_uses_bounded_drawable_pool() -> None:
     assert "maximumDrawableCount = 2" in METAL_VIEW
 
 
+def test_target_change_retires_old_direct_drawable_owners() -> None:
+    setter = body(
+        METAL_VIEW,
+        "- (void)setTargetPID:",
+        "- (void)noteValidatedFullscreenCanvasForPID:",
+    )
+    assert "_scheduledCatalystDrawableFrame = nil" in setter
+    assert "[_catalystDrawableCompositor removeAllFrames]" in setter
+    assert "_directDrawableContinuousPacing = NO" in setter
+    assert "maximumDrawableCount = 2" in setter
+
+
+def test_event_driven_view_can_present_at_panel_cadence_without_idle_draws() -> None:
+    assert "self.enableSetNeedsDisplay = YES" in METAL_VIEW
+    assert "self.paused = YES" in METAL_VIEW
+    assert "UIScreen.mainScreen.maximumFramesPerSecond" in METAL_VIEW
+    assert "self.preferredFramesPerSecond = MAX(" in METAL_VIEW
+
+
 def test_fully_occluded_stage_manager_scene_releases_its_stream() -> None:
     section = body(
         HOST,
