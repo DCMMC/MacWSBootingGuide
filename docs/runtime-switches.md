@@ -40,13 +40,17 @@ Production VS Code and Chrome jobs also omit Chromium's remote-debugging port,
 pipe and remote-origin overrides; the audit rejects these command-line options
 in shipped plists, including split option/value forms. Opening a web link in
 VS Code uses the private `macws_vscode_url.sock` Unix socket and the extension's
-`simpleBrowser.show` command, not CDP. The `misc/*cdp*` and browser benchmark
-tools remain explicit diagnostics: they require a separately launched,
-temporary browser job with an operator-selected debugging endpoint. Do not
-enable that endpoint by editing or reusing the production launch job, and stop
-the diagnostic job when the bounded measurement finishes. Updating a plist
-does not alter an already loaded job or running browser; the clean arguments
-take effect on its next controlled unload/load and launch.
+`simpleBrowser.show` command, not CDP. This route serializes each close/open
+transaction and replaces its preceding socket-owned page; a bounded close
+request retires the last test page after profiling. The
+`macws_vscode_webview_lifecycle.json` receipt provides event-level cleanup
+evidence without a polling loop or per-frame writes. The `misc/*cdp*` and
+browser benchmark tools remain explicit diagnostics: they require a separately
+launched, temporary browser job with an operator-selected debugging endpoint.
+Do not enable that endpoint by editing or reusing the production launch job,
+and stop the diagnostic job when the bounded measurement finishes. Updating a
+plist does not alter an already loaded job or running browser; the clean
+arguments take effect on its next controlled unload/load and launch.
 
 ## Production invariants
 
