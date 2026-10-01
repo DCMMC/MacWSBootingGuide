@@ -117,10 +117,9 @@ iPadOS 16 的固定尺寸档位不是本方案必须接受的产品边界。开�
 判定公式：
 
 ```text
-像素匹配密度 = macOS surface backingScale / (MTK drawable pixels / Scene points)
-像素匹配所需 iPad 宽高 = macOS 最小 frame 宽高 × 像素匹配密度
-放大 +10% 所需 iPad 宽高 = macOS 最小 frame 宽高 × 像素匹配密度 × 1.10
-更多空间所需 iPad 宽高 = macOS 最小 frame 宽高 × 像素匹配密度 × 0.85
+Retina 标准密度 = 1.0 macOS logical point / iPad Scene point
+Retina 标准所需 iPad 宽高 = macOS 最小 frame 宽高
+Retina 更多空间所需 iPad 宽高 = macOS 最小 frame 宽高 × 0.85
 ```
 
 只要 Scene 的可用宽度或高度低于当前模式要求：
@@ -161,13 +160,13 @@ macOS 的显示缩放主要是显示级配置，并不适合在四个独立 Scen
 
 当前实现采用“逐窗口有效密度”：
 
-- **像素匹配 Retina（默认）**：动态使用 `macOS backingScale / UIKit effectiveDrawableScale`。最终安装二进制的 runtime witness 为 `frame=1728x1302 backing=2.000 drawable=1726x1302 content=(0.00,0.58 1004.00x755.84) density=1.16`：高度完全相等，宽度差异限制在两个物理取整像素内。同一几何版本还记录过 AppKit 收敛到 `1027x651 logical point`、surface `2054x1302`、drawable `2053x1302` 的一像素差证据。全屏或其他 Scene 合成比例变化后会重新计算，不能把 100% 或 135% 当成所有窗口状态下的固定答案。
-- **放大 +10%（可选）**：在动态像素匹配密度上乘 1.10，向 AppKit 请求更小的逻辑窗口，再由 Host 放大到 drawable。它可以让字体和控件变大，但当前仍是 Metal 线性重采样，不是逐像素 Retina；产品文案和默认迁移都不得把它描述成无损 HiDPI。
-- **更多空间 +18%**：在动态像素匹配密度上乘 0.85，使逻辑画布扩大约 `1 / 0.85 = 1.176`，再做一次受控等比缩小。它明确是可选缩放，不宣称是 1:1 原生 HiDPI。
-- DisplayStream 的真实 `backingScale` 仍用于 HiDPI 像素传输；密度模式不伪造 IOSurface 尺寸。原生 Retina 模式的验收必须记录 surface backing scale、drawable 像素尺寸和最终内容矩形三者，而不能只看控制面板的百分比文案。
+- **Retina 标准（默认）**：AppKit logical point 与 iPad Scene point 为 1:1，AppKit 继续生成真实 2× backing surface，Host 的原生 drawable 路径保持 source pixel 与 destination pixel 逐像素对应。runtime-confirmed via `MacWSHost.log`：`frame=1750x1448 backing=2.000 drawable=1750x1448 content=(0.00,0.00 875.00x724.00) density=1.00`，四个几何量严格闭合。
+- **Retina 更多空间**：密度因子为 0.85，使每个 Scene point 对应约 `1 / 0.85 = 1.176` 个 AppKit logical point；连接已有窗口时可以缩小 Scene，用户保持 Scene 尺寸时则让 AppKit 扩大 logical canvas。两条路径都保留真实 backing scale 2，因此 producer 每个 Scene point 提供约 `2 / 0.85 = 2.353` 个源像素，而 iPad drawable 最多消费 2 个像素。这个方向只会缩小超采样源，不会像已移除的 125%/150% 模式那样把不足的源像素放大。它是 macOS 风格的 scaled HiDPI，不宣称 source/destination 逐像素 1:1。
+- 已持久化的旧 `放大 +10%`、`舒适 125%`、`舒适 150%` 值在读取时统一迁移到 Retina 标准，避免升级后继续进入非原生上采样路径。
+- DisplayStream 的真实 `backingScale` 仍用于 HiDPI 像素传输；密度模式不伪造 IOSurface 尺寸。Retina 验收必须记录 surface backing scale、drawable 像素尺寸和最终内容矩形三者，而不能只看控制面板文案。
 - 切换模式会恢复视口缩放、重新计算小窗口门槛，然后防抖请求 AppKit 重排。
 
-因此，这里实现的是“每个 Scene 的有效信息密度”，不是修改 macOS 全局 DPI。真正“字体更大且仍逐像素锐利”需要在 AppKit/Core Animation 上游提高该窗口的 backing scale，并让扩大后的 backing surface 继续精确匹配 drawable；继续增大 Host 缩放系数做不到这一点。将来若验证出 macOS 13.4 可安全逐窗口设置 backing scale，必须先证明窗口纹理、命中测试、菜单和跨屏拖动四者一致，才能替换当前方案。
+因此，这里实现的是“每个 Scene 的有效信息密度”，不是修改 macOS 全局 DPI。固定 drawable 上“字体更大且仍逐像素锐利”需要在 AppKit/Core Animation 上游把窗口 backing scale 提高到 2 以上；继续减小 logical canvas 再放大 2× source 做不到这一点，所以产品不再提供 125%/150% 档。将来若验证出 macOS 13.4 可安全逐窗口设置更高 backing scale，必须先证明窗口纹理、命中测试、菜单和跨屏拖动四者一致，才能重新引入更大文字模式。
 
 ### 6. 触摸与妙控键盘
 
@@ -621,9 +620,9 @@ git diff --check
 至少选择 Terminal、Finder/系统应用、Electron、固定尺寸面板各一个：
 
 1. 记录应用发布的真实 min frame。
-2. 在像素匹配 Retina 下，把 Scene 调到门槛 `+1 point`：不得遮罩，应用布局完整，并记录 source/drawable 像素是否 1:1。
+2. 在 Retina 标准下，把 Scene 调到门槛 `+1 point`：不得遮罩，应用布局完整，并记录 source/drawable 像素是否 1:1。
 3. 调到门槛 `-1 point`：必须整窗遮罩，所有 macOS 输入停止。
-4. 切换更多空间 +18%：若达到新门槛，遮罩撤下，AppKit 发生一次合并后的重排。
+4. 切换 Retina 更多空间：若达到新门槛，遮罩撤下，AppKit 发生一次合并后的重排；记录 producer 像素数不得小于 drawable 像素数。
 5. 固定尺寸窗口：不发送 resize；Scene 过小时遮罩。
 6. 应用运行中改变 `contentMinSize`：500–1000 ms 内目录和遮罩更新。
 7. 快速拖过所有台前调度档位：不能形成 resize 循环、日志风暴或持续边距；交接期旧帧可以短暂留边，但任何一帧都不能拉伸变形。
