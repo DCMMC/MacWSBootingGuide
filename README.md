@@ -39,6 +39,10 @@ Current user-visible capabilities include:
 - Touch, pointer, window move/resize, Mission Control gestures, Magic Keyboard,
   software shortcuts, and iOS Chinese IME committed into the exact AppKit
   window.
+- A Game Camera input mode with iPadOS pointer lock, unbounded Magic Keyboard
+  and direct-touch camera motion, automatic activation from an application's
+  relative-mouse request, and click calibration independent of a game's
+  dynamic render resolution.
 - Clipboard, files, drag and drop, open/save panels, location, audio, Retina
   Standard/Larger UI modes, lock/sleep coordination, and bounded thermal
   telemetry.
