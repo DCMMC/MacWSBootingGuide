@@ -86,6 +86,16 @@ echo "$MACWS_LOCAL_OUTPUT"
         self.assertNotIn('MACWS_AUDIO_RENDER_BRIDGE',
                          job.get('EnvironmentVariables', {}))
 
+    def test_audio_shared_cache_hooks_use_dyld_interposition(self):
+        bridge = (ROOT / 'libmachook/AudioRenderBridge.m').read_text()
+        self.assertNotIn('#import <substrate.h>', bridge)
+        self.assertNotIn('MSHookFunction(', bridge)
+        self.assertIn('dlsym(RTLD_NEXT, "AudioUnitSetProperty")', bridge)
+        for entry in (
+                'AudioUnitSetProperty', 'AudioOutputUnitStart',
+                'AudioOutputUnitStop', 'AudioComponentInstanceDispose'):
+            self.assertIn(f'DYLD_INTERPOSE(MacWS{entry}', bridge)
+
     def test_m2_software_audio_cadence_excludes_callback_work(self):
         bridge = (ROOT / 'libmachook/AudioRenderBridge.m').read_text()
         self.assertIn('strcmp(machine, "iPad14,5") == 0;', bridge)

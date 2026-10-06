@@ -1113,7 +1113,11 @@ ensure_navigation_spaces() {
         return 1
     }
     rm -f "$LOGDIR/navigation-spaces.log"
-    /var/jb/usr/bin/timeout -k 2 20 \
+    # This late one-shot controller needs SkyLight IPC but creates no Metal
+    # device, input endpoint, or application window. Keep the static
+    # compatibility interposes under the exact headless-utility constructor
+    # scope used by the wallpaper controller below.
+    MACWS_UTILITY_PROCESS=1 /var/jb/usr/bin/timeout -k 2 20 \
         "$CHROOTEXEC" 0 0 "$ROOTFS" "$WORKSPACECTL_BIN" \
         ensure-navigation-spaces > "$LOGDIR/navigation-spaces.log" 2>&1
     rc=$?
@@ -1242,8 +1246,8 @@ start_ws_dependents_after_replacement() {
         workspace_waited=$((workspace_waited + 1))
     done
     ensure_navigation_spaces || return 1
-    refresh_dock_after_navigation_spaces || return 1
     apply_workspace_wallpaper || return 1
+    refresh_dock_after_navigation_spaces || return 1
     # Full-screen Mission Control drags must be posted from OSXvnc's real
     # WindowServer/CGS client. Keep that process alive even when remote RFB is
     # disabled; write_plists then binds its RFB listener to localhost only.
@@ -1579,13 +1583,17 @@ restore_cold_boot_trust() {
         "$ROOTFS/System/Library/Frameworks/CydiaSubstrate.framework/CydiaSubstrate" \
         /var/jb/Library/Frameworks/CydiaSubstrate.framework/CydiaSubstrate \
         "$ROOTFS/bin/bash" \
+        "$ROOTFS$DEFAULTS_BIN" \
         "$ROOTFS/usr/sbin/filecoordinationd" \
         "$ROOTFS/System/Library/CoreServices/launchservicesd" \
         "$ROOTFS/System/Library/CoreServices/launchservicesd.dylib" \
+        "$ROOTFS$LSREGISTER_BIN" \
         "$ROOTFS/System/Library/PrivateFrameworks/SkyLight.framework/Versions/A/Resources/CursorAsset" \
         "$ROOTFS/System/Library/PrivateFrameworks/SkyLight.framework/Versions/A/Resources/CursorAsset_base" \
         "$ROOTFS$P_SHAREDFILELISTD" \
         "$ROOTFS/System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer" \
+        "$ROOTFS$VNC_BIN" \
+        "$ROOTFS$TERM_BIN" \
         "$ROOTFS/System/Library/PrivateFrameworks/SystemStatusServer.framework/Support/systemstatusd" \
         "$ROOTFS/usr/local/libexec/macws-cfprefsd" \
         "$ROOTFS/usr/sbin/coreaudiod" \
@@ -1768,6 +1776,9 @@ ensure_cfprefsd_dirhelper_tree() {
     local temporary_leaf="$temporary_user/TemporaryItems"
     local temporary_mobile="$temporary_root/folders.501"
     local temporary_mobile_leaf="$temporary_mobile/TemporaryItems"
+    local root_home="$ROOTFS/private/var/root"
+    local root_library="$root_home/Library"
+    local root_preferences="$root_library/Preferences"
     local mobile_home="$ROOTFS/Users/mobile"
     local mobile_library="$mobile_home/Library"
     local mobile_preferences="$mobile_library/Preferences"
@@ -1777,9 +1788,11 @@ ensure_cfprefsd_dirhelper_tree() {
     local mobile_temp_dir="$mobile_user_root/T"
 
     mkdir -p "$temporary_leaf" "$temporary_mobile_leaf" \
+        "$root_preferences" \
         "$mobile_preferences" "$mobile_user_dir" "$mobile_cache_dir" \
         "$mobile_temp_dir" || return 1
     chown root:wheel "$temporary_root" "$temporary_user" "$temporary_leaf" \
+        "$root_home" "$root_library" "$root_preferences" \
         2>/dev/null || true
     chown 501:501 "$temporary_mobile" "$temporary_mobile_leaf" \
         "$mobile_home" "$mobile_library" "$mobile_preferences" \
@@ -1788,6 +1801,7 @@ ensure_cfprefsd_dirhelper_tree() {
         2>/dev/null || return 1
     chmod 1311 "$temporary_root" || return 1
     chmod 0700 "$temporary_user" "$temporary_leaf" || return 1
+    chmod 0700 "$root_home" "$root_library" "$root_preferences" || return 1
     chmod 0700 "$temporary_mobile" "$temporary_mobile_leaf" \
         "$mobile_preferences" || return 1
     chmod 0755 "$mobile_home" "$mobile_library" || return 1
@@ -3881,7 +3895,12 @@ apply_workspace_wallpaper() {
         return 1
     fi
     rm -f "$LOGDIR/workspace-controller.log"
-    /var/jb/usr/bin/timeout -k 2 20 \
+    # This one-shot controller performs an AppKit/NSWorkspace IPC and never
+    # creates a Metal device, input endpoint, or application window. Preserve
+    # the static syscall/bootstrap interposes under the existing exact
+    # headless-utility constructor contract. The caller runs it before Dock
+    # rebinds its new workspace generation.
+    MACWS_UTILITY_PROCESS=1 /var/jb/usr/bin/timeout -k 2 20 \
         "$CHROOTEXEC" 0 0 "$ROOTFS" "$WORKSPACECTL_BIN" \
         set-wallpaper "$WORKSPACE_WALLPAPER" \
         > "$LOGDIR/workspace-controller.log" 2>&1
@@ -4257,13 +4276,19 @@ repair_desktop() {
             "$FINDER_DESKTOP_LABEL" "Finder desktop owner" || return 1
     fi
 
+    # Apply through the current, responsive SkyLight session before replacing
+    # Dock.  On iPad14,3 / 20F75, a fresh AppKit client launched after the
+    # replacement Dock blocked in SLSInitialize/get_session_port; a sample of
+    # that exact process retained all 4,203 main-thread observations in
+    # mach_msg2_trap.  The setting is persistent, so the replacement Dock
+    # consumes it when loaded.
+    apply_workspace_wallpaper || return 1
     reload_desktop_job "$DOCK_PLIST" "$DOCK_LABEL" \
         "Dock and desktop-picture owner" || return 1
     reload_desktop_job "$SYSTEMUI_PLIST" "$SYSTEMUI_LABEL" \
         "macOS SystemUIServer" || return 1
     reload_desktop_job "$CONTROL_CENTER_PLIST" "$CONTROL_CENTER_LABEL" \
         "macOS Control Center" || return 1
-    apply_workspace_wallpaper || return 1
     wait_for_desktop_input_route || return 1
     log "TIMING desktop-repair stage=desktop-agents-wallpaper seconds=$((SECONDS - stage_started)) total=$((SECONDS - repair_started))"
     stage_started=$SECONDS
@@ -4973,10 +4998,13 @@ start_macos() {
     # get_session_port. They are now bounded and run only after LaunchServices,
     # WindowServer, and all real Aqua session owners have explicit readiness
     # witnesses. Establish two adjacent native Spaces for continuous three-
-    # finger navigation, then apply the persisted high-resolution wallpaper.
+    # finger navigation. Apply the persisted high-resolution wallpaper while
+    # this SkyLight generation is responsive, then rebind Dock to the completed
+    # catalog. A new AppKit client launched after that rebind can block in the
+    # session-port lookup on iPad14,3 / 20F75.
     ensure_navigation_spaces || return 1
-    refresh_dock_after_navigation_spaces || return 1
     apply_workspace_wallpaper || return 1
+    refresh_dock_after_navigation_spaces || return 1
     wait_for_desktop_input_route || return 1
     log "TIMING start-macos stage=aqua-spaces-wallpaper seconds=$((SECONDS - macos_stage_started)) total=$((SECONDS - macos_started))"
     macos_stage_started=$SECONDS

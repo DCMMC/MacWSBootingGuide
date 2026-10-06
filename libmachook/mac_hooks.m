@@ -10802,7 +10802,6 @@ static void macws_new_vnc_handle_mouse(id self, SEL command,
     macws_vnc_last_point = point;
 }
 
-static IOSurfaceRef macws_vnc_src = NULL;
 // Returns true only when a complete mmap frame was copied.  A test gradient is
 // diagnostic output and deliberately does not count as a real shared frame.
 static bool macws_vnc_fill_test(int rectX, int rectY,
@@ -15845,7 +15844,7 @@ MACWS_CLIENT_PLANE_GETTER(AddressFormat, uint32_t, uint32_t);
     static Return (*g_macws_iosurface_plane_##Name)(id, SEL, NSUInteger); \
     static Return macws_iosurface_plane_##Name(id surface, SEL cmd, NSUInteger plane) { \
         uintptr_t value; \
-        if (macws_iosurface_native_plane_value(surface, plane, \
+        if (macws_iosurface_native_plane_value((__bridge IOSurfaceRef)surface, plane, \
                 MacWSNativePlane##Name, &value)) return (Return)value; \
         return g_macws_iosurface_plane_##Name(surface, cmd, plane); \
     }
@@ -16770,13 +16769,11 @@ IOSurfaceRef IOSurfaceCreate_safe(CFDictionaryRef properties_cf) {
         if (my_n % 250 == 1 /* 1, 251, 501, ... — keep low under steady state */) {
             Dl_info di;
             void *ra1 = __builtin_return_address(0);
-            void *ra2 = __builtin_return_address(1);
-            const char *sym1 = "?", *sym2 = "?";
+            const char *sym1 = "?";
             if (dladdr(ra1, &di) && di.dli_sname) sym1 = di.dli_sname;
-            if (dladdr(ra2, &di) && di.dli_sname) sym2 = di.dli_sname;
             fprintf(stderr,
-                "#### IOSURF_STATS n=%lu cumulative_bytes=%lu MB this_size=%zu KB caller1=%s caller2=%s\n",
-                my_n, my_total / (1024*1024), my_bytes / 1024, sym1, sym2);
+                "#### IOSURF_STATS n=%lu cumulative_bytes=%lu MB this_size=%zu KB caller=%s\n",
+                my_n, my_total / (1024*1024), my_bytes / 1024, sym1);
         }
     }
     // CoreImage sometimes passes a CFDictionary whose -objectForKey: is not a
@@ -17123,13 +17120,86 @@ cleanup:
 // IOKit
 io_connect_t iogpuClients[10];
 int iogpuClientsCount = 0;
-static BOOL IOConnectIsIOGPU(io_connect_t client) {
-    for(int i = 0; i < iogpuClientsCount; ++i) {
-        if(iogpuClients[i] == client) {
-            return YES;
+typedef enum {
+    MacWSIOGPUDeviceInfoUnknown = 0,
+    MacWSIOGPUDeviceInfoLegacy70 = 1,
+    MacWSIOGPUDeviceInfoNative78 = 2,
+} MacWSIOGPUDeviceInfoProfile;
+static _Atomic uint8_t iogpuDeviceInfoProfiles[10];
+
+static int MacWSIOGPUClientIndex(io_connect_t client) {
+    for (int i = 0; i < iogpuClientsCount; ++i) {
+        if (iogpuClients[i] == client) return i;
+    }
+    return -1;
+}
+
+static MacWSIOGPUDeviceInfoProfile
+MacWSIOGPUDeviceInfoProfileForClient(io_connect_t client) {
+    int index = MacWSIOGPUClientIndex(client);
+    if (index < 0) return MacWSIOGPUDeviceInfoUnknown;
+    return (MacWSIOGPUDeviceInfoProfile)atomic_load_explicit(
+        &iogpuDeviceInfoProfiles[index], memory_order_acquire);
+}
+
+static void MacWSRecordIOGPUDeviceInfoProfile(
+    io_connect_t client, MacWSIOGPUDeviceInfoProfile profile) {
+    int index = MacWSIOGPUClientIndex(client);
+    if (index < 0) return;
+    atomic_store_explicit(&iogpuDeviceInfoProfiles[index], profile,
+                          memory_order_release);
+}
+
+// Establish the kernel's read-only device-info contract as soon as an AGX
+// user client is published. Waiting for AGXMetal to issue selector 0x100 was
+// runtime-confirmed too late on iPad13,11 / 20E252: the first type-0 request
+// arrived while the profile was still unknown, inherited the legacy layout,
+// and failed with 0xe00002be. Probe only the two exact known shapes and record
+// the result on this connection; no model/build guess or process-global ABI is
+// used. Unknown failures remain unknown and must not enable any translator.
+static void MacWSProbeIOGPUDeviceInfoProfile(io_connect_t client) {
+    uint8_t output[0x78] = {0};
+    size_t output_size = sizeof(output);
+    IOReturn first_result = IOConnectCallStructMethod(
+        client, 0x100, NULL, 0, output, &output_size);
+    size_t first_actual_size = output_size;
+    if (first_result == KERN_SUCCESS) {
+        MacWSRecordIOGPUDeviceInfoProfile(
+            client, MacWSIOGPUDeviceInfoNative78);
+        dprintf(STDERR_FILENO,
+            "#### AGX device-info ABI probe conn=%u requested=0x78 "
+            "actual=%#zx result=%#x selected=native-0x78\n",
+            client, output_size, first_result);
+        return;
+    }
+
+    IOReturn retry_result = first_result;
+    if (first_result == kIOReturnBadArgument) {
+        memset(output, 0, sizeof(output));
+        output_size = 0x70;
+        retry_result = IOConnectCallStructMethod(
+            client, 0x100, NULL, 0, output, &output_size);
+        if (retry_result == KERN_SUCCESS) {
+            MacWSRecordIOGPUDeviceInfoProfile(
+                client, MacWSIOGPUDeviceInfoLegacy70);
+            dprintf(STDERR_FILENO,
+                "#### AGX device-info ABI probe conn=%u requested=0x78 "
+                "actual=%#zx result=%#x fallback=0x70 actual=%#zx "
+                "result=%#x selected=legacy-0x70\n",
+                client, first_actual_size, first_result,
+                output_size, retry_result);
+            return;
         }
     }
-    return NO;
+
+    dprintf(STDERR_FILENO,
+        "#### AGX device-info ABI probe conn=%u requested=0x78 "
+        "actual=%#zx result=%#x fallback-result=%#x selected=unknown\n",
+        client, first_actual_size, first_result, retry_result);
+}
+
+static BOOL IOConnectIsIOGPU(io_connect_t client) {
+    return MacWSIOGPUClientIndex(client) >= 0;
 }
 static uint32_t IOConnectTranslateSelector(io_connect_t client, uint32_t selector) {
     if(IOConnectIsIOGPU(client)) {
@@ -22452,6 +22522,28 @@ static BOOL macws_submit_with_forward_progress_bridge(
 
 __thread struct MacWSNoCopyScope *g_macws_nocopy_scope;
 
+// Ventura's AGXMetal13_3 requests a 0x78-byte selector-0x100 device-info
+// record. Runtime-confirmed native probes:
+//   * iPadOS 16.0/16.3 rejects 0x78 and accepts the legacy 0x70 shape.
+//   * iPadOS 16.5.1 / 20F75 accepts exactly 0x78 and rejects 0x70.
+// Negotiate at the read-only query boundary: preserve the producer's native
+// request first and retry the known legacy size only after the kernel returns
+// kIOReturnBadArgument. This is capability-based and fail-closed; other
+// failures retain their original status and are never hidden.
+static BOOL MacWSIOGPUDeviceInfoNeedsLegacyRetry(io_connect_t client,
+                                                  uint32_t selector,
+                                                  size_t requested_output,
+                                                  IOReturn result) {
+    if (!IOConnectIsIOGPU(client) || selector != 0x100 ||
+        requested_output != 0x78) return NO;
+    if (result == KERN_SUCCESS) {
+        MacWSRecordIOGPUDeviceInfoProfile(
+            client, MacWSIOGPUDeviceInfoNative78);
+        return NO;
+    }
+    return result == kIOReturnBadArgument;
+}
+
 bool MacWSAGXNoCopyABIReady(const void *agx_initializer,
                            const void *iogpu_initializer) {
     static const uint8_t agx_uuid[16] = {
@@ -22479,7 +22571,7 @@ IOReturn IOConnectCallMethod_new(io_connect_t client, uint32_t selector, const u
     uint32_t orig = selector;
     int skip = caller_is_libmachook(__builtin_return_address(0));
     if (!skip) selector = IOConnectTranslateSelector(client, selector);
-    if(IOConnectIsIOGPU(client) && selector == 0x100 && outStructCnt && *outStructCnt == 0x78) *outStructCnt = 0x70;
+    size_t device_info_requested_output = outStructCnt ? *outStructCnt : 0;
     // sel=0x9 (ResCreate): WAS bumping outStructCnt 0x50 → 0x10000 here based
     // on a misread of `IOGPUDevice::new_resource <+76>`. Standalone iOS-native
     // test (misc/agx_iogpu_probe.c + misc/sel9_test_macos.c) proves the OPPOSITE:
@@ -22594,7 +22686,10 @@ IOReturn IOConnectCallMethod_new(io_connect_t client, uint32_t selector, const u
             ? *(const uint32_t *)(src + 0x48) : 0;
         int patched = 0;
         memcpy(shadowbuf, inStruct, inStructCnt);
-        if(bc == 0 && agxType == 0) {
+        MacWSIOGPUDeviceInfoProfile device_info_profile =
+            MacWSIOGPUDeviceInfoProfileForClient(client);
+        if (bc == 0 && agxType == 0 &&
+            device_info_profile == MacWSIOGPUDeviceInfoLegacy70) {
             // Heap byte-count fixup (only valid for type=0 heap creation;
             // type=0x80 client-buffer path uses args+0x40 as the end VA,
             // not a size). Prefer the exact length captured at the upstream
@@ -22659,6 +22754,21 @@ IOReturn IOConnectCallMethod_new(io_connect_t client, uint32_t selector, const u
                     "+0x48 span=%#llx +0x58 low32=%#x -> +0x40=%#llx\n",
                     resDiagSequence, (unsigned long long)mac_span, sz32,
                     (unsigned long long)nb);
+            }
+        } else if (bc == 0 && agxType == 0 &&
+                   device_info_profile == MacWSIOGPUDeviceInfoNative78 &&
+                   macws_runtime_diagnostics_enabled()) {
+            static _Atomic unsigned int native_type0_count = 0;
+            unsigned int sequence =
+                atomic_fetch_add(&native_type0_count, 1) + 1;
+            if (sequence <= 8) {
+                fprintf(stderr,
+                    "#### AGXIOC type0 native-0x78 preserve #%u: "
+                    "+0x40=%#llx +0x48=%#llx +0x50=%#llx +0x58=%#llx\n",
+                    sequence, (unsigned long long)bc,
+                    (unsigned long long)*(const uint64_t *)(src + 0x48),
+                    (unsigned long long)*(const uint64_t *)(src + 0x50),
+                    (unsigned long long)*(const uint64_t *)(src + 0x58));
             }
         }
         // type=0 with args+0x40 already set (high bit pattern = pinned-VA
@@ -22993,7 +23103,13 @@ IOReturn IOConnectCallMethod_new(io_connect_t client, uint32_t selector, const u
         // iOS sends at +0x58.  Therefore +0x58 must be reconstructed from the
         // current IOSurface's properties, not blindly zeroed.  Presence of
         // that span also supplies native layout-word bit 33.
-        if(agxType == 0x82) {
+        // Runtime-confirmed on iPad13,11 / 20E252 with the native Metal
+        // IOSurface control: native-0x78 already carries the kernel's exact
+        // +0x38/+0x50/+0x58 resource shape. Applying the 16.3 field shift to
+        // that request returned 0xe00002c2. Translate this type only after the
+        // connection has positively negotiated the legacy-0x70 profile.
+        if (agxType == 0x82 &&
+            device_info_profile == MacWSIOGPUDeviceInfoLegacy70) {
             uint32_t f14 = *(const uint32_t *)(src + 0x14);
             uint64_t old_40 = *(const uint64_t *)(src + 0x40);
             uint64_t old_50 = *(const uint64_t *)(src + 0x50);
@@ -23093,9 +23209,28 @@ IOReturn IOConnectCallMethod_new(io_connect_t client, uint32_t selector, const u
         selector == 0x1a;
     int submit_diag_active = translated_agx_submit &&
         macws_submit_diag_enabled();
-    // The byte-validated native-AGX ABI translation is part of submitting
-    // this foreign producer's command buffer, independent of debug files.
-    int submit_fix_active = translated_agx_submit;
+    // The byte-validated command compactor is the legacy-0x70 ABI adapter.
+    // Runtime-confirmed on iPad13,11 / 20E252: preserving native-0x78 command
+    // storage produced 13 completed final composites (status=4, clean=13,
+    // error=0), while applying the legacy compactor produced Metal internal
+    // errors 0x102/0x103. Unknown profiles also stay unmodified and fail at
+    // the real boundary instead of silently selecting the legacy ABI.
+    MacWSIOGPUDeviceInfoProfile submit_device_info_profile =
+        MacWSIOGPUDeviceInfoProfileForClient(client);
+    int submit_fix_active = translated_agx_submit &&
+        submit_device_info_profile == MacWSIOGPUDeviceInfoLegacy70;
+    if (translated_agx_submit &&
+        submit_device_info_profile == MacWSIOGPUDeviceInfoNative78 &&
+        macws_runtime_diagnostics_enabled()) {
+        static _Atomic unsigned int native_submit_count = 0;
+        unsigned int sequence = atomic_fetch_add(&native_submit_count, 1) + 1;
+        if (sequence <= 8) {
+            dprintf(STDERR_FILENO,
+                "#### AGX native-0x78 SUBMIT-ABI #%u: command storage "
+                "preserved; legacy-0x70 compactor not applicable\n",
+                sequence);
+        }
+    }
     // The ABI translator and the byte-dump diagnostic are independent gates.
     // Previously, macws_kcmd_fix was silently inert unless submit_diag also
     // existed, which made the same PF80 submit complete in exclusive tests but
@@ -23205,6 +23340,24 @@ IOReturn IOConnectCallMethod_new(io_connect_t client, uint32_t selector, const u
         r = IOConnectCallMethod(client, selector, in, inCnt,
                                 inStruct, inStructCnt,
                                 out, outCnt, outStruct, outStructCnt);
+    }
+    if (!submit_forward_progress_bridge_used && outStructCnt &&
+        MacWSIOGPUDeviceInfoNeedsLegacyRetry(
+            client, selector, device_info_requested_output, r)) {
+        *outStructCnt = 0x70;
+        r = IOConnectCallMethod(client, selector, in, inCnt,
+                                inStruct, inStructCnt,
+                                out, outCnt, outStruct, outStructCnt);
+        if (r == KERN_SUCCESS) {
+            MacWSRecordIOGPUDeviceInfoProfile(
+                client, MacWSIOGPUDeviceInfoLegacy70);
+        }
+        if (r != KERN_SUCCESS || macws_runtime_diagnostics_enabled()) {
+            dprintf(STDERR_FILENO,
+                "#### AGXIOC DEVICE-INFO legacy-retry API=method "
+                "requested=0x78 retried=0x70 returned=%#zx result=%#x\n",
+                *outStructCnt, r);
+        }
     }
     if (submit_timing_sequence && submit_timing_sequence <= 1024) {
         struct timespec submit_timing_after = {0};
@@ -23523,7 +23676,6 @@ IOReturn IOConnectCallMethod_new(io_connect_t client, uint32_t selector, const u
                 for (int i = 0; i < nf; i++) {
                     Dl_info di;
                     if (dladdr(frames[i], &di) && di.dli_fname) {
-                        uintptr_t base = (uintptr_t)di.dli_fbase;
                         const char *fname = strrchr(di.dli_fname, '/');
                         fname = fname ? fname + 1 : di.dli_fname;
                         fprintf(stderr, "####     [%d] %p %s+%#llx (%s)\n",
@@ -24086,6 +24238,7 @@ IOReturn IOConnectCallStructMethod_new(io_connect_t client, uint32_t selector, c
     int struct_skip = caller_is_libmachook(__builtin_return_address(0));
     if (!struct_skip)
         selector = IOConnectTranslateSelector(client, selector);
+    size_t device_info_requested_output = outStructCnt ? *outStructCnt : 0;
     // macOS 13.4 kern_SwapEnd passes conn+0x18 as its 0x46c-byte selector-5
     // input. SwapBegin stored the active swap ID at conn+0x68, hence input+0x50.
     // In coexistence, cancel that exact swap through the RE-confirmed iOS ABI
@@ -24151,16 +24304,23 @@ IOReturn IOConnectCallStructMethod_new(io_connect_t client, uint32_t selector, c
 
         return cancel_r;
     }
-    // AGX GPU device-info query (method 256 / setupImmediate): macOS 13.4 asks for
-    // a 0x78 (120-byte) output struct, but the iOS 16.x GPU userclient hard-checks
-    // the output size at 0x70 (112). The 8-byte mismatch -> kIOReturnBadArgument and
-    // AGX device init aborts. Clamp to what the iOS kernel accepts. (Found by diffing
-    // macOS AGXMetal13_3 727C250E vs iOS BA327004 in Ghidra: both selector 0x100,
-    // outStructCnt 0x78 vs 0x70.)
-    if(IOConnectIsIOGPU(client) && selector == 0x100 && outStructCnt && *outStructCnt == 0x78) {
-        *outStructCnt = 0x70;
-    }
     IOReturn r = IOConnectCallStructMethod(client, selector, inStruct, inStructCnt, outStruct, outStructCnt);
+    if (outStructCnt && MacWSIOGPUDeviceInfoNeedsLegacyRetry(
+            client, selector, device_info_requested_output, r)) {
+        *outStructCnt = 0x70;
+        r = IOConnectCallStructMethod(client, selector, inStruct, inStructCnt,
+                                      outStruct, outStructCnt);
+        if (r == KERN_SUCCESS) {
+            MacWSRecordIOGPUDeviceInfoProfile(
+                client, MacWSIOGPUDeviceInfoLegacy70);
+        }
+        if (r != KERN_SUCCESS || macws_runtime_diagnostics_enabled()) {
+            dprintf(STDERR_FILENO,
+                "#### AGXIOC DEVICE-INFO legacy-retry API=struct "
+                "requested=0x78 retried=0x70 returned=%#zx result=%#x\n",
+                *outStructCnt, r);
+        }
+    }
     // Read-only witness for the exclusive-mode control experiment.  The exact
     // 0x46c-byte shape is the macOS 13.4 kern_SwapEnd call verified above;
     // coexistence returns from the narrow SwapCancel branch before reaching
@@ -24549,9 +24709,15 @@ kern_return_t IOServiceOpen_new(io_service_t service, task_port_t owningTask, ui
         if (borrowed != MACH_PORT_NULL) {
             *connect = (io_connect_t)borrowed;
             assert(iogpuClientsCount < sizeof(iogpuClients) / sizeof(iogpuClients[0]));
-            iogpuClients[iogpuClientsCount++] = *connect;
+            int client_index = iogpuClientsCount++;
+            iogpuClients[client_index] = *connect;
+            atomic_store(&iogpuDeviceInfoProfiles[client_index],
+                         MacWSIOGPUDeviceInfoUnknown);
             fprintf(stderr, "#### IOServiceOpen agx BORROWED connect=%u (type was %u)\n",
                 *connect, type);
+            if (macws_agx_native_enabled()) {
+                MacWSProbeIOGPUDeviceInfoProfile(*connect);
+            }
             return KERN_SUCCESS;
         }
         // Fallback to normal path if XPC borrow failed.
@@ -24590,9 +24756,15 @@ kern_return_t IOServiceOpen_new(io_service_t service, task_port_t owningTask, ui
     kern_return_t result = IOServiceOpen(service, owningTask, type, connect);
     assert(iogpuClientsCount < sizeof(iogpuClients) / sizeof(iogpuClients[0]));
     if(result == KERN_SUCCESS && service == agxService) {
-        iogpuClients[iogpuClientsCount++] = *connect;
+        int client_index = iogpuClientsCount++;
+        iogpuClients[client_index] = *connect;
+        atomic_store(&iogpuDeviceInfoProfiles[client_index],
+                     MacWSIOGPUDeviceInfoUnknown);
         fprintf(stderr, "#### debugbydcmmc IOServiceOpen agx connect=%d type=%#x (requested=%#x)\n",
             *connect, type, requested_type);
+        if (macws_agx_native_enabled()) {
+            MacWSProbeIOGPUDeviceInfoProfile(*connect);
+        }
     }
     return result;
 }

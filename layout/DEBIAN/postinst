@@ -40,6 +40,43 @@ ANGLE_ASSET_SOURCE_DIR=/var/jb/usr/macOS/share/angle
 ANGLE_ASSET_TARGET_DIR="$ROOTFS/usr/local/share/macws/angle"
 SUBLIME_SETTINGS_TEMPLATE=/var/jb/usr/macOS/share/sublime/Preferences.sublime-settings
 
+normalize_restored_runtime_metadata() {
+    # A rootfs restored through a NAS can retain the NAS account's numeric
+    # 1000:1001 owner. Runtime-confirmed on iPad13,11/iPadOS 16.4.1: dyld then
+    # refused to map Ventura's shared cache and codesign could not resolve
+    # cache-resident libTLE; after restoring uid 0 on these exact two cache
+    # files the same codesign transaction advanced normally. Do not recurse
+    # through the 29-GB rootfs or rewrite unrelated user/application ownership.
+    cache_root="$ROOTFS/System/Volumes/Preboot/Cryptexes/OS/System/Library/dyld"
+    for cache_path in \
+        "$cache_root/dyld_shared_cache_arm64e" \
+        "$cache_root/dyld_shared_cache_arm64e.01"; do
+        [ -e "$cache_path" ] || continue
+        [ -f "$cache_path" ] && [ ! -L "$cache_path" ] || return 1
+        chown root:wheel "$cache_path" || return 1
+        chmod 0755 "$cache_path" || return 1
+    done
+
+    # The boot-trust and Settings verifiers intentionally reject state owned
+    # by another uid or writable by group/other. Restore only their bounded
+    # project-private directories and immediate regular files. Both failures
+    # were runtime-confirmed after the same NAS restore.
+    for state_dir in \
+        "$ROOTFS/var/db/macws/boot-trust" \
+        "$ROOTFS/var/db/macws/settings-runtime"; do
+        [ -d "$state_dir" ] || continue
+        [ ! -L "$state_dir" ] || return 1
+        chown root:wheel "$state_dir" || return 1
+        chmod 0700 "$state_dir" || return 1
+        for state_path in "$state_dir"/*; do
+            [ -e "$state_path" ] || continue
+            [ -f "$state_path" ] && [ ! -L "$state_path" ] || continue
+            chown root:wheel "$state_path" || return 1
+            chmod 0600 "$state_path" || return 1
+        done
+    done
+}
+
 # The chroot executes patched macOS dyld/shared-cache images whose fixed
 # CodeDirectories cannot be made admissible by CoreTrust-signing ordinary
 # Mach-O files.  A full jailbreak trustcache backend is therefore structural,
@@ -51,6 +88,11 @@ if [ ! -x /var/jb/usr/bin/jbctl ]; then
     echo 'macOS Host install failed: a full Dopamine-compatible jailbreak with /var/jb/usr/bin/jbctl is required; NathanLR cannot admit the macOS shared-cache closure.' >&2
     exit 1
 fi
+
+normalize_restored_runtime_metadata || {
+    echo 'macOS Host install failed: restored rootfs runtime metadata is unsafe.' >&2
+    exit 1
+}
 
 # This is the dpkg maintainer entry point; build_on_ios deliberately does not
 # repeat the separate deep rootfs repair script. Audit the boot-scanned launch
@@ -591,6 +633,9 @@ ensure_private_cfprefsd() {
     cf_temporary_leaf="$cf_temporary_user/TemporaryItems"
     cf_temporary_mobile="$cf_temporary_root/folders.501"
     cf_temporary_mobile_leaf="$cf_temporary_mobile/TemporaryItems"
+    cf_root_home="$ROOTFS/private/var/root"
+    cf_root_library="$cf_root_home/Library"
+    cf_root_preferences="$cf_root_library/Preferences"
     cf_mobile_home="$ROOTFS/Users/mobile"
     cf_mobile_library="$cf_mobile_home/Library"
     cf_mobile_preferences="$cf_mobile_library/Preferences"
@@ -612,10 +657,12 @@ ensure_private_cfprefsd() {
     # different mode, _CFPrefsTemporaryFDToWriteTo fails with ENOENT and the
     # daemon silently becomes non-persistent.
     mkdir -p "$cf_temporary_leaf" "$cf_temporary_mobile_leaf" \
+        "$cf_root_preferences" \
         "$cf_mobile_preferences" "$cf_mobile_user_dir" \
         "$cf_mobile_cache_dir" "$cf_mobile_temp_dir" || return 1
     chown root:wheel "$cf_temporary_root" "$cf_temporary_user" \
-        "$cf_temporary_leaf" 2>/dev/null || true
+        "$cf_temporary_leaf" "$cf_root_home" "$cf_root_library" \
+        "$cf_root_preferences" 2>/dev/null || true
     chown 501:501 "$cf_temporary_mobile" "$cf_temporary_mobile_leaf" \
         "$cf_mobile_home" "$cf_mobile_library" "$cf_mobile_preferences" \
         "$cf_mobile_user_root" "$cf_mobile_user_dir" \
@@ -623,6 +670,8 @@ ensure_private_cfprefsd() {
         2>/dev/null || return 1
     chmod 1311 "$cf_temporary_root" || return 1
     chmod 0700 "$cf_temporary_user" "$cf_temporary_leaf" || return 1
+    chmod 0700 "$cf_root_home" "$cf_root_library" \
+        "$cf_root_preferences" || return 1
     chmod 0700 "$cf_temporary_mobile" "$cf_temporary_mobile_leaf" \
         "$cf_mobile_preferences" || return 1
     chmod 0755 "$cf_mobile_home" "$cf_mobile_library" || return 1

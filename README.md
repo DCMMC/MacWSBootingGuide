@@ -22,6 +22,7 @@ presents macOS windows as iPadOS windows.
 | --- | --- | --- | --- |
 | iPad13,6 (M1), iPadOS 16.3.1 / 20D67 | Dopamine rootless | Ventura 13.4 / 22F66 | Primary target; broadest display, input, IME, power, VS Code, Steam, Office, and system-app coverage |
 | iPad14,5 (M2), iPadOS 16.0 / 20A8372 | Dopamine rootless | Ventura 13.4 / 22F66 | M2 compiler adapter, native display, audio, VS Code, Steam, and arm64 Unity 7DTD paths validated; coverage is narrower than M1 |
+| iPad14,3 (M2), iPadOS 16.5.1 / 20F75 | Dopamine rootless | Ventura 13.4 / 22F66 | Porting candidate: compiler/AGX/workspace startup reached runtime witnesses, but final unlocked Host pixels and interaction are still pending |
 | iPad13,7, iPadOS 16.6 | NathanLR | Ventura experiment | Unsupported: the current CoreTrust/signing path cannot admit the patched macOS shared-cache closure |
 | Any other device or build | unknown | unknown | A porting target, not a supported configuration |
 
@@ -41,8 +42,9 @@ Current user-visible capabilities include:
   window.
 - A Game Camera input mode with iPadOS pointer lock, unbounded Magic Keyboard
   and direct-touch camera motion, automatic activation from an application's
-  relative-mouse request, and click calibration independent of a game's
-  dynamic render resolution.
+  relative-mouse request. The current absolute-click correction is a guarded
+  exact-window candidate and still needs fresh in-game acceptance; it is not
+  advertised as fixed.
 - Clipboard, files, drag and drop, open/save panels, location, audio, Retina
   Standard/Larger UI modes, lock/sleep coordination, and bounded thermal
   telemetry.

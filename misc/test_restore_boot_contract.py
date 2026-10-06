@@ -22,6 +22,16 @@ class RestoreBootContract(unittest.TestCase):
         self.assertNotIn(
             'grep -Fq "/var/jb/usr on $canonical_target ("', BIND)
 
+    def test_bind_probe_accepts_only_the_exact_helper_fallback_symlink(self):
+        symlink_probe = 'if [ -L "$target_dir" ]; then'
+        directory_creation = '[ -d "$target_dir" ] || mkdir -p "$target_dir"'
+        self.assertIn(symlink_probe, BIND)
+        self.assertIn(
+            '[ "$(readlink "$target_dir")" = "$source_dir" ]', BIND)
+        self.assertIn(
+            '[ -x "$target_dir/$proxy_relative" ]', BIND)
+        self.assertLess(BIND.index(symlink_probe), BIND.index(directory_creation))
+
     def test_filtered_restore_recreates_only_the_volatile_tmp_directory(self):
         self.assertIn("ROOTFS=/var/mnt/rootfs", AUTOSIGND)
         self.assertIn(
