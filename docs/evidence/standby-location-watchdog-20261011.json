@@ -1,0 +1,357 @@
+{
+  "recorded_at": 1791674607.88273,
+  "device": {
+    "model": "iPad13,6",
+    "ipados": "16.3.1",
+    "build": "20D67",
+    "macos": "13.4",
+    "macos_build": "22F66"
+  },
+  "runtime_evidence": {
+    "location_client": "com.macwsguide.host",
+    "powerlog_client_row": {
+      "start_displayed_local": "2026-10-10 02:30:20",
+      "end_displayed_local": "2026-10-11 00:38:42",
+      "type": "Location",
+      "desired_accuracy": -1.0
+    },
+    "clock_caveat": "Powerlog events differ from native lock witnesses by approximately 160 seconds; future verification uses record ID boundaries.",
+    "watchdog_cpu_seconds_approximately_18h": 3248.18,
+    "standby_bdc_samples": {
+      "first_local": "2026-10-10 07:34:34",
+      "first_percent": 69,
+      "last_local": "2026-10-11 00:00:09",
+      "last_percent": 54
+    },
+    "baseband_status": {
+      "code": 0,
+      "error": "",
+      "ok": true,
+      "status": {
+        "auto_enabled": true,
+        "backend_exit": 0,
+        "build": "20D67",
+        "driver_state": 1,
+        "driver_state_off": true,
+        "failure_detected": true,
+        "hardware_off": true,
+        "model": "iPad13,6",
+        "power_known": true,
+        "powered_on": false,
+        "profile_supported": true,
+        "supported": true,
+        "version": "0.1.2"
+      }
+    },
+    "location_restart_witnesses": [
+      "[macwslocationd] native effective client=com.macwsguide.host authorization=3",
+      "[macwslocationd] native client started verified-authorization=3 attempt=0",
+      "[macwslocationd] delivered native fix #1 type=4 accuracy=35.0m age=10.9s"
+    ],
+    "after_location_locked_entries": 0
+  },
+  "changes": {
+    "location_provider": "Retire the native manager on workspace sleep; ignore queued authorization/delegate callbacks; register a fresh manager on wake.",
+    "watchdog": "Skip heavy launchd queries/PID writes while locked and the cached WindowServer PID is alive; missing/dead servers still trigger recovery; explicit runtime caps retain their original policy."
+  },
+  "validation": {
+    "targeted_regressions_passed": 26,
+    "runtime_switch_audit": "passed",
+    "location_arm64_build": "passed",
+    "full_unittest_suite": {
+      "tests": 648,
+      "failures": 23,
+      "errors": 14,
+      "skipped": 18,
+      "passed": false,
+      "limitations": [
+        "xcrun unavailable on iPad",
+        "unsigned native test fixtures killed",
+        "SDK vm_page_size declaration absent",
+        "macOS-specific executable paths unavailable"
+      ]
+    },
+    "real_standby_measurement": {
+      "recorded_local": "2026-10-12T00:29:57",
+      "timezone": "Africa/Cairo (UTC+03:00 for these records)",
+      "short_test": {
+        "status": "complete",
+        "samples": [
+          {
+            "timestamp": 1791675682.836674,
+            "lockstate": 1,
+            "hasBlankedScreen": 1,
+            "CurrentCapacity": 34,
+            "AppleRawCurrentCapacity": 2203,
+            "AppleRawMaxCapacity": 6766,
+            "InstantAmperage": -23,
+            "Temperature": 2739,
+            "Voltage": 3774,
+            "ExternalConnected": false,
+            "IsCharging": false
+          },
+          {
+            "timestamp": 1791675997.823803,
+            "lockstate": 1,
+            "hasBlankedScreen": 1,
+            "CurrentCapacity": 34,
+            "AppleRawCurrentCapacity": 2199,
+            "AppleRawMaxCapacity": 6766,
+            "InstantAmperage": -18,
+            "Temperature": 2679,
+            "Voltage": 3779,
+            "ExternalConnected": false,
+            "IsCharging": false
+          },
+          {
+            "timestamp": 1791676394.337229,
+            "lockstate": 1,
+            "hasBlankedScreen": 1,
+            "CurrentCapacity": 34,
+            "AppleRawCurrentCapacity": 2195,
+            "AppleRawMaxCapacity": 6766,
+            "InstantAmperage": -20,
+            "Temperature": 2639,
+            "Voltage": 3782,
+            "ExternalConnected": false,
+            "IsCharging": false
+          }
+        ],
+        "created": 1791674463.147627,
+        "start_id": 953999,
+        "start": 1791675682.8364952,
+        "end_id": 954007,
+        "wake_reasons": [
+          {
+            "value": "NUB.SPMI0Sw3IRQ",
+            "events": 1
+          },
+          {
+            "value": "SMC.OutboxNotEmpty",
+            "events": 1
+          },
+          {
+            "value": "bluetooth-pcie",
+            "events": 1
+          },
+          {
+            "value": "nub-spmi.0x02",
+            "events": 1
+          },
+          {
+            "value": "rtc",
+            "events": 1
+          },
+          {
+            "value": "smc.70070000",
+            "events": 1
+          },
+          {
+            "value": "wifibt",
+            "events": 1
+          }
+        ],
+        "elapsed_seconds": 711.5005550384521,
+        "displayed_percentage_drop": 0,
+        "capacity_drop_mAh": 8,
+        "average_discharge_mA": 40.477832091703064,
+        "median_sample_mA": 20,
+        "finished": 1791676394.3559308
+      },
+      "short_test_caveats": [
+        "Only three samples: the device suspended the observer while asleep. Actual duration, not requested cadence, is used.",
+        "Capacity differences over twelve minutes are quantized; instantaneous sample median is not the mean discharge current."
+      ],
+      "powerlog_battery_witnesses": [
+        {
+          "id": 452241,
+          "timestamp": 1791676550.3346758,
+          "percent": 34,
+          "raw_capacity_mAh": 2195,
+          "raw_max_mAh": 6766,
+          "instant_mA": -20,
+          "charge_accum": 6867,
+          "external_connected": false,
+          "is_charging": false,
+          "powerlog_local": "2026-10-11T02:55:50"
+        },
+        {
+          "id": 452323,
+          "timestamp": 1791702785.0562758,
+          "percent": 34,
+          "raw_capacity_mAh": 2283,
+          "raw_max_mAh": 6762,
+          "instant_mA": -51,
+          "charge_accum": 7025,
+          "external_connected": false,
+          "is_charging": false,
+          "powerlog_local": "2026-10-11T10:13:05"
+        },
+        {
+          "id": 452700,
+          "timestamp": 1791710351.47607,
+          "percent": 86,
+          "raw_capacity_mAh": 5731,
+          "raw_max_mAh": 6741,
+          "instant_mA": 0,
+          "charge_accum": 3587,
+          "external_connected": false,
+          "is_charging": false,
+          "powerlog_local": "2026-10-11T12:19:11"
+        },
+        {
+          "id": 452935,
+          "timestamp": 1791728965.9900787,
+          "percent": 82,
+          "raw_capacity_mAh": 5302,
+          "raw_max_mAh": 6787,
+          "instant_mA": -45,
+          "charge_accum": 3903,
+          "external_connected": false,
+          "is_charging": false,
+          "powerlog_local": "2026-10-11T17:29:25"
+        },
+        {
+          "id": 453272,
+          "timestamp": 1791753562.9341028,
+          "percent": 80,
+          "raw_capacity_mAh": 5169,
+          "raw_max_mAh": 6788,
+          "instant_mA": -37,
+          "charge_accum": 4127,
+          "external_connected": false,
+          "is_charging": false,
+          "powerlog_local": "2026-10-12T00:19:22"
+        }
+      ],
+      "night_unplugged": {
+        "hours": 7.287422666682137,
+        "start_percent": 34,
+        "end_percent": 34,
+        "battery_records": 83,
+        "connected_records": 0,
+        "interpretation": "Gauge raw capacity rose by 88 mAh while ChargeAccum increased by 158. The unchanged percentage does not prove zero energy consumption; no capacity-difference discharge estimate is made for this interval."
+      },
+      "whole_post_charge_unplugged": {
+        "hours": 12.003182786901792,
+        "start_percent": 86,
+        "end_percent": 80,
+        "displayed_percentage_points_drop": 6,
+        "linear_18h_displayed_drop_estimate": 8.997613542789052,
+        "interpretation": "Includes charge relaxation and a higher-current background interval around 16:00-17:00. The cause of that transient load is not proven."
+      },
+      "settled_late_unplugged": {
+        "hours": 6.832484451135,
+        "start_percent": 82,
+        "end_percent": 80,
+        "displayed_percentage_points_drop": 2,
+        "linear_18h_displayed_drop_estimate": 5.26894722665922,
+        "raw_capacity_drop_mAh": 133,
+        "capacity_difference_average_mA": 19.46583280960212,
+        "raw_max_capacity_mAh_start": 6787,
+        "raw_max_capacity_mAh_end": 6788
+      },
+      "charging_bdc_local": {
+        "connected": "2026-10-11 10:15:30",
+        "disconnected": "2026-10-11 12:21:36",
+        "source": "BDC_OBC (UTC timestamps converted to UTC+03:00)"
+      },
+      "native_lifecycle_local": {
+        "sleep": "2026-10-11 02:38:07",
+        "wake": "2026-10-12 00:18:04",
+        "suspended_apps": 14,
+        "resumed_apps": 14
+      },
+      "macws_location_entries_while_locked": 0,
+      "native_location_witnesses": [
+        "[macwslocationd] native client suspended reason=workspace-sleep",
+        "[macwslocationd] native client refreshed reason=workspace-wake authorization=3 services=1",
+        "[macwslocationd] native client started verified-authorization=3 attempt=0"
+      ],
+      "assessment": {
+        "standby_faults_addressed": true,
+        "description": "Large improvement from the earlier roughly 0.9 percentage points per hour. Settled standby is near the upper edge of the practical target, about 5.3 displayed points per eighteen hours by linear extrapolation. Whole post-charge history extrapolates to about 9 points, so a strict eighteen-hour <=5-point guarantee is not established.",
+        "full_18h_continuous_unplugged_test_completed": false,
+        "combined_fixes": "BasebandDisabler 0.1.2 plus MacWS native location sleep lifecycle and watchdog query suppression. These observations do not separately attribute the reduction to each change."
+      }
+    },
+    "upstream_checkout_targeted_regressions_passed": 26,
+    "native_source_sha256": "f5391f6b118b646e8e047ba8294cf7824b0332756880c808ee9d3d34693c3565",
+    "native_source_matches_built_and_deployed_checkout": true,
+    "published_gui_integration": {
+      "watchdog_tests_passed": 4,
+      "newer_upstream_startup_changes_retained": true,
+      "installed_gui_is_previous_device_snapshot": true
+    },
+    "upstream_memory_contracts_passed": 10,
+    "upstream_full_unittest_suite": {
+      "tests": 671,
+      "failures": 23,
+      "errors": 14,
+      "skipped": 18,
+      "seconds": 107.351,
+      "passed": false,
+      "failure_count_matches_previous_device_snapshot": true,
+      "failed_test_names": [
+        "test_fixture_mode_ribbon_does_not_exhaust_budget (test_cgimage_observer.CGImageObserverTests)",
+        "test_real_interpose_preserves_pixels_and_bounds_observation (test_cgimage_observer.CGImageObserverTests)",
+        "test_real_broker_validation_and_rolling_abi (test_keyboard_snapshot_wire.KeyboardSnapshotWireTests)",
+        "test_real_producer_state_machine (test_keyboard_source.KeyboardSourceTests)",
+        "test_executable_state_contract (test_keyboard_state.KeyboardStateTests)",
+        "test_framework_free_hid_policy (test_keyboard_text_input_route.KeyboardTextInputRouteTests)",
+        "test_real_ioconnect_branch_skips_generic_only_for_verified_wire (test_nocopy_abi.NoCopyABI)",
+        "test_real_objc_scope_restores_on_nil_exception_nested_and_skip (test_nocopy_abi.NoCopyABI)",
+        "test_wire_guards_source_immutability_tail_and_thread_isolation (test_nocopy_abi.NoCopyABI)",
+        "test_actual_wrapper_preserves_arguments_result_errno_and_budget (test_nocopy_native_layout_probe.NativeNoCopyLayoutProbeTests)",
+        "test_original_arguments_errors_exceptions_errno_factories_and_budgets (test_office_shader_observer.OfficeShaderObserver)",
+        "test_real_cpu_bitmap_original_method_arguments_errno_and_budgets (test_office_upload_observer.OfficeUploadObserver)",
+        "test_real_macos_header_budget_reference (test_sendfile_compat.SendfileContract)",
+        "test_real_entry_closes_old_momentum_before_any_new_contact (test_touch_momentum_cancellation.TouchMomentumCancellationTests)",
+        "test_changed_bytes_replacement_and_failed_capture_are_not_cached (test_autosign_metadata_cache.AutosignMetadataCache)",
+        "test_consumed_modules_and_table_are_never_accessed_after_original (test_metal_image_filter_compose.MetalImageFilterComposeTests)",
+        "test_invalid_scope_or_bounds_never_access_modules_or_call_setters (test_metal_image_filter_compose.MetalImageFilterComposeTests) (case='zero-scope')",
+        "test_invalid_scope_or_bounds_never_access_modules_or_call_setters (test_metal_image_filter_compose.MetalImageFilterComposeTests) (case='oversized-scope')",
+        "test_invalid_scope_or_bounds_never_access_modules_or_call_setters (test_metal_image_filter_compose.MetalImageFilterComposeTests) (case='null-vector')",
+        "test_invalid_scope_or_bounds_never_access_modules_or_call_setters (test_metal_image_filter_compose.MetalImageFilterComposeTests) (case='null-begin')",
+        "test_invalid_scope_or_bounds_never_access_modules_or_call_setters (test_metal_image_filter_compose.MetalImageFilterComposeTests) (case='unaligned-begin')",
+        "test_invalid_scope_or_bounds_never_access_modules_or_call_setters (test_metal_image_filter_compose.MetalImageFilterComposeTests) (case='reversed-end')",
+        "test_invalid_scope_or_bounds_never_access_modules_or_call_setters (test_metal_image_filter_compose.MetalImageFilterComposeTests) (case='reversed-capacity')",
+        "test_invalid_scope_or_bounds_never_access_modules_or_call_setters (test_metal_image_filter_compose.MetalImageFilterComposeTests) (case='unaligned-end')",
+        "test_invalid_scope_or_bounds_never_access_modules_or_call_setters (test_metal_image_filter_compose.MetalImageFilterComposeTests) (case='unaligned-capacity')",
+        "test_invalid_scope_or_bounds_never_access_modules_or_call_setters (test_metal_image_filter_compose.MetalImageFilterComposeTests) (case='count-mismatch')",
+        "test_invalid_scope_or_bounds_never_access_modules_or_call_setters (test_metal_image_filter_compose.MetalImageFilterComposeTests) (case='oversized-capacity')",
+        "test_invalid_scope_or_bounds_never_access_modules_or_call_setters (test_metal_image_filter_compose.MetalImageFilterComposeTests) (case='wrapped-end')",
+        "test_last_target_mismatch_or_null_prevents_every_setter (test_metal_image_filter_compose.MetalImageFilterComposeTests) (case='unknown-last')",
+        "test_last_target_mismatch_or_null_prevents_every_setter (test_metal_image_filter_compose.MetalImageFilterComposeTests) (case='native-ios-last')",
+        "test_last_target_mismatch_or_null_prevents_every_setter (test_metal_image_filter_compose.MetalImageFilterComposeTests) (case='catalyst-last')",
+        "test_last_target_mismatch_or_null_prevents_every_setter (test_metal_image_filter_compose.MetalImageFilterComposeTests) (case='null-last-target')",
+        "test_null_and_duplicate_modules_do_not_partially_mutate (test_metal_image_filter_compose.MetalImageFilterComposeTests) (case='duplicate')",
+        "test_null_and_duplicate_modules_do_not_partially_mutate (test_metal_image_filter_compose.MetalImageFilterComposeTests) (case='null-last-module')",
+        "test_original_failure_and_error_output_are_not_replaced (test_metal_image_filter_compose.MetalImageFilterComposeTests)",
+        "test_supported_setters_all_run_before_original_and_preserve_abi (test_metal_image_filter_compose.MetalImageFilterComposeTests)",
+        "test_live_service_response_is_accepted (test_windowing_startup_readiness.WindowingStartupReadiness)"
+      ],
+      "limitations": [
+        "xcrun unavailable on iPad",
+        "Native test fixtures killed by SIGKILL; unsigned fixture execution requires the platform admission workflow",
+        "SDK vm_page_size declaration absent",
+        "Fixtures assume macOS executable paths such as /bin/cat and /usr/bin/true",
+        "macOS stock sendfile reference reports unsupported platform (exit 77)"
+      ],
+      "note": "Same failure/error counts as the previous device checkout; this is not an all-tests-pass claim. Relevant lifecycle/recovery checks and the native location build passed separately."
+    }
+  },
+  "installation": {
+    "deployed_at": 1791674766.708281,
+    "source_gui_sha256": "361ebcaf55a3d93e2e5468bf16f9345da897c7eac92db8b54f947e0d118608fa",
+    "installed_gui_sha256": "361ebcaf55a3d93e2e5468bf16f9345da897c7eac92db8b54f947e0d118608fa",
+    "installed_location_sha256": "9369cdfefe768ed25dc4e0e0f6ce80afe41b510141dfabaf6f9cf2b07db972cb"
+  },
+  "backup_directory": "/var/jb/var/mobile/ipad-standby-diagnostics/20261011",
+  "restore_command": "python3 misc/deploy_standby_fix.py rollback (authenticated root session)",
+  "publication": {
+    "based_on_upstream": "ec73b9e",
+    "source_checkout_head": "714df50",
+    "note": "Most prior dirty-source changes already exist upstream. Publication retains newer upstream compatibility, input, startup, and project-memory changes and adds only this standby fix and evidence. Installed GUI hashes describe the on-device snapshot, not the newer upstream GUI."
+  }
+}

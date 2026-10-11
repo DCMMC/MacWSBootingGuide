@@ -301,6 +301,16 @@ Power, heat and memory:
   MacWSHost leaves the iOS idle timer enabled. `macwshostd` observes the real
   lock state, publishes workspace sleep/wake, and pauses the macOS display
   completion boundary while locked.
+- The native location bridge retires its manager on workspace sleep and
+  registers a fresh provider on wake. Startup, refresh, authorization retries,
+  and queued fixes must consult the durable hostd sleep marker. An unbounded
+  watchdog skips launchd queries and PID writes while that marker exists and
+  its cached WindowServer PID is alive; missing/dead servers still recover.
+  The 2026-10-12 observation confirmed no MacWS location entries during lock
+  and about 6.8 unplugged hours at 82% -> 80%. The complete post-charge interval
+  was 86% -> 80% in about 12 hours. These are observations, not a guaranteed
+  eighteen-hour battery limit; gauge relaxation affected the overnight data.
+  See `docs/evidence/standby-location-watchdog-20261011.json`.
 - Idle scenes use event-driven/latest-state delivery and a 100-ms idle
   completion cadence. Close TestUFO/Aquarium/video pages after every run;
   multiple hidden benchmarks are real workload, not harmless tabs.

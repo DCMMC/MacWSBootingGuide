@@ -17,9 +17,11 @@
 #include <notify.h>
 #include <stdio.h>
 #include <string.h>
+#include <unistd.h>
 #include <xpc/xpc.h>
 
 #include "macws_interop_protocol.h"
+#include "macws_power_lifecycle.h"
 
 // Procursus' reduced iPhoneOS16.5 xpc.h omits this public libxpc entry point
 // even though the runtime exports it.  Keep the signed scalar wire type used
@@ -49,6 +51,9 @@ static NSString *const MacWSEffectiveLocationClient =
 @property(nonatomic) xpc_connection_t interopConnection;
 @property(nonatomic) NSUInteger deliveredCount;
 @property(nonatomic) int refreshToken;
+@property(nonatomic) int sleepToken;
+@property(nonatomic) int wakeToken;
+@property(nonatomic) BOOL workspaceSleeping;
 @property(nonatomic) NSTimeInterval lastRefreshTime;
 @property(nonatomic) BOOL updatingLocation;
 @end
@@ -157,6 +162,26 @@ static void MacWSSetXPCDouble(xpc_object_t dictionary, const char *key,
 - (void)start {
     [self connectInteropService];
     __weak typeof(self) weakSelf = self;
+    self.sleepToken = self.wakeToken = -1;
+    uint32_t sleepResult = notify_register_dispatch(
+        MACWS_WORKSPACE_WILL_SLEEP_NOTIFY, &_sleepToken,
+        dispatch_get_main_queue(), ^(int token) {
+            (void)token;
+            [weakSelf synchronizeWorkspacePowerForReason:@"workspace-sleep"];
+        });
+    uint32_t wakeResult = notify_register_dispatch(
+        MACWS_WORKSPACE_DID_WAKE_NOTIFY, &_wakeToken,
+        dispatch_get_main_queue(), ^(int token) {
+            (void)token;
+            [weakSelf synchronizeWorkspacePowerForReason:@"workspace-wake"];
+        });
+    if (sleepResult != NOTIFY_STATUS_OK || wakeResult != NOTIFY_STATUS_OK)
+        [self log:[NSString stringWithFormat:
+            @"workspace subscriptions failed sleep=%u wake=%u",
+            sleepResult, wakeResult]];
+    // Subscribe before reading the durable state so a lock/unlock edge
+    // during startup cannot leave an Always-authorized provider running.
+    [self synchronizeWorkspacePowerForReason:@"startup"];
     uint32_t result = notify_register_dispatch(MACWS_LOCATION_REFRESH_NOTIFICATION,
         &_refreshToken, dispatch_get_main_queue(), ^(int token) {
             (void)token;
@@ -186,7 +211,36 @@ static void MacWSSetXPCDouble(xpc_object_t dictionary, const char *key,
     [self reconnectLocationClientForReason:@"startup"];
 }
 
+- (void)synchronizeWorkspacePowerForReason:(NSString *)reason {
+    // hostd writes/removes this marker before posting either edge. Read the
+    // current state rather than replaying a stale queued notification.
+    BOOL sleeping = access(MACWS_WORKSPACE_SLEEP_MARKER_HOST, F_OK) == 0;
+    BOOL wasSleeping = self.workspaceSleeping;
+    self.workspaceSleeping = sleeping;
+    if (sleeping) {
+        if (!wasSleeping || self.locationManager) {
+            // Retire the manager as well as stopping it: authorization retry
+            // blocks and already queued delegate calls must not restart or
+            // publish an old provider after the screen locks.
+            self.locationManager.delegate = nil;
+            [self.locationManager stopUpdatingLocation];
+            self.locationManager = nil;
+            self.updatingLocation = NO;
+            self.lastRefreshTime = 0;
+            [self log:[NSString stringWithFormat:
+                @"native client suspended reason=%@", reason]];
+        }
+    } else if (wasSleeping) {
+        [self reconnectLocationClientForReason:reason];
+    }
+}
+
 - (void)reconnectLocationClientForReason:(NSString *)reason {
+    if (self.workspaceSleeping ||
+        access(MACWS_WORKSPACE_SLEEP_MARKER_HOST, F_OK) == 0) {
+        [self synchronizeWorkspacePowerForReason:reason];
+        return;
+    }
     NSTimeInterval now = NSProcessInfo.processInfo.systemUptime;
     if (self.lastRefreshTime && now - self.lastRefreshTime < 3.0) return;
     self.lastRefreshTime = now;
@@ -214,6 +268,11 @@ static void MacWSSetXPCDouble(xpc_object_t dictionary, const char *key,
 - (void)startAuthorizedLocationClient:(CLLocationManager *)manager
                               attempt:(NSUInteger)attempt {
     if (!manager || manager != self.locationManager || self.updatingLocation) return;
+    if (self.workspaceSleeping ||
+        access(MACWS_WORKSPACE_SLEEP_MARKER_HOST, F_OK) == 0) {
+        [self synchronizeWorkspacePowerForReason:@"authorization-while-sleeping"];
+        return;
+    }
     // Registration and its initial delegate callback are asynchronous. The
     // diagnostic observed an initial cached0, then a real daemon readback3.
     // Poll that stock readback briefly; never convert denied/unknown to ready.
@@ -261,6 +320,11 @@ static void MacWSSetXPCDouble(xpc_object_t dictionary, const char *key,
 - (void)locationManager:(CLLocationManager *)manager
       didUpdateLocations:(NSArray<CLLocation *> *)locations {
     if (manager != self.locationManager) return;
+    if (self.workspaceSleeping ||
+        access(MACWS_WORKSPACE_SLEEP_MARKER_HOST, F_OK) == 0) {
+        [self synchronizeWorkspacePowerForReason:@"location-while-sleeping"];
+        return;
+    }
     CLLocation *location = locations.lastObject;
     if (!location || location.horizontalAccuracy < 0) return;
 

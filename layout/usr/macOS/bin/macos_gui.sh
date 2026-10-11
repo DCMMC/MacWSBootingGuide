@@ -1349,6 +1349,17 @@ run_watchdog() {
     log "watchdog: armed (temperature every ${WD_THERMAL_POLL}s, observe-only; memory guard=disabled; restarts>=$WD_RESTART_LIMIT/${WD_WINDOW}s; runtime cap=$runtime_cap_label)"
     while :; do
         sleep "$WD_POLL"
+        # hostd publishes the real SpringBoard lock state and suspends the
+        # owned applications. Leave launchd's KeepAlive jobs in charge while
+        # locked; spawning launchctl/awk and rewriting PID files on each poll
+        # makes the recovery observer an unnecessary standby workload.
+        # Recovery resumes within one poll after unlock. Explicit bounded
+        # automation retains its original deadline policy.
+        if [ "$WD_MAX_RUNTIME" -eq 0 ] &&
+           [ -n "$last_pid" ] && kill -0 "$last_pid" 2>/dev/null &&
+           [ -f "$ROOTFS/private/tmp/macws_workspace_sleeping" ]; then
+            continue
+        fi
         now=$SECONDS
         if [ "$now" -ge "$next_thermal" ]; then
             next_thermal=$((now + WD_THERMAL_POLL))
